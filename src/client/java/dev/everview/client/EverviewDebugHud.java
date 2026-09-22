@@ -10,10 +10,7 @@ import net.minecraft.resources.Identifier;
 import java.util.List;
 
 /**
- * Always-on development HUD for the alpha builds.
- *
- * This intentionally uses Minecraft 26.3's HUD extraction API rather than legacy
- * immediate GUI rendering, so it remains compatible with the modern render pipeline.
+ * Always-on development telemetry for alpha builds.
  */
 public final class EverviewDebugHud {
     private static final Identifier HUD_ID =
@@ -39,13 +36,19 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = List.of(
-                "Everview M1.1 | ACTIVE",
+                "Everview M1.2 | ACTIVE",
                 "26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris),
-                "Smoke radius: " + surface.radiusBlocks() + " blocks | spacing: " + surface.sampleSpacing(),
-                "Tiles: " + metrics.tiles() + " | submits: " + metrics.submissions() + " | drawn: " + metrics.tilesDrawn(),
-                "Quads: " + metrics.cells() + " | vertices: " + metrics.vertices(),
-                String.format("Build: %.3f ms | geometry: %.3f ms", metrics.buildMs(), metrics.drawMs()),
-                "Target architecture: " + EverviewClient.TARGET_DISTANCE_BLOCKS + " blocks"
+                "Radius: " + surface.radiusBlocks() + " | spacing: " + surface.sampleSpacing()
+                        + " | tile: " + LoadedSurfaceSampler.TILE_SIZE,
+                "Active: " + metrics.activeTiles() + " | cache: " + metrics.cacheSize()
+                        + " | new: " + metrics.newTilesBuilt() + " | hits: " + metrics.cacheHits(),
+                "Cull: " + metrics.tilesCulled() + " | submits: " + metrics.submissions()
+                        + " | drawn: " + metrics.tilesDrawn(),
+                "Quads: " + metrics.cells() + " | vertices: " + metrics.vertices()
+                        + " | incomplete: " + metrics.incompleteTiles(),
+                String.format("Tile update: %.3f ms | geometry: %.3f ms", metrics.updateMs(), metrics.drawMs()),
+                "Evictions: " + metrics.evictions()
+                        + " | target: " + EverviewClient.TARGET_DISTANCE_BLOCKS + " blocks"
         );
 
         int x = 6;
