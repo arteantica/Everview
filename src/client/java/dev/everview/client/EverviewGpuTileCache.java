@@ -38,7 +38,15 @@ public final class EverviewGpuTileCache {
     private EverviewGpuTileCache() {
     }
 
-    public static void beginFrame(ClientLevel level) {
+    /**
+     * Called from COLLECT_SUBMITS, before Minecraft opens the opaque terrain
+     * RenderPass. Buffer creation/upload is intentionally kept out of the
+     * active terrain pass.
+     */
+    public static void prepareFrame(
+            ClientLevel level,
+            WorldgenSurfaceSnapshot snapshot
+    ) {
         if (level != lastLevel) {
             clear();
             lastLevel = level;
@@ -47,37 +55,54 @@ public final class EverviewGpuTileCache {
         uploadsRemaining = MAX_UPLOADS_PER_FRAME;
         uploadsThisFrame = 0;
         uploadNanosThisFrame = 0L;
+
+        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+            if (uploadsRemaining <= 0) {
+                break;
+            }
+
+            LodTileKey key = new LodTileKey(
+                    tile.lodLevel(),
+                    tile.tileX(),
+                    tile.tileZ()
+            );
+            GpuTile existing = TILES.get(key);
+
+            if (existing != null
+                    && existing.source() == tile
+                    && !existing.vertexBuffer().isClosed()) {
+                continue;
+            }
+
+            long started = System.nanoTime();
+            GpuTile uploaded = upload(tile);
+            uploadNanosThisFrame += System.nanoTime() - started;
+            uploadsThisFrame++;
+            uploadsRemaining--;
+
+            if (existing != null) {
+                residentBytes -= existing.bytes();
+                existing.close();
+            }
+
+            TILES.put(key, uploaded);
+            residentBytes += uploaded.bytes();
+        }
+
+        trim();
     }
 
-    public static GpuTile getOrUpload(WorldgenSurfaceTile tile) {
+    public static GpuTile getResident(WorldgenSurfaceTile tile) {
         LodTileKey key = new LodTileKey(tile.lodLevel(), tile.tileX(), tile.tileZ());
         GpuTile existing = TILES.get(key);
 
-        if (existing != null && existing.source() == tile && !existing.vertexBuffer().isClosed()) {
-            return existing;
-        }
-
-        if (existing != null) {
-            residentBytes -= existing.bytes();
-            existing.close();
-            TILES.remove(key);
-        }
-
-        if (uploadsRemaining <= 0) {
+        if (existing == null
+                || existing.source() != tile
+                || existing.vertexBuffer().isClosed()) {
             return null;
         }
 
-        long started = System.nanoTime();
-        GpuTile uploaded = upload(tile);
-        uploadNanosThisFrame += System.nanoTime() - started;
-        uploadsThisFrame++;
-        uploadsRemaining--;
-
-        TILES.put(key, uploaded);
-        residentBytes += uploaded.bytes();
-        trim();
-
-        return uploaded;
+        return existing;
     }
 
     public static Stats stats() {
