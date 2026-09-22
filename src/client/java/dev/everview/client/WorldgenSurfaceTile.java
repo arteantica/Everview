@@ -11,12 +11,19 @@ public record WorldgenSurfaceTile(
         int tileSize,
         int sampleSpacing,
         int[] vertices,
+        int[] colors,
         int cellCount,
         int minY,
         int maxY,
         int seaLevel,
         long generationNanos
 ) {
+    public WorldgenSurfaceTile {
+        if (colors.length != vertices.length / 3) {
+            throw new IllegalArgumentException("colors must match vertex count");
+        }
+    }
+
     public int vertexCount() {
         return vertices.length / 3;
     }
