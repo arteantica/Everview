@@ -59,6 +59,10 @@
 - [x] first procedural material breakup pass
 - [x] ring-aware material detail falloff
 - [x] bake material breakup into cached tile colors
+- [x] terraced L1 plateau geometry
+- [x] vertical cliff faces between near-LOD cells
+- [x] flat water/coastline classification for L1
+- [ ] denser near-LOD sampling after M3.2 performance validation
 - [ ] texture-atlas / UV material rendering
 - [ ] structures
 - [ ] trees
