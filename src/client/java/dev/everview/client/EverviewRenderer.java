@@ -10,13 +10,7 @@ import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4fc;
 
 /**
- * M2 renderer.
- *
- * Only the true distant worldgen ring is visible now. The old loaded-chunk
- * heightfield from M1 is intentionally not submitted: it was useful to prove
- * renderer integration, but it produces false caps over cave mouths and
- * overhangs. Near terrain remains vanilla/Sodium until the voxel-derived near
- * LOD path replaces that diagnostic surface.
+ * Progressive M2.2 distant renderer.
  */
 public final class EverviewRenderer {
     private EverviewRenderer() {
@@ -51,6 +45,11 @@ public final class EverviewRenderer {
         var frustum = camera.getCullFrustum();
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+            WorldgenLodRing ring = snapshot.ringForLevel(tile.lodLevel());
+            if (ring == null) {
+                continue;
+            }
+
             AABB bounds = new AABB(
                     tile.minX(),
                     tile.minY() - 4.0,
@@ -72,7 +71,7 @@ public final class EverviewRenderer {
                     RenderTypes.debugQuads(),
                     (poseState, consumer) -> {
                         long start = System.nanoTime();
-                        drawWorldgenTile(poseState.pose(), consumer, tile, snapshot, camera);
+                        drawWorldgenTile(poseState.pose(), consumer, tile, ring, camera);
                         EverviewMetrics.recordTileDraw(System.nanoTime() - start);
                     }
             );
@@ -83,7 +82,7 @@ public final class EverviewRenderer {
             Matrix4fc pose,
             VertexConsumer consumer,
             WorldgenSurfaceTile tile,
-            WorldgenSurfaceSnapshot snapshot,
+            WorldgenLodRing ring,
             Camera camera
     ) {
         var cameraPos = camera.position();
@@ -91,8 +90,8 @@ public final class EverviewRenderer {
         double cameraY = cameraPos.y();
         double cameraZ = cameraPos.z();
 
-        double innerSq = (double) snapshot.innerRadiusBlocks() * snapshot.innerRadiusBlocks();
-        double outerSq = (double) snapshot.outerRadiusBlocks() * snapshot.outerRadiusBlocks();
+        double innerSq = (double) ring.innerRadiusBlocks() * ring.innerRadiusBlocks();
+        double outerSq = (double) ring.outerRadiusBlocks() * ring.outerRadiusBlocks();
 
         int[] vertices = tile.vertices();
 
@@ -144,9 +143,12 @@ public final class EverviewRenderer {
             float t = (worldY - tile.seaLevel()) / 140.0F;
             t = Math.max(0.0F, Math.min(1.0F, t));
 
-            red = clampColor(70.0F + 165.0F * t);
+            // Very slight LOD tint shift keeps ring transitions visually
+            // identifiable during testing without changing the terrain shape.
+            float lodLift = (tile.lodLevel() - 1) * 8.0F;
+            red = clampColor(70.0F + 165.0F * t + lodLift);
             green = clampColor(155.0F + 75.0F * t);
-            blue = clampColor(75.0F + 160.0F * t);
+            blue = clampColor(75.0F + 160.0F * t + lodLift);
         }
 
         consumer.addVertex(pose, x, y, z)
