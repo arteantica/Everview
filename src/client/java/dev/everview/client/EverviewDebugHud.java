@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M2.7 | PERSISTENT + ADAPTIVE");
+        lines.add("Everview M3.0 | MINECRAFT SURFACE");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Palette: L1 GREEN | L2 ORANGE | L3 PURPLE | L4 RED | L5 YELLOW");
+        lines.add("Visual: biome grass | water | sand | stone | snow | slope light");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),

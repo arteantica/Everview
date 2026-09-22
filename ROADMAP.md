@@ -35,7 +35,7 @@
 - [x] 4 ms bounded initial-fill generation throughput test
 - [x] adaptive generation budget based on server/client frame pressure
 - [x] experimental camera/frustum depth extension to 20,480 blocks
-- [ ] validate 16,384-block L5 visibility through extended projection
+- [x] validate 16,384-block L5 visibility through extended projection
 - [ ] compact surface tile format
 - [x] compressed per-world/per-dimension disk persistence
 - [ ] multiplayer/server data path
@@ -49,9 +49,10 @@
 - [ ] seam stitching / geomorphing
 
 ## M4 - visual parity
-- [ ] biome tint
-- [ ] water
-- [ ] snow/material classification
+- [x] first biome-derived grass tint pass
+- [x] first water color pass
+- [x] first sand/stone/snow/material classification pass
+- [x] first slope-based terrain lighting pass
 - [ ] structures
 - [ ] trees
 - [ ] fog and atmosphere

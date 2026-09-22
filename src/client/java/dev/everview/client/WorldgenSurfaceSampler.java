@@ -583,6 +583,18 @@ public final class WorldgenSurfaceSampler {
 
             y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
             job.heights[sampleIndex] = y;
+
+            var biome = level.getNoiseBiome(worldX >> 2, y >> 2, worldZ >> 2);
+            var appearance = MinecraftSurfacePalette.sample(
+                    biome,
+                    worldX,
+                    y,
+                    worldZ,
+                    level.getSeaLevel()
+            );
+            job.sampleColors[sampleIndex] = appearance.rgb();
+            job.sampleMaterials[sampleIndex] = appearance.material();
+
             job.minY = Math.min(job.minY, y);
             job.maxY = Math.max(job.maxY, y);
             job.nextSample = sampleIndex + 1;
@@ -599,7 +611,7 @@ public final class WorldgenSurfaceSampler {
 
         if (job.nextSample >= job.totalSamples && taskEpoch == epoch) {
             long meshStart = System.nanoTime();
-            int[] vertices = buildVertices(job);
+            MeshData mesh = buildMesh(job);
             long meshElapsed = System.nanoTime() - meshStart;
 
             job.accumulatedNanos += meshElapsed;
@@ -611,7 +623,8 @@ public final class WorldgenSurfaceSampler {
                     job.key.tileZ(),
                     job.ring.tileSize(),
                     job.ring.sampleSpacing(),
-                    vertices,
+                    mesh.vertices(),
+                    mesh.colors(),
                     job.cellCount,
                     job.minY,
                     job.maxY,
@@ -626,9 +639,11 @@ public final class WorldgenSurfaceSampler {
         lastSliceMs = sliceElapsed / 1_000_000.0;
     }
 
-    private static int[] buildVertices(GenerationJob job) {
+    private static MeshData buildMesh(GenerationJob job) {
         int[] vertices = new int[job.cellCount * 12];
-        int out = 0;
+        int[] colors = new int[job.cellCount * 4];
+        int vertexOut = 0;
+        int colorOut = 0;
         int spacing = job.ring.sampleSpacing();
 
         for (int gz = 0; gz < job.cellsAcross; gz++) {
@@ -639,30 +654,88 @@ public final class WorldgenSurfaceSampler {
                 int x0 = job.originX + gx * spacing;
                 int x1 = x0 + spacing;
 
-                int y00 = job.heights[gz * job.samplesAcross + gx];
-                int y10 = job.heights[gz * job.samplesAcross + gx + 1];
-                int y01 = job.heights[(gz + 1) * job.samplesAcross + gx];
-                int y11 = job.heights[(gz + 1) * job.samplesAcross + gx + 1];
+                int i00 = gz * job.samplesAcross + gx;
+                int i10 = i00 + 1;
+                int i01 = (gz + 1) * job.samplesAcross + gx;
+                int i11 = i01 + 1;
 
-                vertices[out++] = x0;
-                vertices[out++] = y00;
-                vertices[out++] = z0;
+                int y00 = job.heights[i00];
+                int y10 = job.heights[i10];
+                int y01 = job.heights[i01];
+                int y11 = job.heights[i11];
 
-                vertices[out++] = x0;
-                vertices[out++] = y01;
-                vertices[out++] = z1;
+                float dx = ((y10 + y11) - (y00 + y01)) * 0.5F / spacing;
+                float dz = ((y01 + y11) - (y00 + y10)) * 0.5F / spacing;
+                float invLength = 1.0F / (float) Math.sqrt(dx * dx + 1.0F + dz * dz);
 
-                vertices[out++] = x1;
-                vertices[out++] = y11;
-                vertices[out++] = z1;
+                float nx = -dx * invLength;
+                float ny = invLength;
+                float nz = -dz * invLength;
 
-                vertices[out++] = x1;
-                vertices[out++] = y10;
-                vertices[out++] = z0;
+                // Fixed northwest/up light gives terrain readable shape before
+                // shader-aware lighting is introduced.
+                float lightDot = nx * -0.45F + ny * 0.86F + nz * -0.24F;
+                float shade = 0.72F + Math.max(0.0F, lightDot) * 0.30F;
+
+                float maxRise = Math.max(
+                        Math.max(Math.abs(y10 - y00), Math.abs(y01 - y00)),
+                        Math.max(Math.abs(y11 - y10), Math.abs(y11 - y01))
+                );
+                float steepness = Math.min(1.0F, maxRise / Math.max(1.0F, spacing * 0.95F));
+
+                int c00 = shadeSample(job, i00, shade, steepness);
+                int c01 = shadeSample(job, i01, shade, steepness);
+                int c11 = shadeSample(job, i11, shade, steepness);
+                int c10 = shadeSample(job, i10, shade, steepness);
+
+                vertices[vertexOut++] = x0;
+                vertices[vertexOut++] = y00;
+                vertices[vertexOut++] = z0;
+                colors[colorOut++] = c00;
+
+                vertices[vertexOut++] = x0;
+                vertices[vertexOut++] = y01;
+                vertices[vertexOut++] = z1;
+                colors[colorOut++] = c01;
+
+                vertices[vertexOut++] = x1;
+                vertices[vertexOut++] = y11;
+                vertices[vertexOut++] = z1;
+                colors[colorOut++] = c11;
+
+                vertices[vertexOut++] = x1;
+                vertices[vertexOut++] = y10;
+                vertices[vertexOut++] = z0;
+                colors[colorOut++] = c10;
             }
         }
 
-        return vertices;
+        return new MeshData(vertices, colors);
+    }
+
+    private static int shadeSample(
+            GenerationJob job,
+            int sampleIndex,
+            float shade,
+            float steepness
+    ) {
+        int color = job.sampleColors[sampleIndex];
+        byte material = job.sampleMaterials[sampleIndex];
+
+        if (material == MinecraftSurfacePalette.MATERIAL_GRASS && steepness > 0.42F) {
+            float stoneBlend = Math.min(0.78F, (steepness - 0.42F) * 1.15F);
+            color = MinecraftSurfacePalette.blend(
+                    color,
+                    MinecraftSurfacePalette.stoneColor(),
+                    stoneBlend
+            );
+        }
+
+        if (material == MinecraftSurfacePalette.MATERIAL_WATER) {
+            shade = 0.92F + (shade - 0.72F) * 0.25F;
+        }
+
+        return MinecraftSurfacePalette.applyLighting(color, shade);
     }
 
     private static void trimCache() {
@@ -757,6 +830,8 @@ public final class WorldgenSurfaceSampler {
         private final int totalSamples;
         private final int cellCount;
         private final int[] heights;
+        private final int[] sampleColors;
+        private final byte[] sampleMaterials;
 
         private volatile int nextSample;
         private volatile boolean failed;
@@ -774,11 +849,19 @@ public final class WorldgenSurfaceSampler {
             this.totalSamples = samplesAcross * samplesAcross;
             this.cellCount = cellsAcross * cellsAcross;
             this.heights = new int[totalSamples];
+            this.sampleColors = new int[totalSamples];
+            this.sampleMaterials = new byte[totalSamples];
         }
 
         private double progressPercent() {
             return nextSample * 100.0 / totalSamples;
         }
+    }
+
+    private record MeshData(
+            int[] vertices,
+            int[] colors
+    ) {
     }
 
     private record WantedTile(
