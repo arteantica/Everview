@@ -5,6 +5,7 @@ import com.mojang.renderpearl.api.buffers.GpuBuffer;
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.renderpearl.api.commands.RenderPass;
 import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
+import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.phys.AABB;
@@ -28,12 +29,23 @@ public final class EverviewRenderer {
     }
 
     /**
-     * Kept for the client initializer. The actual M3.3 draw hook is a small
-     * LevelRenderer mixin because Fabric's opaque-terrain event intentionally
-     * runs inside the already-open terrain RenderPass but does not expose that
-     * pass in its public context.
+     * GPU uploads happen during COLLECT_SUBMITS, before the opaque terrain
+     * RenderPass begins. The actual draw hook is a small LevelRenderer mixin
+     * that receives Minecraft's already-open opaque RenderPass.
      */
     public static void register() {
+        LevelRenderEvents.COLLECT_SUBMITS.register(context -> {
+            Minecraft client = Minecraft.getInstance();
+
+            if (client.level == null || client.player == null) {
+                return;
+            }
+
+            WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
+            if (!snapshot.tiles().isEmpty()) {
+                EverviewGpuTileCache.prepareFrame(client.level, snapshot);
+            }
+        });
     }
 
     public static void drawPersistentTerrain(RenderPass renderPass) {
@@ -50,7 +62,6 @@ public final class EverviewRenderer {
         }
 
         EverviewMetrics.beginRenderFrame();
-        EverviewGpuTileCache.beginFrame(client.level);
 
         var cameraPos = camera.position();
         double cameraX = cameraPos.x();
@@ -85,7 +96,7 @@ public final class EverviewRenderer {
             }
 
             EverviewGpuTileCache.GpuTile gpuTile =
-                    EverviewGpuTileCache.getOrUpload(tile);
+                    EverviewGpuTileCache.getResident(tile);
             if (gpuTile == null) {
                 continue;
             }
