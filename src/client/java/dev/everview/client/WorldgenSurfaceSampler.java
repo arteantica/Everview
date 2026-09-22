@@ -179,7 +179,7 @@ public final class WorldgenSurfaceSampler {
             ResourceKey<Level> dimension
     ) {
         diskCachePath = WorldgenDiskCache.pathFor(server, dimension);
-        diskCacheSeed = WorldgenDiskCache.seedFor(server);
+        diskCacheSeed = WorldgenDiskCache.seedFor(server, dimension);
         diskCacheDimension = WorldgenDiskCache.dimensionId(dimension);
         diskCacheStatus = "LOADING";
         diskLoadReady = false;
