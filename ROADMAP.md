@@ -58,6 +58,7 @@
 - [x] retain material IDs per distant surface vertex
 - [x] first procedural material breakup pass
 - [x] ring-aware material detail falloff
+- [x] bake material breakup into cached tile colors
 - [ ] texture-atlas / UV material rendering
 - [ ] structures
 - [ ] trees
