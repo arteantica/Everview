@@ -28,7 +28,7 @@ public final class EverviewDebugHud {
 
     private static void extractRenderState(GuiGraphicsExtractor graphics, DeltaTracker deltaTracker) {
         Minecraft client = Minecraft.getInstance();
-        if (client.font == null || client.level == null || client.options.hideGui) {
+        if (client.font == null || client.level == null || client.gui.hud.isHidden()) {
             return;
         }
 
