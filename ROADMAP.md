@@ -55,6 +55,10 @@
 - [x] first slope-based terrain lighting pass
 - [x] naturalized palette + tighter snow classification
 - [x] vanilla-to-LOD overlap handoff pass
+- [x] retain material IDs per distant surface vertex
+- [x] first procedural material breakup pass
+- [x] ring-aware material detail falloff
+- [ ] texture-atlas / UV material rendering
 - [ ] structures
 - [ ] trees
 - [ ] fog and atmosphere
