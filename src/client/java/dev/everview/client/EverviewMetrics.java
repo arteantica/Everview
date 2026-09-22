@@ -7,7 +7,7 @@ import java.util.List;
  * Render/update telemetry used by the alpha HUD.
  */
 public final class EverviewMetrics {
-    private static final int MAX_DIAGNOSTIC_LOD = 5;
+    private static final int MAX_DIAGNOSTIC_LOD = 6;
 
     private static volatile int activeTiles;
     private static volatile int cells;
