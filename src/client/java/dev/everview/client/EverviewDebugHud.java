@@ -31,19 +31,15 @@ public final class EverviewDebugHud {
         }
 
         EverviewMetrics.Snapshot metrics = EverviewMetrics.snapshot();
-        SurfaceSnapshot near = LoadedSurfaceSampler.snapshot();
         WorldgenSurfaceSnapshot far = WorldgenSurfaceSampler.snapshot();
 
         boolean sodium = FabricLoader.getInstance().isModLoaded("sodium");
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M2.0 | ACTIVE");
+        lines.add("Everview M2.0.1 | ACTIVE");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Near: " + near.radiusBlocks() + "r | spacing " + near.sampleSpacing()
-                + " | active " + metrics.activeTiles() + " | cache " + metrics.cacheSize());
-        lines.add("Near update: " + formatMs(metrics.updateMs())
-                + " | new " + metrics.newTilesBuilt() + " | hits " + metrics.cacheHits());
+        lines.add("Near debug heightfield: OFF | vanilla/Sodium handoff");
 
         if (far.available()) {
             lines.add("Far WORLDGEN: " + far.innerRadiusBlocks() + "-" + far.outerRadiusBlocks()

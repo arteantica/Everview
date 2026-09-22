@@ -18,10 +18,12 @@ public final class EverviewClient implements ClientModInitializer {
     public void onInitializeClient() {
         EverviewRenderer.register();
         EverviewDebugHud.register();
-        ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            LoadedSurfaceSampler.tick(client);
-            WorldgenSurfaceSampler.tick(client);
-        });
+
+        // M2 focuses on the first true beyond-loaded-chunks worldgen ring.
+        // The old M1 near debug heightfield remains in the codebase as a
+        // diagnostic tool, but is deliberately disabled because it can cover
+        // cave mouths/overhangs and is not the near-LOD architecture we want.
+        ClientTickEvents.END_CLIENT_TICK.register(WorldgenSurfaceSampler::tick);
 
         LOGGER.info(
                 "Everview {} bootstrapped for Minecraft 26.3 Fabric: {} LOD rings, target {} blocks",

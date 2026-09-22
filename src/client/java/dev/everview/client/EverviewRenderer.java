@@ -12,9 +12,11 @@ import org.joml.Matrix4fc;
 /**
  * M2 renderer.
  *
- * The near debug surface still comes from loaded chunks. The far ring now comes
- * from direct generator height queries on the integrated server and can therefore
- * exist beyond Minecraft's loaded client chunks.
+ * Only the true distant worldgen ring is visible now. The old loaded-chunk
+ * heightfield from M1 is intentionally not submitted: it was useful to prove
+ * renderer integration, but it produces false caps over cave mouths and
+ * overhangs. Near terrain remains vanilla/Sodium until the voxel-derived near
+ * LOD path replaces that diagnostic surface.
  */
 public final class EverviewRenderer {
     private EverviewRenderer() {
@@ -32,58 +34,13 @@ public final class EverviewRenderer {
             return;
         }
 
-        SurfaceSnapshot near = LoadedSurfaceSampler.snapshot();
         WorldgenSurfaceSnapshot far = WorldgenSurfaceSampler.snapshot();
-
-        if (near.isEmpty() && far.tiles().isEmpty()) {
+        if (far.tiles().isEmpty()) {
             return;
         }
 
         EverviewMetrics.beginRenderFrame();
-
-        if (!near.isEmpty()) {
-            submitNearTiles(context, camera, near);
-        }
-
-        if (!far.tiles().isEmpty()) {
-            submitWorldgenTiles(context, camera, far);
-        }
-    }
-
-    private static void submitNearTiles(
-            LevelRenderContext context,
-            Camera camera,
-            SurfaceSnapshot snapshot
-    ) {
-        var frustum = camera.getCullFrustum();
-
-        for (SurfaceTile tile : snapshot.tiles()) {
-            AABB bounds = new AABB(
-                    tile.minX(),
-                    tile.minY() - 2.0,
-                    tile.minZ(),
-                    tile.maxX(),
-                    tile.maxY() + 2.0,
-                    tile.maxZ()
-            );
-
-            if (!frustum.isVisible(bounds)) {
-                EverviewMetrics.recordCulledTile();
-                continue;
-            }
-
-            EverviewMetrics.recordSubmission();
-
-            context.submitNodeCollector().submitCustomGeometry(
-                    context.poseStack(),
-                    RenderTypes.debugQuads(),
-                    (poseState, consumer) -> {
-                        long start = System.nanoTime();
-                        drawNearTile(poseState.pose(), consumer, tile, snapshot, camera);
-                        EverviewMetrics.recordTileDraw(System.nanoTime() - start);
-                    }
-            );
-        }
+        submitWorldgenTiles(context, camera, far);
     }
 
     private static void submitWorldgenTiles(
@@ -122,48 +79,6 @@ public final class EverviewRenderer {
         }
     }
 
-    private static void drawNearTile(
-            Matrix4fc pose,
-            VertexConsumer consumer,
-            SurfaceTile tile,
-            SurfaceSnapshot snapshot,
-            Camera camera
-    ) {
-        var cameraPos = camera.position();
-        double cameraX = cameraPos.x();
-        double cameraY = cameraPos.y();
-        double cameraZ = cameraPos.z();
-
-        int globalMinY = snapshot.minY();
-        int globalMaxY = Math.max(globalMinY + 1, snapshot.maxY());
-        double innerSkipSq =
-                (double) LoadedSurfaceSampler.INNER_SKIP_RADIUS * LoadedSurfaceSampler.INNER_SKIP_RADIUS;
-
-        float tileTint = ((tile.tileX() + tile.tileZ()) & 1) == 0 ? 1.0F : 0.90F;
-
-        int[] vertices = tile.vertices();
-
-        for (int i = 0; i < vertices.length; i += 12) {
-            double quadCenterX = (vertices[i] + vertices[i + 6]) * 0.5;
-            double quadCenterZ = (vertices[i + 2] + vertices[i + 8]) * 0.5;
-            double dx = quadCenterX - cameraX;
-            double dz = quadCenterZ - cameraZ;
-
-            if (dx * dx + dz * dz < innerSkipSq) {
-                continue;
-            }
-
-            drawNearVertex(pose, consumer, vertices, i, cameraX, cameraY, cameraZ,
-                    globalMinY, globalMaxY, tileTint);
-            drawNearVertex(pose, consumer, vertices, i + 3, cameraX, cameraY, cameraZ,
-                    globalMinY, globalMaxY, tileTint);
-            drawNearVertex(pose, consumer, vertices, i + 6, cameraX, cameraY, cameraZ,
-                    globalMinY, globalMaxY, tileTint);
-            drawNearVertex(pose, consumer, vertices, i + 9, cameraX, cameraY, cameraZ,
-                    globalMinY, globalMaxY, tileTint);
-        }
-    }
-
     private static void drawWorldgenTile(
             Matrix4fc pose,
             VertexConsumer consumer,
@@ -199,37 +114,6 @@ public final class EverviewRenderer {
         }
     }
 
-    private static void drawNearVertex(
-            Matrix4fc pose,
-            VertexConsumer consumer,
-            int[] vertices,
-            int index,
-            double cameraX,
-            double cameraY,
-            double cameraZ,
-            int globalMinY,
-            int globalMaxY,
-            float tileTint
-    ) {
-        int worldX = vertices[index];
-        int worldY = vertices[index + 1];
-        int worldZ = vertices[index + 2];
-
-        float x = (float) (worldX - cameraX);
-        float y = (float) (worldY + 0.16D - cameraY);
-        float z = (float) (worldZ - cameraZ);
-
-        float t = (worldY - globalMinY) / (float) (globalMaxY - globalMinY);
-        t = Math.max(0.0F, Math.min(1.0F, t));
-
-        int red = clampColor((45.0F + 175.0F * t) * tileTint);
-        int green = clampColor((145.0F + 90.0F * t) * tileTint);
-        int blue = clampColor((60.0F + 175.0F * t) * tileTint);
-
-        consumer.addVertex(pose, x, y, z)
-                .setColor(red, green, blue, 145);
-    }
-
     private static void drawWorldgenVertex(
             Matrix4fc pose,
             VertexConsumer consumer,
@@ -253,7 +137,6 @@ public final class EverviewRenderer {
         int blue;
 
         if (worldY <= tile.seaLevel() + 1) {
-            // Temporary ocean classification for the smoke test.
             red = 45;
             green = 115;
             blue = 205;
