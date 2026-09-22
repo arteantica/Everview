@@ -75,7 +75,7 @@ public final class EverviewRenderer {
                         OptionalDouble.empty()
                 )) {
 
-            renderPass.setPipeline(EverviewGpuPipeline.TERRAIN);
+            renderPass.setPipeline(RenderSystem.getCompiledPipeline(EverviewGpuPipeline.TERRAIN));
             RenderSystem.bindDefaultUniforms(renderPass);
 
             RenderSystem.AutoStorageIndexBuffer quadIndices =
