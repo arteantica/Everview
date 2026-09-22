@@ -18,7 +18,9 @@ public record WorldgenSurfaceSnapshot(
         double lastSliceMs,
         int lastSliceSamples,
         double currentTileProgressPercent,
-        int currentLodLevel
+        int currentLodLevel,
+        double initialFillSeconds,
+        boolean initialFillComplete
 ) {
     public static final WorldgenSurfaceSnapshot EMPTY =
             new WorldgenSurfaceSnapshot(
@@ -34,7 +36,9 @@ public record WorldgenSurfaceSnapshot(
                     0.0,
                     0,
                     0.0,
-                    0
+                    0,
+                    0.0,
+                    false
             );
 
     public WorldgenSurfaceSnapshot {
