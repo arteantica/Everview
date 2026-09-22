@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.2.2 | 4-BLOCK ULTRA-NEAR");
+        lines.add("Everview M3.3 | PERSISTENT GPU");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Visual: L1 4-block ultra-near | L2 8-block near | 1-block steps | cliff walls");
+        lines.add("Render: opaque depth-write | persistent tile buffers | L1 4b | L2 8b");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
@@ -113,6 +113,15 @@ public final class EverviewDebugHud {
         } else {
             lines.add("Far WORLDGEN: unavailable (singleplayer test path)");
         }
+
+        EverviewGpuTileCache.Stats gpu = EverviewGpuTileCache.stats();
+        lines.add(String.format(
+                "GPU tiles: %d | %.2f MiB | uploads %d / %.3f ms",
+                gpu.bufferCount(),
+                gpu.residentMiB(),
+                gpu.uploadsThisFrame(),
+                gpu.uploadMs()
+        ));
 
         lines.add("Frame total c/s/d: " + metrics.tilesCulled() + "/"
                 + metrics.submissions() + "/" + metrics.tilesDrawn());
