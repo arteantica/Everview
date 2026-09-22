@@ -26,9 +26,10 @@
 
 ## M2 - distant generation
 - [x] direct singleplayer ChunkGenerator height sampling without loading distant chunks
-- [x] server-thread one-tile-at-a-time generation queue
 - [x] first true worldgen LOD ring beyond the vanilla render radius
-- [ ] worker-backed sampling strategy with bounded CPU budget
+- [x] split distant generation into small server-thread slices
+- [x] soft per-slice CPU budget with bounded queued work
+- [ ] adaptive generation budget based on server/client frame pressure
 - [ ] multiple progressive LOD rings
 - [ ] far-plane extension beyond vanilla camera depth
 - [ ] compact surface tile format
