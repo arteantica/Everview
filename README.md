@@ -1,3 +1,4 @@
+<img width="1920" height="1080" alt="2026-09-22_16 53 55" src="https://github.com/user-attachments/assets/1bf74b18-5f6d-40b2-8ad5-d279aa9eda62" />
 # Everview
 
 Everview is an experimental client-side terrain LOD renderer for Minecraft Java.
