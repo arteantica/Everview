@@ -1,26 +1,32 @@
 package dev.everview.client;
 
+import java.util.List;
+
 /**
- * Immutable CPU-side snapshot used by the temporary M1 renderer.
- *
- * Vertices are absolute integer world coordinates in xyz triplets. We convert them
- * to camera-relative floats only at submission time so large world coordinates do
- * not immediately destroy vertex precision.
+ * Immutable CPU-side snapshot used by the M1.1 tiled smoke-test renderer.
  */
 public record SurfaceSnapshot(
-        int[] vertices,
+        List<SurfaceTile> tiles,
         int cellCount,
+        int vertexCount,
         int minY,
-        int maxY
+        int maxY,
+        int radiusBlocks,
+        int sampleSpacing,
+        long buildNanos
 ) {
     public static final SurfaceSnapshot EMPTY =
-            new SurfaceSnapshot(new int[0], 0, 0, 1);
+            new SurfaceSnapshot(List.of(), 0, 0, 0, 1, 0, 0, 0L);
 
-    public boolean isEmpty() {
-        return cellCount == 0 || vertices.length == 0;
+    public SurfaceSnapshot {
+        tiles = List.copyOf(tiles);
     }
 
-    public int vertexCount() {
-        return vertices.length / 3;
+    public boolean isEmpty() {
+        return tiles.isEmpty() || cellCount == 0;
+    }
+
+    public double buildMs() {
+        return buildNanos / 1_000_000.0;
     }
 }
