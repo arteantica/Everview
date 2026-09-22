@@ -37,22 +37,27 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M2.2 | ACTIVE");
+        lines.add("Everview M2.3 | RING VISIBILITY");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Near: vanilla/Sodium | progressive WORLDGEN rings");
+        lines.add("Palette: L1 GREEN | L2 ORANGE | L3 PURPLE");
 
         if (far.available()) {
             for (WorldgenRingStatus status : far.rings()) {
                 WorldgenLodRing ring = status.ring();
+                EverviewMetrics.RingRenderStats render = metrics.ring(ring.lodLevel());
+
                 lines.add(String.format(
-                        "L%d %d-%d s%d: %d/%d (%.0f%%)",
+                        "L%d %d-%d s%d: gen %d/%d | c/s/d %d/%d/%d | q %d",
                         ring.lodLevel(),
                         ring.innerRadiusBlocks(),
                         ring.outerRadiusBlocks(),
                         ring.sampleSpacing(),
                         status.readyTileCount(),
                         status.desiredTileCount(),
-                        status.completionPercent()
+                        render.culled(),
+                        render.submitted(),
+                        render.drawn(),
+                        render.emittedQuads()
                 ));
             }
 
@@ -73,15 +78,12 @@ public final class EverviewDebugHud {
                     far.currentLodLevel(),
                     far.currentTileProgressPercent()
             ));
-
-            lines.add("Last tile CPU: " + formatMs(far.lastTileGenerationMs())
-                    + " | generated " + far.generatedTileCount());
         } else {
             lines.add("Far WORLDGEN: unavailable (singleplayer test path)");
         }
 
-        lines.add("Cull: " + metrics.tilesCulled() + " | submits: " + metrics.submissions()
-                + " | drawn: " + metrics.tilesDrawn());
+        lines.add("Frame total c/s/d: " + metrics.tilesCulled() + "/"
+                + metrics.submissions() + "/" + metrics.tilesDrawn());
         lines.add("Geometry CPU: " + formatMs(metrics.drawMs())
                 + " | target: " + EverviewClient.TARGET_DISTANCE_BLOCKS);
 

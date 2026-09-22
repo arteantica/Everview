@@ -10,7 +10,11 @@ import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4fc;
 
 /**
- * Progressive M2.2 distant renderer.
+ * M2.3 visibility diagnostic renderer.
+ *
+ * Each progressive ring now has an intentionally obvious diagnostic palette and
+ * independent cull/submit/draw/quad counters. This lets us distinguish "generated
+ * successfully" from "actually surviving the camera/frustum render path".
  */
 public final class EverviewRenderer {
     private EverviewRenderer() {
@@ -60,25 +64,35 @@ public final class EverviewRenderer {
             );
 
             if (!frustum.isVisible(bounds)) {
-                EverviewMetrics.recordCulledTile();
+                EverviewMetrics.recordCulledTile(tile.lodLevel());
                 continue;
             }
 
-            EverviewMetrics.recordSubmission();
+            EverviewMetrics.recordSubmission(tile.lodLevel());
 
             context.submitNodeCollector().submitCustomGeometry(
                     context.poseStack(),
                     RenderTypes.debugQuads(),
                     (poseState, consumer) -> {
                         long start = System.nanoTime();
-                        drawWorldgenTile(poseState.pose(), consumer, tile, ring, camera);
-                        EverviewMetrics.recordTileDraw(System.nanoTime() - start);
+                        int emittedQuads = drawWorldgenTile(
+                                poseState.pose(),
+                                consumer,
+                                tile,
+                                ring,
+                                camera
+                        );
+                        EverviewMetrics.recordTileDraw(
+                                tile.lodLevel(),
+                                System.nanoTime() - start,
+                                emittedQuads
+                        );
                     }
             );
         }
     }
 
-    private static void drawWorldgenTile(
+    private static int drawWorldgenTile(
             Matrix4fc pose,
             VertexConsumer consumer,
             WorldgenSurfaceTile tile,
@@ -93,6 +107,7 @@ public final class EverviewRenderer {
         double innerSq = (double) ring.innerRadiusBlocks() * ring.innerRadiusBlocks();
         double outerSq = (double) ring.outerRadiusBlocks() * ring.outerRadiusBlocks();
 
+        int emittedQuads = 0;
         int[] vertices = tile.vertices();
 
         for (int i = 0; i < vertices.length; i += 12) {
@@ -110,7 +125,10 @@ public final class EverviewRenderer {
             drawWorldgenVertex(pose, consumer, vertices, i + 3, cameraX, cameraY, cameraZ, tile);
             drawWorldgenVertex(pose, consumer, vertices, i + 6, cameraX, cameraY, cameraZ, tile);
             drawWorldgenVertex(pose, consumer, vertices, i + 9, cameraX, cameraY, cameraZ, tile);
+            emittedQuads++;
         }
+
+        return emittedQuads;
     }
 
     private static void drawWorldgenVertex(
@@ -131,28 +149,54 @@ public final class EverviewRenderer {
         float y = (float) (worldY + 0.10D - cameraY);
         float z = (float) (worldZ - cameraZ);
 
+        float elevation = (worldY - tile.seaLevel()) / 160.0F;
+        elevation = Math.max(0.0F, Math.min(1.0F, elevation));
+
         int red;
         int green;
         int blue;
 
-        if (worldY <= tile.seaLevel() + 1) {
-            red = 45;
-            green = 115;
-            blue = 205;
-        } else {
-            float t = (worldY - tile.seaLevel()) / 140.0F;
-            t = Math.max(0.0F, Math.min(1.0F, t));
-
-            // Very slight LOD tint shift keeps ring transitions visually
-            // identifiable during testing without changing the terrain shape.
-            float lodLift = (tile.lodLevel() - 1) * 8.0F;
-            red = clampColor(70.0F + 165.0F * t + lodLift);
-            green = clampColor(155.0F + 75.0F * t);
-            blue = clampColor(75.0F + 160.0F * t + lodLift);
+        // M2.3 diagnostic palette:
+        // L1 = green/cyan, L2 = amber/orange, L3 = magenta/purple.
+        // Water follows the same ring identity instead of sharing one blue.
+        switch (tile.lodLevel()) {
+            case 1 -> {
+                if (worldY <= tile.seaLevel() + 1) {
+                    red = 25;
+                    green = 145;
+                    blue = 220;
+                } else {
+                    red = clampColor(45.0F + 70.0F * elevation);
+                    green = clampColor(175.0F + 70.0F * elevation);
+                    blue = clampColor(75.0F + 100.0F * elevation);
+                }
+            }
+            case 2 -> {
+                if (worldY <= tile.seaLevel() + 1) {
+                    red = 220;
+                    green = 125;
+                    blue = 30;
+                } else {
+                    red = clampColor(205.0F + 45.0F * elevation);
+                    green = clampColor(125.0F + 90.0F * elevation);
+                    blue = clampColor(35.0F + 80.0F * elevation);
+                }
+            }
+            default -> {
+                if (worldY <= tile.seaLevel() + 1) {
+                    red = 155;
+                    green = 65;
+                    blue = 220;
+                } else {
+                    red = clampColor(175.0F + 70.0F * elevation);
+                    green = clampColor(55.0F + 70.0F * elevation);
+                    blue = clampColor(180.0F + 70.0F * elevation);
+                }
+            }
         }
 
         consumer.addVertex(pose, x, y, z)
-                .setColor(red, green, blue, 175);
+                .setColor(red, green, blue, 190);
     }
 
     private static int clampColor(float value) {
