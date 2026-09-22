@@ -19,7 +19,7 @@ public final class EverviewClientEvents {
         if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_SOLID_BLOCKS) {
             return;
         }
-        EverviewRuntime.recordWorldRenderCallback();
+        EverviewRuntime.render(event);
     }
 
     @SubscribeEvent
