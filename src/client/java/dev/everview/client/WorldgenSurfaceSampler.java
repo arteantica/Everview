@@ -735,19 +735,19 @@ public final class WorldgenSurfaceSampler {
 
                 int c00 = MaterialTerrainShading.apply(
                         shadeSample(job, i00, shade, steepness),
-                        m00, x0, y00, z0, job.ring.lodLevel()
+                        m00, x0, y00, z0, job.ring.sampleSpacing()
                 );
                 int c01 = MaterialTerrainShading.apply(
                         shadeSample(job, i01, shade, steepness),
-                        m01, x0, y01, z1, job.ring.lodLevel()
+                        m01, x0, y01, z1, job.ring.sampleSpacing()
                 );
                 int c11 = MaterialTerrainShading.apply(
                         shadeSample(job, i11, shade, steepness),
-                        m11, x1, y11, z1, job.ring.lodLevel()
+                        m11, x1, y11, z1, job.ring.sampleSpacing()
                 );
                 int c10 = MaterialTerrainShading.apply(
                         shadeSample(job, i10, shade, steepness),
-                        m10, x1, y10, z0, job.ring.lodLevel()
+                        m10, x1, y10, z0, job.ring.sampleSpacing()
                 );
 
                 vertices[vertexOut++] = x0;
