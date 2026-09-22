@@ -22,17 +22,19 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 /**
  * Budgeted progressive distant-worldgen sampler.
  *
- * M2.4 extends the progressive ladder to 16,384 blocks while preserving
- * M2.1's one-slice-at-a-time server budget. Every ring doubles tile size and
- * sample spacing, so each tile remains an 8x8 quad grid while coverage expands
- * exponentially.
+ * Progressive distant-worldgen sampler.
+ *
+ * M2.6 keeps one bounded integrated-server task per client tick, but raises the
+ * initial-fill budget from the deliberately conservative 1.5 ms used in M2.1
+ * to 4.0 ms. This should cut first-fill time dramatically while still keeping
+ * Everview well below Minecraft's 50 ms server-tick budget.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 384;
     public static final int MAX_OUTER_RADIUS = 16_384;
 
-    public static final long SLICE_BUDGET_NANOS = 1_500_000L;
-    public static final int MAX_SAMPLES_PER_SLICE = 12;
+    public static final long SLICE_BUDGET_NANOS = 4_000_000L;
+    public static final int MAX_SAMPLES_PER_SLICE = 32;
 
     private static final int CACHE_LIMIT = 1_536;
 

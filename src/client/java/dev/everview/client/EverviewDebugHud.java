@@ -37,7 +37,7 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M2.5 | EXTENDED CAMERA DEPTH");
+        lines.add("Everview M2.6 | FASTER INITIAL FILL");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Palette: L1 GREEN | L2 ORANGE | L3 PURPLE | L4 RED | L5 YELLOW");
         lines.add(String.format(
@@ -89,7 +89,7 @@ public final class EverviewDebugHud {
             ));
 
             lines.add(String.format(
-                    "Budget %.2f | slice %.3f ms / %d | L%d tile %.0f%%",
+                    "Gen budget %.2f ms/tick | last %.3f ms / %d samples | L%d tile %.0f%%",
                     far.sliceBudgetMs(),
                     far.lastSliceMs(),
                     far.lastSliceSamples(),
