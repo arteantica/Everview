@@ -25,16 +25,20 @@
 - [ ] persistent GPU tile buffers
 
 ## M2 - distant generation
-- [ ] off-thread surface sampler
-- [ ] direct worldgen sampling without full client chunks
-- [ ] bounded worker queue and cancellation
+- [x] direct singleplayer ChunkGenerator height sampling without loading distant chunks
+- [x] server-thread one-tile-at-a-time generation queue
+- [x] first true worldgen LOD ring beyond the vanilla render radius
+- [ ] worker-backed sampling strategy with bounded CPU budget
+- [ ] multiple progressive LOD rings
+- [ ] far-plane extension beyond vanilla camera depth
 - [ ] compact surface tile format
 - [ ] disk persistence
+- [ ] multiplayer/server data path
 
 ## M3 - GPU architecture
 - [ ] persistent GPU buffers
 - [ ] batched/indirect terrain submission
-- [ ] frustum culling
+- [x] frustum culling
 - [ ] horizon/occlusion culling
 - [ ] screen-space error based detail selection
 - [ ] seam stitching / geomorphing
@@ -46,6 +50,7 @@
 - [ ] structures
 - [ ] trees
 - [ ] fog and atmosphere
+- [ ] near voxel-derived LOD for cave mouths/overhangs (issue #5)
 
 ## M5 - compatibility
 - [ ] Sodium path
@@ -55,6 +60,7 @@
 - [ ] shader-facing LOD metadata
 
 ## Benchmark goals
+- [x] first generator-derived terrain beyond loaded chunks
 - [ ] 65,536 blocks
 - [ ] 262,144 blocks
 - [ ] world-scale horizon mode

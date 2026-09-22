@@ -18,7 +18,10 @@ public final class EverviewClient implements ClientModInitializer {
     public void onInitializeClient() {
         EverviewRenderer.register();
         EverviewDebugHud.register();
-        ClientTickEvents.END_CLIENT_TICK.register(LoadedSurfaceSampler::tick);
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            LoadedSurfaceSampler.tick(client);
+            WorldgenSurfaceSampler.tick(client);
+        });
 
         LOGGER.info(
                 "Everview {} bootstrapped for Minecraft 26.3 Fabric: {} LOD rings, target {} blocks",

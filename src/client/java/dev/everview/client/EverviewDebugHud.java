@@ -7,6 +7,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.resources.Identifier;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -30,26 +31,41 @@ public final class EverviewDebugHud {
         }
 
         EverviewMetrics.Snapshot metrics = EverviewMetrics.snapshot();
-        SurfaceSnapshot surface = LoadedSurfaceSampler.snapshot();
+        SurfaceSnapshot near = LoadedSurfaceSampler.snapshot();
+        WorldgenSurfaceSnapshot far = WorldgenSurfaceSampler.snapshot();
 
         boolean sodium = FabricLoader.getInstance().isModLoaded("sodium");
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
-        List<String> lines = List.of(
-                "Everview M1.2 | ACTIVE",
-                "26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris),
-                "Radius: " + surface.radiusBlocks() + " | spacing: " + surface.sampleSpacing()
-                        + " | tile: " + LoadedSurfaceSampler.TILE_SIZE,
-                "Active: " + metrics.activeTiles() + " | cache: " + metrics.cacheSize()
-                        + " | new: " + metrics.newTilesBuilt() + " | hits: " + metrics.cacheHits(),
-                "Cull: " + metrics.tilesCulled() + " | submits: " + metrics.submissions()
-                        + " | drawn: " + metrics.tilesDrawn(),
-                "Quads: " + metrics.cells() + " | vertices: " + metrics.vertices()
-                        + " | incomplete: " + metrics.incompleteTiles(),
-                String.format("Tile update: %.3f ms | geometry: %.3f ms", metrics.updateMs(), metrics.drawMs()),
-                "Evictions: " + metrics.evictions()
-                        + " | target: " + EverviewClient.TARGET_DISTANCE_BLOCKS + " blocks"
-        );
+        List<String> lines = new ArrayList<>();
+        lines.add("Everview M2.0 | ACTIVE");
+        lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
+        lines.add("Near: " + near.radiusBlocks() + "r | spacing " + near.sampleSpacing()
+                + " | active " + metrics.activeTiles() + " | cache " + metrics.cacheSize());
+        lines.add("Near update: " + formatMs(metrics.updateMs())
+                + " | new " + metrics.newTilesBuilt() + " | hits " + metrics.cacheHits());
+
+        if (far.available()) {
+            lines.add("Far WORLDGEN: " + far.innerRadiusBlocks() + "-" + far.outerRadiusBlocks()
+                    + " | spacing " + far.sampleSpacing());
+            lines.add(String.format(
+                    "Far tiles: %d/%d (%.0f%%) | cache %d | job %s",
+                    far.readyTileCount(),
+                    far.desiredTileCount(),
+                    far.completionPercent(),
+                    far.cacheSize(),
+                    far.taskInFlight() ? "ON" : "OFF"
+            ));
+            lines.add("Last far tile: " + formatMs(far.lastTileGenerationMs())
+                    + " | generated " + far.generatedTileCount());
+        } else {
+            lines.add("Far WORLDGEN: unavailable (singleplayer test path)");
+        }
+
+        lines.add("Cull: " + metrics.tilesCulled() + " | submits: " + metrics.submissions()
+                + " | drawn: " + metrics.tilesDrawn());
+        lines.add("Geometry CPU: " + formatMs(metrics.drawMs())
+                + " | target: " + EverviewClient.TARGET_DISTANCE_BLOCKS);
 
         int x = 6;
         int y = 6;
@@ -72,6 +88,10 @@ public final class EverviewDebugHud {
             graphics.text(client.font, lines.get(i), x + pad, textY, color, true);
             textY += lineHeight;
         }
+    }
+
+    private static String formatMs(double ms) {
+        return String.format("%.3f ms", ms);
     }
 
     private static String yesNo(boolean value) {
