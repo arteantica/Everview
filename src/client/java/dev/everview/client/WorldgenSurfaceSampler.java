@@ -11,6 +11,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.levelgen.Heightmap;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -617,7 +618,7 @@ public final class WorldgenSurfaceSampler {
 
         if (job.nextSample >= job.totalSamples && taskEpoch == epoch) {
             long meshStart = System.nanoTime();
-            MeshData mesh = buildMesh(job);
+            MeshData mesh = buildMesh(job, level.getSeaLevel());
             long meshElapsed = System.nanoTime() - meshStart;
 
             job.accumulatedNanos += meshElapsed;
@@ -632,7 +633,7 @@ public final class WorldgenSurfaceSampler {
                     mesh.vertices(),
                     mesh.colors(),
                     mesh.materials(),
-                    job.cellCount,
+                    mesh.quadCount(),
                     job.minY,
                     job.maxY,
                     level.getSeaLevel(),
@@ -646,7 +647,15 @@ public final class WorldgenSurfaceSampler {
         lastSliceMs = sliceElapsed / 1_000_000.0;
     }
 
-    private static MeshData buildMesh(GenerationJob job) {
+    private static MeshData buildMesh(GenerationJob job, int seaLevel) {
+        if (job.ring.lodLevel() == 1) {
+            return buildTerracedMesh(job, seaLevel);
+        }
+
+        return buildSmoothMesh(job);
+    }
+
+    private static MeshData buildSmoothMesh(GenerationJob job) {
         int[] vertices = new int[job.cellCount * 12];
         int[] colors = new int[job.cellCount * 4];
         byte[] materials = new byte[job.cellCount * 4];
@@ -739,7 +748,381 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
-        return new MeshData(vertices, colors, materials);
+        return new MeshData(vertices, colors, materials, job.cellCount);
+    }
+
+    /**
+     * L1 gets a deliberately blockier coarse-voxel surface. Each 16x16 cell is
+     * a flat plateau, with vertical faces between neighboring plateaus and dark
+     * skirts around tile edges. This sacrifices smooth triangles close to the
+     * vanilla handoff in favor of silhouettes that read much more like Minecraft.
+     */
+    private static MeshData buildTerracedMesh(GenerationJob job, int seaLevel) {
+        int cells = job.cellsAcross;
+        int spacing = job.ring.sampleSpacing();
+        int[] topY = new int[job.cellCount];
+        int[] topColor = new int[job.cellCount];
+        byte[] topMaterial = new byte[job.cellCount];
+
+        for (int gz = 0; gz < cells; gz++) {
+            for (int gx = 0; gx < cells; gx++) {
+                int cell = gz * cells + gx;
+                int i00 = gz * job.samplesAcross + gx;
+                int i10 = i00 + 1;
+                int i01 = (gz + 1) * job.samplesAcross + gx;
+                int i11 = i01 + 1;
+
+                byte material = dominantMaterial(job, i00, i10, i01, i11);
+                topMaterial[cell] = material;
+
+                int y = representativeHeight(
+                        job,
+                        material,
+                        seaLevel,
+                        i00,
+                        i10,
+                        i01,
+                        i11
+                );
+                topY[cell] = y;
+
+                int baseColor = representativeColor(
+                        job,
+                        material,
+                        i00,
+                        i10,
+                        i01,
+                        i11
+                );
+
+                int y00 = job.heights[i00];
+                int y10 = job.heights[i10];
+                int y01 = job.heights[i01];
+                int y11 = job.heights[i11];
+
+                float dx = ((y10 + y11) - (y00 + y01)) * 0.5F / spacing;
+                float dz = ((y01 + y11) - (y00 + y10)) * 0.5F / spacing;
+                float invLength = 1.0F / (float) Math.sqrt(dx * dx + 1.0F + dz * dz);
+                float lightDot =
+                        (-dx * invLength) * -0.45F
+                                + invLength * 0.86F
+                                + (-dz * invLength) * -0.24F;
+                float shade = 0.76F + Math.max(0.0F, lightDot) * 0.26F;
+
+                int x = job.originX + gx * spacing + spacing / 2;
+                int z = job.originZ + gz * spacing + spacing / 2;
+                int lit = MinecraftSurfacePalette.applyLighting(baseColor, shade);
+                topColor[cell] = MaterialTerrainShading.apply(
+                        lit,
+                        material,
+                        x,
+                        y,
+                        z,
+                        job.ring.lodLevel()
+                );
+            }
+        }
+
+        MeshBuilder mesh = new MeshBuilder(job.cellCount * 3);
+
+        // Flat top faces.
+        for (int gz = 0; gz < cells; gz++) {
+            int z0 = job.originZ + gz * spacing;
+            int z1 = z0 + spacing;
+
+            for (int gx = 0; gx < cells; gx++) {
+                int x0 = job.originX + gx * spacing;
+                int x1 = x0 + spacing;
+                int cell = gz * cells + gx;
+                int y = topY[cell];
+
+                mesh.addQuad(
+                        x0, y, z0,
+                        x0, y, z1,
+                        x1, y, z1,
+                        x1, y, z0,
+                        topColor[cell],
+                        topMaterial[cell]
+                );
+            }
+        }
+
+        // Internal east/west boundaries. One face per shared edge.
+        for (int gz = 0; gz < cells; gz++) {
+            int z0 = job.originZ + gz * spacing;
+            int z1 = z0 + spacing;
+
+            for (int gx = 0; gx < cells - 1; gx++) {
+                int left = gz * cells + gx;
+                int right = left + 1;
+                int leftY = topY[left];
+                int rightY = topY[right];
+
+                if (leftY == rightY) {
+                    continue;
+                }
+
+                int high = leftY > rightY ? left : right;
+                int highY = Math.max(leftY, rightY);
+                int lowY = Math.min(leftY, rightY);
+                int x = job.originX + (gx + 1) * spacing;
+
+                int color = sideColor(
+                        topColor[high],
+                        topMaterial[high],
+                        highY - lowY,
+                        0.82F
+                );
+
+                mesh.addQuad(
+                        x, lowY, z0,
+                        x, lowY, z1,
+                        x, highY, z1,
+                        x, highY, z0,
+                        color,
+                        wallMaterial(topMaterial[high])
+                );
+            }
+        }
+
+        // Internal north/south boundaries.
+        for (int gz = 0; gz < cells - 1; gz++) {
+            int z = job.originZ + (gz + 1) * spacing;
+
+            for (int gx = 0; gx < cells; gx++) {
+                int north = gz * cells + gx;
+                int south = north + cells;
+                int northY = topY[north];
+                int southY = topY[south];
+
+                if (northY == southY) {
+                    continue;
+                }
+
+                int high = northY > southY ? north : south;
+                int highY = Math.max(northY, southY);
+                int lowY = Math.min(northY, southY);
+                int x0 = job.originX + gx * spacing;
+                int x1 = x0 + spacing;
+
+                int color = sideColor(
+                        topColor[high],
+                        topMaterial[high],
+                        highY - lowY,
+                        0.72F
+                );
+
+                mesh.addQuad(
+                        x0, lowY, z,
+                        x1, lowY, z,
+                        x1, highY, z,
+                        x0, highY, z,
+                        color,
+                        wallMaterial(topMaterial[high])
+                );
+            }
+        }
+
+        // Tile-edge skirts hide cracks where neighboring plateau averages differ.
+        int skirtDepth = spacing * 2;
+
+        for (int gz = 0; gz < cells; gz++) {
+            int z0 = job.originZ + gz * spacing;
+            int z1 = z0 + spacing;
+
+            int west = gz * cells;
+            addSkirt(mesh, job.originX, z0, job.originX, z1,
+                    topY[west], skirtDepth, topColor[west], topMaterial[west], true);
+
+            int east = gz * cells + cells - 1;
+            int eastX = job.originX + cells * spacing;
+            addSkirt(mesh, eastX, z1, eastX, z0,
+                    topY[east], skirtDepth, topColor[east], topMaterial[east], true);
+        }
+
+        for (int gx = 0; gx < cells; gx++) {
+            int x0 = job.originX + gx * spacing;
+            int x1 = x0 + spacing;
+
+            int north = gx;
+            addSkirt(mesh, x1, job.originZ, x0, job.originZ,
+                    topY[north], skirtDepth, topColor[north], topMaterial[north], false);
+
+            int south = (cells - 1) * cells + gx;
+            int southZ = job.originZ + cells * spacing;
+            addSkirt(mesh, x0, southZ, x1, southZ,
+                    topY[south], skirtDepth, topColor[south], topMaterial[south], false);
+        }
+
+        return mesh.finish();
+    }
+
+    private static byte dominantMaterial(
+            GenerationJob job,
+            int i00,
+            int i10,
+            int i01,
+            int i11
+    ) {
+        int[] counts = new int[6];
+        int[] indices = {i00, i10, i01, i11};
+
+        for (int index : indices) {
+            int material = Byte.toUnsignedInt(job.sampleMaterials[index]);
+            if (material >= 0 && material < counts.length) {
+                counts[material]++;
+            }
+        }
+
+        // Two or more water corners make this a water cell. This keeps lakes and
+        // oceans flat instead of interpolating blue ramps up their shorelines.
+        if (counts[MinecraftSurfacePalette.MATERIAL_WATER] >= 2) {
+            return MinecraftSurfacePalette.MATERIAL_WATER;
+        }
+
+        int bestMaterial = MinecraftSurfacePalette.MATERIAL_GRASS;
+        int bestCount = -1;
+
+        for (int material = 0; material < counts.length; material++) {
+            if (material == MinecraftSurfacePalette.MATERIAL_WATER) {
+                continue;
+            }
+
+            if (counts[material] > bestCount) {
+                bestCount = counts[material];
+                bestMaterial = material;
+            }
+        }
+
+        return (byte) bestMaterial;
+    }
+
+    private static int representativeHeight(
+            GenerationJob job,
+            byte material,
+            int seaLevel,
+            int... indices
+    ) {
+        if (material == MinecraftSurfacePalette.MATERIAL_WATER) {
+            return seaLevel;
+        }
+
+        int sum = 0;
+        int count = 0;
+
+        for (int index : indices) {
+            if (job.sampleMaterials[index] == MinecraftSurfacePalette.MATERIAL_WATER) {
+                continue;
+            }
+
+            sum += job.heights[index];
+            count++;
+        }
+
+        if (count == 0) {
+            return seaLevel;
+        }
+
+        int average = Math.round(sum / (float) count);
+
+        // Two-block vertical snapping keeps large 16x16 L1 cells from looking
+        // perfectly smooth while avoiding comically tall giant "blocks".
+        return Math.round(average / 2.0F) * 2;
+    }
+
+    private static int representativeColor(
+            GenerationJob job,
+            byte material,
+            int... indices
+    ) {
+        long red = 0;
+        long green = 0;
+        long blue = 0;
+        int count = 0;
+
+        for (int index : indices) {
+            if (job.sampleMaterials[index] != material) {
+                continue;
+            }
+
+            int rgb = job.sampleColors[index];
+            red += (rgb >> 16) & 0xFF;
+            green += (rgb >> 8) & 0xFF;
+            blue += rgb & 0xFF;
+            count++;
+        }
+
+        if (count == 0) {
+            for (int index : indices) {
+                int rgb = job.sampleColors[index];
+                red += (rgb >> 16) & 0xFF;
+                green += (rgb >> 8) & 0xFF;
+                blue += rgb & 0xFF;
+                count++;
+            }
+        }
+
+        return ((int) (red / count) << 16)
+                | ((int) (green / count) << 8)
+                | (int) (blue / count);
+    }
+
+    private static int sideColor(
+            int topColor,
+            byte topMaterial,
+            int heightDelta,
+            float directionalShade
+    ) {
+        int target = switch (topMaterial) {
+            case MinecraftSurfacePalette.MATERIAL_GRASS -> 0x65503A;
+            case MinecraftSurfacePalette.MATERIAL_SAND -> 0xB7A66F;
+            case MinecraftSurfacePalette.MATERIAL_TERRACOTTA -> 0x8F4F38;
+            case MinecraftSurfacePalette.MATERIAL_SNOW -> 0x83888A;
+            default -> MinecraftSurfacePalette.stoneColor();
+        };
+
+        float blend = Math.min(0.72F, 0.28F + heightDelta / 48.0F);
+        int side = MinecraftSurfacePalette.blend(topColor, target, blend);
+        return MinecraftSurfacePalette.applyLighting(side, directionalShade);
+    }
+
+    private static byte wallMaterial(byte topMaterial) {
+        if (topMaterial == MinecraftSurfacePalette.MATERIAL_SAND
+                || topMaterial == MinecraftSurfacePalette.MATERIAL_TERRACOTTA) {
+            return topMaterial;
+        }
+
+        return MinecraftSurfacePalette.MATERIAL_STONE;
+    }
+
+    private static void addSkirt(
+            MeshBuilder mesh,
+            int x0,
+            int z0,
+            int x1,
+            int z1,
+            int topY,
+            int depth,
+            int topColor,
+            byte material,
+            boolean eastWest
+    ) {
+        int bottomY = topY - depth;
+        int color = sideColor(
+                topColor,
+                material,
+                depth,
+                eastWest ? 0.72F : 0.66F
+        );
+
+        mesh.addQuad(
+                x0, bottomY, z0,
+                x1, bottomY, z1,
+                x1, topY, z1,
+                x0, topY, z0,
+                color,
+                wallMaterial(material)
+        );
     }
 
     private static byte displayMaterial(
@@ -906,8 +1289,85 @@ public final class WorldgenSurfaceSampler {
     private record MeshData(
             int[] vertices,
             int[] colors,
-            byte[] materials
+            byte[] materials,
+            int quadCount
     ) {
+    }
+
+    private static final class MeshBuilder {
+        private int[] vertices;
+        private int[] colors;
+        private byte[] materials;
+        private int vertexInts;
+        private int vertexCount;
+        private int quadCount;
+
+        private MeshBuilder(int estimatedQuads) {
+            int quads = Math.max(8, estimatedQuads);
+            this.vertices = new int[quads * 12];
+            this.colors = new int[quads * 4];
+            this.materials = new byte[quads * 4];
+        }
+
+        private void addQuad(
+                int x0, int y0, int z0,
+                int x1, int y1, int z1,
+                int x2, int y2, int z2,
+                int x3, int y3, int z3,
+                int color,
+                byte material
+        ) {
+            ensureCapacity(1);
+
+            vertexInts = addVertex(x0, y0, z0, color, material, vertexInts);
+            vertexInts = addVertex(x1, y1, z1, color, material, vertexInts);
+            vertexInts = addVertex(x2, y2, z2, color, material, vertexInts);
+            vertexInts = addVertex(x3, y3, z3, color, material, vertexInts);
+            quadCount++;
+        }
+
+        private int addVertex(
+                int x,
+                int y,
+                int z,
+                int color,
+                byte material,
+                int out
+        ) {
+            vertices[out++] = x;
+            vertices[out++] = y;
+            vertices[out++] = z;
+            colors[vertexCount] = color;
+            materials[vertexCount] = material;
+            vertexCount++;
+            return out;
+        }
+
+        private void ensureCapacity(int moreQuads) {
+            int requiredQuads = quadCount + moreQuads;
+            int requiredVertexInts = requiredQuads * 12;
+            int requiredVertices = requiredQuads * 4;
+
+            if (requiredVertexInts > vertices.length) {
+                int next = Math.max(requiredVertexInts, vertices.length * 2);
+                vertices = Arrays.copyOf(vertices, next);
+            }
+
+            if (requiredVertices > colors.length) {
+                int next = Math.max(requiredVertices, colors.length * 2);
+                colors = Arrays.copyOf(colors, next);
+                materials = Arrays.copyOf(materials, next);
+            }
+        }
+
+        private MeshData finish() {
+            return new MeshData(
+                    Arrays.copyOf(vertices, vertexInts),
+                    Arrays.copyOf(colors, vertexCount),
+                    Arrays.copyOf(materials, vertexCount),
+                    quadCount
+            );
+        }
     }
 
     private record WantedTile(
