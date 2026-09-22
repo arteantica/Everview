@@ -37,9 +37,15 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M2.4 | DISTANCE LADDER 16K");
+        lines.add("Everview M2.5 | EXTENDED CAMERA DEPTH");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Palette: L1 GREEN | L2 ORANGE | L3 PURPLE | L4 RED | L5 YELLOW");
+        lines.add(String.format(
+                "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
+                EverviewFarPlane.vanillaDepthFar(),
+                EverviewFarPlane.extendedDepthFar(),
+                WorldgenSurfaceSampler.MAX_OUTER_RADIUS
+        ));
 
         if (far.available()) {
             for (WorldgenRingStatus status : far.rings()) {
