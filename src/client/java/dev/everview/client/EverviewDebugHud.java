@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.3 | PERSISTENT GPU");
+        lines.add("Everview M3.3.1 | PRECISE HANDOFF");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Render: opaque depth-write | persistent tile buffers | L1 4b | L2 8b");
+        lines.add("Render: persistent GPU | L1 4b / 32t | precise vanilla boundary | L2 8b");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
