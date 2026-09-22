@@ -3,6 +3,7 @@ package dev.everview.client;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.levelgen.Heightmap;
 
@@ -217,14 +218,30 @@ public final class LoadedSurfaceSampler {
 
         int localX = Math.floorMod(worldX, 16);
         int localZ = Math.floorMod(worldZ, 16);
-        int surfaceY = chunk.getHeight(Heightmap.Types.WORLD_SURFACE, localX, localZ);
+        int surfaceY = chunk.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, localX, localZ);
 
-        BlockPos topBlock = new BlockPos(worldX, surfaceY - 1, worldZ);
-        if (!chunk.getBlockState(topBlock).getFluidState().isEmpty()) {
-            return INVALID_Y;
+        // Heightmaps can still land on exposed tree logs/branches. Walk downward
+        // through vegetation so the diagnostic mesh follows the terrain instead
+        // of forming tents over tree canopies.
+        BlockPos.MutableBlockPos topBlock =
+                new BlockPos.MutableBlockPos(worldX, surfaceY - 1, worldZ);
+
+        for (int skipped = 0; skipped < 32 && topBlock.getY() >= level.getMinY(); skipped++) {
+            var state = chunk.getBlockState(topBlock);
+
+            if (state.is(BlockTags.LOGS) || state.is(BlockTags.LEAVES)) {
+                topBlock.move(0, -1, 0);
+                continue;
+            }
+
+            if (!state.getFluidState().isEmpty()) {
+                return INVALID_Y;
+            }
+
+            return topBlock.getY() + 1;
         }
 
-        return surfaceY;
+        return INVALID_Y;
     }
 
     private static final class IntVertexBuffer {
