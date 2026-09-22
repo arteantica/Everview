@@ -28,7 +28,7 @@ import java.util.zip.GZIPOutputStream;
  */
 public final class WorldgenDiskCache {
     private static final int MAGIC = 0x45564C31; // EVL1
-    private static final int VERSION = 3;
+    private static final int VERSION = 4;
     private static final int MAX_TILES = 100_000;
     private static final int MAX_VERTEX_INTS = 1_000_000;
 
@@ -43,7 +43,7 @@ public final class WorldgenDiskCache {
 
         return server.getWorldPath(LevelResource.ROOT)
                 .resolve("everview")
-                .resolve("lod-cache-v3")
+                .resolve("lod-cache-v4")
                 .resolve(dimensionId + ".evc.gz");
     }
 
@@ -124,6 +124,14 @@ public final class WorldgenDiskCache {
                     colors[color] = input.readInt();
                 }
 
+                int materialLength = input.readInt();
+                if (materialLength != colorLength) {
+                    return new LoadResult(List.of(), false, elapsedMs(started), "CORRUPT");
+                }
+
+                byte[] materials = new byte[materialLength];
+                input.readFully(materials);
+
                 tiles.add(new WorldgenSurfaceTile(
                         lodLevel,
                         tileX,
@@ -132,6 +140,7 @@ public final class WorldgenDiskCache {
                         sampleSpacing,
                         vertices,
                         colors,
+                        materials,
                         cellCount,
                         minY,
                         maxY,
@@ -198,6 +207,10 @@ public final class WorldgenDiskCache {
                     for (int color : colors) {
                         output.writeInt(color);
                     }
+
+                    byte[] materials = tile.materials();
+                    output.writeInt(materials.length);
+                    output.write(materials);
                 }
             }
 

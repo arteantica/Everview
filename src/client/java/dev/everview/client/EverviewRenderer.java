@@ -10,10 +10,11 @@ import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4fc;
 
 /**
- * M3.0 Minecraft-looking surface renderer.
+ * M3.1 material-aware distant terrain renderer.
  *
- * Ring diagnostics remain active, but visible terrain now uses biome/material
- * colors generated with each tile instead of the old rainbow LOD palette.
+ * Base biome/material colors are generated with each tile, then a cheap
+ * world-space material breakup pass adds readable grass/stone/sand/snow/water
+ * character without requiring a texture atlas yet.
  */
 public final class EverviewRenderer {
     private EverviewRenderer() {
@@ -122,10 +123,22 @@ public final class EverviewRenderer {
                 continue;
             }
 
-            drawWorldgenVertex(pose, consumer, vertices, tile.colors(), i, cameraX, cameraY, cameraZ);
-            drawWorldgenVertex(pose, consumer, vertices, tile.colors(), i + 3, cameraX, cameraY, cameraZ);
-            drawWorldgenVertex(pose, consumer, vertices, tile.colors(), i + 6, cameraX, cameraY, cameraZ);
-            drawWorldgenVertex(pose, consumer, vertices, tile.colors(), i + 9, cameraX, cameraY, cameraZ);
+            drawWorldgenVertex(
+                    pose, consumer, vertices, tile.colors(), tile.materials(),
+                    tile.lodLevel(), i, cameraX, cameraY, cameraZ
+            );
+            drawWorldgenVertex(
+                    pose, consumer, vertices, tile.colors(), tile.materials(),
+                    tile.lodLevel(), i + 3, cameraX, cameraY, cameraZ
+            );
+            drawWorldgenVertex(
+                    pose, consumer, vertices, tile.colors(), tile.materials(),
+                    tile.lodLevel(), i + 6, cameraX, cameraY, cameraZ
+            );
+            drawWorldgenVertex(
+                    pose, consumer, vertices, tile.colors(), tile.materials(),
+                    tile.lodLevel(), i + 9, cameraX, cameraY, cameraZ
+            );
             emittedQuads++;
             maxDistanceSq = Math.max(maxDistanceSq, distanceSq);
         }
@@ -138,6 +151,8 @@ public final class EverviewRenderer {
             VertexConsumer consumer,
             int[] vertices,
             int[] colors,
+            byte[] materials,
+            int lodLevel,
             int index,
             double cameraX,
             double cameraY,
@@ -153,7 +168,15 @@ public final class EverviewRenderer {
         float y = (float) (worldY - 0.22D - cameraY);
         float z = (float) (worldZ - cameraZ);
 
-        int rgb = colors[index / 3];
+        int vertexIndex = index / 3;
+        int rgb = MaterialTerrainShading.apply(
+                colors[vertexIndex],
+                materials[vertexIndex],
+                worldX,
+                worldY,
+                worldZ,
+                lodLevel
+        );
         int red = (rgb >> 16) & 0xFF;
         int green = (rgb >> 8) & 0xFF;
         int blue = rgb & 0xFF;

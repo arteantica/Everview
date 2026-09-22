@@ -12,6 +12,7 @@ public record WorldgenSurfaceTile(
         int sampleSpacing,
         int[] vertices,
         int[] colors,
+        byte[] materials,
         int cellCount,
         int minY,
         int maxY,
@@ -19,8 +20,14 @@ public record WorldgenSurfaceTile(
         long generationNanos
 ) {
     public WorldgenSurfaceTile {
-        if (colors.length != vertices.length / 3) {
+        int vertexCount = vertices.length / 3;
+
+        if (colors.length != vertexCount) {
             throw new IllegalArgumentException("colors must match vertex count");
+        }
+
+        if (materials.length != vertexCount) {
+            throw new IllegalArgumentException("materials must match vertex count");
         }
     }
 

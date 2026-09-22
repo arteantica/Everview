@@ -631,6 +631,7 @@ public final class WorldgenSurfaceSampler {
                     job.ring.sampleSpacing(),
                     mesh.vertices(),
                     mesh.colors(),
+                    mesh.materials(),
                     job.cellCount,
                     job.minY,
                     job.maxY,
@@ -648,6 +649,7 @@ public final class WorldgenSurfaceSampler {
     private static MeshData buildMesh(GenerationJob job) {
         int[] vertices = new int[job.cellCount * 12];
         int[] colors = new int[job.cellCount * 4];
+        byte[] materials = new byte[job.cellCount * 4];
         int vertexOut = 0;
         int colorOut = 0;
         int spacing = job.ring.sampleSpacing();
@@ -697,26 +699,46 @@ public final class WorldgenSurfaceSampler {
                 vertices[vertexOut++] = x0;
                 vertices[vertexOut++] = y00;
                 vertices[vertexOut++] = z0;
+                materials[colorOut] = displayMaterial(job, i00, steepness);
                 colors[colorOut++] = c00;
 
                 vertices[vertexOut++] = x0;
                 vertices[vertexOut++] = y01;
                 vertices[vertexOut++] = z1;
+                materials[colorOut] = displayMaterial(job, i01, steepness);
                 colors[colorOut++] = c01;
 
                 vertices[vertexOut++] = x1;
                 vertices[vertexOut++] = y11;
                 vertices[vertexOut++] = z1;
+                materials[colorOut] = displayMaterial(job, i11, steepness);
                 colors[colorOut++] = c11;
 
                 vertices[vertexOut++] = x1;
                 vertices[vertexOut++] = y10;
                 vertices[vertexOut++] = z0;
+                materials[colorOut] = displayMaterial(job, i10, steepness);
                 colors[colorOut++] = c10;
             }
         }
 
-        return new MeshData(vertices, colors);
+        return new MeshData(vertices, colors, materials);
+    }
+
+    private static byte displayMaterial(
+            GenerationJob job,
+            int sampleIndex,
+            float steepness
+    ) {
+        byte material = job.sampleMaterials[sampleIndex];
+
+        // Once a grass slope becomes visually cliff-like, treat it as stone for
+        // the renderer's material breakup rather than keeping grass texture noise.
+        if (material == MinecraftSurfacePalette.MATERIAL_GRASS && steepness > 0.72F) {
+            return MinecraftSurfacePalette.MATERIAL_STONE;
+        }
+
+        return material;
     }
 
     private static int shadeSample(
@@ -866,7 +888,8 @@ public final class WorldgenSurfaceSampler {
 
     private record MeshData(
             int[] vertices,
-            int[] colors
+            int[] colors,
+            byte[] materials
     ) {
     }
 
