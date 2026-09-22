@@ -16,10 +16,13 @@
 - [x] loaded-chunk surface sampler
 - [x] logical 64x64 terrain tiles
 - [x] live debug HUD and timings
-- [x] reject fluid surface samples in diagnostic terrain
+- [x] reject fluid surface samples
+- [x] ignore tree canopies for ground sampling
+- [x] persistent CPU tile cache
+- [x] rebuild only when entering new tile regions
+- [x] per-tile frustum culling
 - [ ] depth/fog handoff validation
 - [ ] persistent GPU tile buffers
-- [ ] per-tile frustum culling
 
 ## M2 - distant generation
 - [ ] off-thread surface sampler
