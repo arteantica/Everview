@@ -17,6 +17,9 @@
       "dev.everview.client.EverviewClient"
     ]
   },
+  "mixins": [
+    "everview.mixins.json"
+  ],
   "depends": {
     "fabricloader": ">=0.19.5",
     "minecraft": "~26.3",
