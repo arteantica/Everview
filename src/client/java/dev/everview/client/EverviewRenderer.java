@@ -10,7 +10,7 @@ import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4fc;
 
 /**
- * M2.3 visibility diagnostic renderer.
+ * M2.4 distance-ladder diagnostic renderer.
  *
  * Each progressive ring now has an intentionally obvious diagnostic palette and
  * independent cull/submit/draw/quad counters. This lets us distinguish "generated
@@ -75,7 +75,7 @@ public final class EverviewRenderer {
                     RenderTypes.debugQuads(),
                     (poseState, consumer) -> {
                         long start = System.nanoTime();
-                        int emittedQuads = drawWorldgenTile(
+                        DrawStats drawStats = drawWorldgenTile(
                                 poseState.pose(),
                                 consumer,
                                 tile,
@@ -85,14 +85,15 @@ public final class EverviewRenderer {
                         EverviewMetrics.recordTileDraw(
                                 tile.lodLevel(),
                                 System.nanoTime() - start,
-                                emittedQuads
+                                drawStats.emittedQuads(),
+                                drawStats.maxQuadDistance()
                         );
                     }
             );
         }
     }
 
-    private static int drawWorldgenTile(
+    private static DrawStats drawWorldgenTile(
             Matrix4fc pose,
             VertexConsumer consumer,
             WorldgenSurfaceTile tile,
@@ -108,6 +109,7 @@ public final class EverviewRenderer {
         double outerSq = (double) ring.outerRadiusBlocks() * ring.outerRadiusBlocks();
 
         int emittedQuads = 0;
+        double maxDistanceSq = 0.0;
         int[] vertices = tile.vertices();
 
         for (int i = 0; i < vertices.length; i += 12) {
@@ -126,9 +128,10 @@ public final class EverviewRenderer {
             drawWorldgenVertex(pose, consumer, vertices, i + 6, cameraX, cameraY, cameraZ, tile);
             drawWorldgenVertex(pose, consumer, vertices, i + 9, cameraX, cameraY, cameraZ, tile);
             emittedQuads++;
+            maxDistanceSq = Math.max(maxDistanceSq, distanceSq);
         }
 
-        return emittedQuads;
+        return new DrawStats(emittedQuads, Math.sqrt(maxDistanceSq));
     }
 
     private static void drawWorldgenVertex(
@@ -156,8 +159,8 @@ public final class EverviewRenderer {
         int green;
         int blue;
 
-        // M2.3 diagnostic palette:
-        // L1 = green/cyan, L2 = amber/orange, L3 = magenta/purple.
+        // Distance-ladder palette:
+        // L1 green/cyan, L2 orange, L3 purple, L4 red, L5 yellow.
         // Water follows the same ring identity instead of sharing one blue.
         switch (tile.lodLevel()) {
             case 1 -> {
@@ -182,7 +185,7 @@ public final class EverviewRenderer {
                     blue = clampColor(35.0F + 80.0F * elevation);
                 }
             }
-            default -> {
+            case 3 -> {
                 if (worldY <= tile.seaLevel() + 1) {
                     red = 155;
                     green = 65;
@@ -193,10 +196,35 @@ public final class EverviewRenderer {
                     blue = clampColor(180.0F + 70.0F * elevation);
                 }
             }
+            case 4 -> {
+                if (worldY <= tile.seaLevel() + 1) {
+                    red = 220;
+                    green = 55;
+                    blue = 75;
+                } else {
+                    red = clampColor(205.0F + 45.0F * elevation);
+                    green = clampColor(45.0F + 65.0F * elevation);
+                    blue = clampColor(45.0F + 55.0F * elevation);
+                }
+            }
+            default -> {
+                if (worldY <= tile.seaLevel() + 1) {
+                    red = 225;
+                    green = 210;
+                    blue = 45;
+                } else {
+                    red = clampColor(215.0F + 40.0F * elevation);
+                    green = clampColor(185.0F + 60.0F * elevation);
+                    blue = clampColor(40.0F + 60.0F * elevation);
+                }
+            }
         }
 
         consumer.addVertex(pose, x, y, z)
                 .setColor(red, green, blue, 190);
+    }
+
+    private record DrawStats(int emittedQuads, double maxQuadDistance) {
     }
 
     private static int clampColor(float value) {
