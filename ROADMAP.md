@@ -63,7 +63,8 @@
 - [x] vertical cliff faces between near-LOD cells
 - [x] flat water/coastline classification for L1
 - [x] denser L1 sampling: 16 -> 8 blocks after M3.2 performance validation
-- [ ] evaluate 4-block L1 or split near ring after M3.2.1 benchmark
+- [x] split near ring: 4-block ultra-near + 8-block near after M3.2.1 benchmark
+- [ ] evaluate 2-block / voxel-derived inner band after M3.2.2 benchmark
 - [ ] texture-atlas / UV material rendering
 - [ ] structures
 - [ ] trees
