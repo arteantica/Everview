@@ -56,6 +56,8 @@ public final class WorldgenSurfaceSampler {
     private static long nextSliceId;
     private static double lastGenerationMs;
     private static int generatedTileCount;
+    private static long initialFillStartedNanos;
+    private static long initialFillCompletedNanos;
 
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
@@ -109,6 +111,10 @@ public final class WorldgenSurfaceSampler {
             lastInnerRadius = innerRadius;
             activeRings = createRings(innerRadius);
             wantedTiles = buildWantedTiles(centerX, centerZ, activeRings);
+
+            if (initialFillStartedNanos == 0L && !wantedTiles.isEmpty()) {
+                initialFillStartedNanos = System.nanoTime();
+            }
         }
 
         if (currentJob != null
@@ -160,6 +166,8 @@ public final class WorldgenSurfaceSampler {
         lastSliceMs = 0.0;
         lastSliceSamples = 0;
         generatedTileCount = 0;
+        initialFillStartedNanos = 0L;
+        initialFillCompletedNanos = 0L;
         currentJob = null;
         activeSliceId = 0L;
     }
@@ -512,8 +520,22 @@ public final class WorldgenSurfaceSampler {
             ));
         }
 
+        if (initialFillCompletedNanos == 0L
+                && initialFillStartedNanos != 0L
+                && !wantedTiles.isEmpty()
+                && active.size() == wantedTiles.size()) {
+            initialFillCompletedNanos = System.nanoTime();
+        }
+
         double progress = currentJob == null ? 0.0 : currentJob.progressPercent();
         int currentLevel = currentJob == null ? 0 : currentJob.ring.lodLevel();
+
+        long fillEnd = initialFillCompletedNanos != 0L
+                ? initialFillCompletedNanos
+                : System.nanoTime();
+        double initialFillSeconds = initialFillStartedNanos == 0L
+                ? 0.0
+                : (fillEnd - initialFillStartedNanos) / 1_000_000_000.0;
 
         snapshot = new WorldgenSurfaceSnapshot(
                 active,
@@ -528,7 +550,9 @@ public final class WorldgenSurfaceSampler {
                 lastSliceMs,
                 lastSliceSamples,
                 progress,
-                currentLevel
+                currentLevel,
+                initialFillSeconds,
+                initialFillCompletedNanos != 0L
         );
     }
 
