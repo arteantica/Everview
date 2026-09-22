@@ -10,11 +10,11 @@ import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4fc;
 
 /**
- * M3.1 material-aware distant terrain renderer.
+ * M3.1.1 baked-material distant terrain renderer.
  *
- * Base biome/material colors are generated with each tile, then a cheap
- * world-space material breakup pass adds readable grass/stone/sand/snow/water
- * character without requiring a texture atlas yet.
+ * Material breakup is precomputed when a tile is generated/loaded from cache.
+ * The hot render path now only submits baked vertex colors instead of hashing
+ * every visible vertex every frame.
  */
 public final class EverviewRenderer {
     private EverviewRenderer() {
@@ -124,20 +124,20 @@ public final class EverviewRenderer {
             }
 
             drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(), tile.materials(),
-                    tile.lodLevel(), i, cameraX, cameraY, cameraZ
+                    pose, consumer, vertices, tile.colors(),
+                    i, cameraX, cameraY, cameraZ
             );
             drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(), tile.materials(),
-                    tile.lodLevel(), i + 3, cameraX, cameraY, cameraZ
+                    pose, consumer, vertices, tile.colors(),
+                    i + 3, cameraX, cameraY, cameraZ
             );
             drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(), tile.materials(),
-                    tile.lodLevel(), i + 6, cameraX, cameraY, cameraZ
+                    pose, consumer, vertices, tile.colors(),
+                    i + 6, cameraX, cameraY, cameraZ
             );
             drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(), tile.materials(),
-                    tile.lodLevel(), i + 9, cameraX, cameraY, cameraZ
+                    pose, consumer, vertices, tile.colors(),
+                    i + 9, cameraX, cameraY, cameraZ
             );
             emittedQuads++;
             maxDistanceSq = Math.max(maxDistanceSq, distanceSq);
@@ -151,8 +151,6 @@ public final class EverviewRenderer {
             VertexConsumer consumer,
             int[] vertices,
             int[] colors,
-            byte[] materials,
-            int lodLevel,
             int index,
             double cameraX,
             double cameraY,
@@ -169,14 +167,7 @@ public final class EverviewRenderer {
         float z = (float) (worldZ - cameraZ);
 
         int vertexIndex = index / 3;
-        int rgb = MaterialTerrainShading.apply(
-                colors[vertexIndex],
-                materials[vertexIndex],
-                worldX,
-                worldY,
-                worldZ,
-                lodLevel
-        );
+        int rgb = colors[vertexIndex];
         int red = (rgb >> 16) & 0xFF;
         int green = (rgb >> 8) & 0xFF;
         int blue = rgb & 0xFF;
