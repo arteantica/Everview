@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M2.0.1 | ACTIVE");
+        lines.add("Everview M2.1 | ACTIVE");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Near debug heightfield: OFF | vanilla/Sodium handoff");
+        lines.add("Near: vanilla/Sodium | debug heightfield OFF");
 
         if (far.available()) {
             lines.add("Far WORLDGEN: " + far.innerRadiusBlocks() + "-" + far.outerRadiusBlocks()
@@ -52,7 +52,14 @@ public final class EverviewDebugHud {
                     far.cacheSize(),
                     far.taskInFlight() ? "ON" : "OFF"
             ));
-            lines.add("Last far tile: " + formatMs(far.lastTileGenerationMs())
+            lines.add(String.format(
+                    "Budget: %.2f ms | slice: %.3f ms / %d samples | tile %.0f%%",
+                    far.sliceBudgetMs(),
+                    far.lastSliceMs(),
+                    far.lastSliceSamples(),
+                    far.currentTileProgressPercent()
+            ));
+            lines.add("Last complete tile CPU: " + formatMs(far.lastTileGenerationMs())
                     + " | generated " + far.generatedTileCount());
         } else {
             lines.add("Far WORLDGEN: unavailable (singleplayer test path)");

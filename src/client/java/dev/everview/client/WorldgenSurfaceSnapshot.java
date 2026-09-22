@@ -3,7 +3,7 @@ package dev.everview.client;
 import java.util.List;
 
 /**
- * Immutable client-side view of the first true distant-worldgen LOD ring.
+ * Immutable client-side view of the distant-worldgen LOD ring.
  */
 public record WorldgenSurfaceSnapshot(
         List<WorldgenSurfaceTile> tiles,
@@ -15,10 +15,29 @@ public record WorldgenSurfaceSnapshot(
         boolean available,
         boolean taskInFlight,
         double lastTileGenerationMs,
-        int generatedTileCount
+        int generatedTileCount,
+        double sliceBudgetMs,
+        double lastSliceMs,
+        int lastSliceSamples,
+        double currentTileProgressPercent
 ) {
     public static final WorldgenSurfaceSnapshot EMPTY =
-            new WorldgenSurfaceSnapshot(List.of(), 0, 0, 0, 0, 0, false, false, 0.0, 0);
+            new WorldgenSurfaceSnapshot(
+                    List.of(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    false,
+                    0.0,
+                    0,
+                    0.0,
+                    0.0,
+                    0,
+                    0.0
+            );
 
     public WorldgenSurfaceSnapshot {
         tiles = List.copyOf(tiles);

@@ -19,22 +19,29 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
- * First true distant-terrain source for Everview.
+ * Budgeted direct-worldgen sampler for Everview.
  *
- * In singleplayer this asks the integrated server's ChunkGenerator for
- * getBaseHeight(). That samples the world's terrain generator directly and does
- * not load or generate the corresponding chunks. Work is executed on the
- * integrated server thread, one 128-block tile at a time, so custom generators
- * do not need to be assumed thread-safe.
+ * M2.0 proved that ChunkGenerator#getBaseHeight can give us seed-derived terrain
+ * beyond loaded chunks without intentionally loading/generating those chunks.
  *
- * This milestone intentionally samples only the generator surface: no trees,
- * structures, player builds, or cave openings yet.
+ * M2.1 changes the scheduling model: a 128-block tile is no longer sampled in
+ * one server task. Sampling is split across many small server-thread slices with
+ * a soft CPU budget. Only one slice can be queued at a time, so Everview cannot
+ * build up an unbounded backlog when the integrated server is busy.
  */
 public final class WorldgenSurfaceSampler {
     public static final int SAMPLE_SPACING = 16;
     public static final int TILE_SIZE = 128;
     public static final int MIN_INNER_RADIUS = 384;
     public static final int OUTER_RADIUS = 1_024;
+
+    /**
+     * Soft budget per integrated-server task. One individual generator sample can
+     * still exceed this, so the budget is measured and exposed in the HUD rather
+     * than treated as a hard realtime guarantee.
+     */
+    public static final long SLICE_BUDGET_NANOS = 1_500_000L;
+    public static final int MAX_SAMPLES_PER_SLICE = 12;
 
     private static final int LOD_LEVEL = 1;
     private static final int CACHE_LIMIT = 384;
@@ -45,8 +52,9 @@ public final class WorldgenSurfaceSampler {
             new ConcurrentLinkedQueue<>();
 
     private static volatile WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSnapshot.EMPTY;
-    private static volatile long activeTaskId;
-    private static volatile LodTileKey inFlightKey;
+    private static volatile long activeSliceId;
+    private static volatile double lastSliceMs;
+    private static volatile int lastSliceSamples;
 
     private static ClientLevel lastClientLevel;
     private static MinecraftServer lastServer;
@@ -54,10 +62,11 @@ public final class WorldgenSurfaceSampler {
     private static int lastCenterTileZ = Integer.MIN_VALUE;
     private static int lastInnerRadius = Integer.MIN_VALUE;
     private static long epoch;
-    private static long nextTaskId;
+    private static long nextSliceId;
     private static double lastGenerationMs;
     private static int generatedTileCount;
     private static List<LodTileKey> wantedKeys = List.of();
+    private static GenerationJob currentJob;
 
     private WorldgenSurfaceSampler() {
     }
@@ -84,7 +93,7 @@ public final class WorldgenSurfaceSampler {
             lastServer = server;
         }
 
-        boolean changed = drainCompleted();
+        drainCompleted();
 
         int centerX = client.player.getBlockX();
         int centerZ = client.player.getBlockZ();
@@ -102,22 +111,31 @@ public final class WorldgenSurfaceSampler {
             lastCenterTileZ = centerTileZ;
             lastInnerRadius = innerRadius;
             wantedKeys = buildWantedKeys(centerX, centerZ, innerRadius);
-            changed = true;
         }
 
-        if (activeTaskId == 0L) {
+        // If movement made the pending tile irrelevant, abandon it between slices.
+        if (currentJob != null
+                && activeSliceId == 0L
+                && !wantedKeys.contains(currentJob.key)) {
+            currentJob = null;
+        }
+
+        if (currentJob != null && currentJob.failed && activeSliceId == 0L) {
+            currentJob = null;
+        }
+
+        if (currentJob == null && activeSliceId == 0L) {
             LodTileKey next = findNextMissing();
             if (next != null) {
-                schedule(server, clientLevel.dimension(), next);
-                changed = true;
+                currentJob = new GenerationJob(next);
             }
         }
 
-        if (changed) {
-            rebuildSnapshot(innerRadius);
-        } else if (snapshot.taskInFlight() != (activeTaskId != 0L)) {
-            rebuildSnapshot(innerRadius);
+        if (currentJob != null && activeSliceId == 0L) {
+            scheduleSlice(server, clientLevel.dimension(), currentJob);
         }
+
+        rebuildSnapshot(innerRadius);
     }
 
     private static void reset() {
@@ -131,15 +149,16 @@ public final class WorldgenSurfaceSampler {
         lastCenterTileZ = Integer.MIN_VALUE;
         lastInnerRadius = Integer.MIN_VALUE;
         lastGenerationMs = 0.0;
+        lastSliceMs = 0.0;
+        lastSliceSamples = 0;
         generatedTileCount = 0;
+        currentJob = null;
 
-        // Invalidate an old task without letting its finally block clear a newer one.
-        activeTaskId = 0L;
-        inFlightKey = null;
+        // An already queued slice may still finish; epoch makes its result stale.
+        activeSliceId = 0L;
     }
 
-    private static boolean drainCompleted() {
-        boolean changed = false;
+    private static void drainCompleted() {
         CompletedTile completed;
 
         while ((completed = COMPLETED.poll()) != null) {
@@ -150,14 +169,13 @@ public final class WorldgenSurfaceSampler {
             CACHE.put(completed.key(), completed.tile());
             lastGenerationMs = completed.tile().generationMs();
             generatedTileCount++;
-            changed = true;
+
+            if (currentJob != null && currentJob.key.equals(completed.key())) {
+                currentJob = null;
+            }
         }
 
-        if (changed) {
-            trimCache();
-        }
-
-        return changed;
+        trimCache();
     }
 
     private static List<LodTileKey> buildWantedKeys(
@@ -222,7 +240,7 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static LodTileKey findNextMissing() {
-        LodTileKey pending = inFlightKey;
+        LodTileKey pending = currentJob == null ? null : currentJob.key;
 
         for (LodTileKey key : wantedKeys) {
             if (key.equals(pending)) {
@@ -236,101 +254,134 @@ public final class WorldgenSurfaceSampler {
         return null;
     }
 
-    private static void schedule(
+    private static void scheduleSlice(
             MinecraftServer server,
             ResourceKey<Level> dimension,
-            LodTileKey key
+            GenerationJob job
     ) {
-        long taskId = ++nextTaskId;
+        long sliceId = ++nextSliceId;
         long taskEpoch = epoch;
-        activeTaskId = taskId;
-        inFlightKey = key;
+        activeSliceId = sliceId;
 
         try {
             server.execute(() -> {
                 try {
                     ServerLevel level = server.getLevel(dimension);
-                    if (level == null || taskEpoch != epoch) {
+                    if (level == null || taskEpoch != epoch || job != currentJob) {
                         return;
                     }
 
-                    WorldgenSurfaceTile tile = buildTile(level, key.tileX(), key.tileZ());
-                    COMPLETED.add(new CompletedTile(taskEpoch, key, tile));
+                    runSlice(level, job, taskEpoch);
                 } catch (Throwable throwable) {
+                    job.failed = true;
                     EverviewClient.LOGGER.warn(
-                            "Everview distant worldgen tile failed at {}, {}",
-                            key.tileX(),
-                            key.tileZ(),
+                            "Everview budgeted worldgen slice failed at tile {}, {}",
+                            job.key.tileX(),
+                            job.key.tileZ(),
                             throwable
                     );
                 } finally {
-                    if (activeTaskId == taskId) {
-                        activeTaskId = 0L;
-                        inFlightKey = null;
+                    if (activeSliceId == sliceId) {
+                        activeSliceId = 0L;
                     }
                 }
             });
         } catch (Throwable throwable) {
-            if (activeTaskId == taskId) {
-                activeTaskId = 0L;
-                inFlightKey = null;
+            job.failed = true;
+            if (activeSliceId == sliceId) {
+                activeSliceId = 0L;
             }
-            EverviewClient.LOGGER.warn("Everview could not schedule distant worldgen tile", throwable);
+            EverviewClient.LOGGER.warn("Everview could not schedule a worldgen slice", throwable);
         }
     }
 
-    private static WorldgenSurfaceTile buildTile(ServerLevel level, int tileX, int tileZ) {
-        long start = System.nanoTime();
-
-        int originX = tileX * TILE_SIZE;
-        int originZ = tileZ * TILE_SIZE;
-        int samplesAcross = TILE_SIZE / SAMPLE_SPACING + 1;
-        int[] heights = new int[samplesAcross * samplesAcross];
+    private static void runSlice(
+            ServerLevel level,
+            GenerationJob job,
+            long taskEpoch
+    ) {
+        long sliceStart = System.nanoTime();
 
         ServerChunkCache chunks = level.getChunkSource();
         var generator = chunks.getGenerator();
         var randomState = chunks.randomState();
 
-        int minY = Integer.MAX_VALUE;
-        int maxY = Integer.MIN_VALUE;
+        int processed = 0;
 
-        for (int gz = 0; gz < samplesAcross; gz++) {
-            int worldZ = originZ + gz * SAMPLE_SPACING;
+        while (job.nextSample < job.totalSamples && processed < MAX_SAMPLES_PER_SLICE) {
+            int sampleIndex = job.nextSample;
+            int gx = sampleIndex % job.samplesAcross;
+            int gz = sampleIndex / job.samplesAcross;
+            int worldX = job.originX + gx * SAMPLE_SPACING;
+            int worldZ = job.originZ + gz * SAMPLE_SPACING;
 
-            for (int gx = 0; gx < samplesAcross; gx++) {
-                int worldX = originX + gx * SAMPLE_SPACING;
-                int y = generator.getBaseHeight(
-                        worldX,
-                        worldZ,
-                        Heightmap.Types.WORLD_SURFACE_WG,
-                        level,
-                        randomState
-                );
+            int y = generator.getBaseHeight(
+                    worldX,
+                    worldZ,
+                    Heightmap.Types.WORLD_SURFACE_WG,
+                    level,
+                    randomState
+            );
 
-                y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
-                heights[gz * samplesAcross + gx] = y;
-                minY = Math.min(minY, y);
-                maxY = Math.max(maxY, y);
+            y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
+            job.heights[sampleIndex] = y;
+            job.minY = Math.min(job.minY, y);
+            job.maxY = Math.max(job.maxY, y);
+            job.nextSample = sampleIndex + 1;
+            processed++;
+
+            if (System.nanoTime() - sliceStart >= SLICE_BUDGET_NANOS) {
+                break;
             }
         }
 
-        int cellsAcross = samplesAcross - 1;
-        int cellCount = cellsAcross * cellsAcross;
-        int[] vertices = new int[cellCount * 12];
+        long samplingElapsed = System.nanoTime() - sliceStart;
+        job.accumulatedNanos += samplingElapsed;
+
+        long sliceElapsed = samplingElapsed;
+
+        if (job.nextSample >= job.totalSamples && taskEpoch == epoch) {
+            long meshStart = System.nanoTime();
+            int[] vertices = buildVertices(job);
+            long meshElapsed = System.nanoTime() - meshStart;
+
+            job.accumulatedNanos += meshElapsed;
+            sliceElapsed += meshElapsed;
+
+            WorldgenSurfaceTile tile = new WorldgenSurfaceTile(
+                    job.key.tileX(),
+                    job.key.tileZ(),
+                    vertices,
+                    job.cellCount,
+                    job.minY,
+                    job.maxY,
+                    level.getSeaLevel(),
+                    job.accumulatedNanos
+            );
+
+            COMPLETED.add(new CompletedTile(taskEpoch, job.key, tile));
+        }
+
+        lastSliceSamples = processed;
+        lastSliceMs = sliceElapsed / 1_000_000.0;
+    }
+
+    private static int[] buildVertices(GenerationJob job) {
+        int[] vertices = new int[job.cellCount * 12];
         int out = 0;
 
-        for (int gz = 0; gz < cellsAcross; gz++) {
-            int z0 = originZ + gz * SAMPLE_SPACING;
+        for (int gz = 0; gz < job.cellsAcross; gz++) {
+            int z0 = job.originZ + gz * SAMPLE_SPACING;
             int z1 = z0 + SAMPLE_SPACING;
 
-            for (int gx = 0; gx < cellsAcross; gx++) {
-                int x0 = originX + gx * SAMPLE_SPACING;
+            for (int gx = 0; gx < job.cellsAcross; gx++) {
+                int x0 = job.originX + gx * SAMPLE_SPACING;
                 int x1 = x0 + SAMPLE_SPACING;
 
-                int y00 = heights[gz * samplesAcross + gx];
-                int y10 = heights[gz * samplesAcross + gx + 1];
-                int y01 = heights[(gz + 1) * samplesAcross + gx];
-                int y11 = heights[(gz + 1) * samplesAcross + gx + 1];
+                int y00 = job.heights[gz * job.samplesAcross + gx];
+                int y10 = job.heights[gz * job.samplesAcross + gx + 1];
+                int y01 = job.heights[(gz + 1) * job.samplesAcross + gx];
+                int y11 = job.heights[(gz + 1) * job.samplesAcross + gx + 1];
 
                 vertices[out++] = x0;
                 vertices[out++] = y00;
@@ -350,16 +401,7 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
-        return new WorldgenSurfaceTile(
-                tileX,
-                tileZ,
-                vertices,
-                cellCount,
-                minY,
-                maxY,
-                level.getSeaLevel(),
-                System.nanoTime() - start
-        );
+        return vertices;
     }
 
     private static void trimCache() {
@@ -384,6 +426,8 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
+        double progress = currentJob == null ? 0.0 : currentJob.progressPercent();
+
         snapshot = new WorldgenSurfaceSnapshot(
                 active,
                 wantedKeys.size(),
@@ -392,10 +436,46 @@ public final class WorldgenSurfaceSampler {
                 OUTER_RADIUS,
                 SAMPLE_SPACING,
                 true,
-                activeTaskId != 0L,
+                currentJob != null || activeSliceId != 0L,
                 lastGenerationMs,
-                generatedTileCount
+                generatedTileCount,
+                SLICE_BUDGET_NANOS / 1_000_000.0,
+                lastSliceMs,
+                lastSliceSamples,
+                progress
         );
+    }
+
+    private static final class GenerationJob {
+        private final LodTileKey key;
+        private final int originX;
+        private final int originZ;
+        private final int samplesAcross;
+        private final int cellsAcross;
+        private final int totalSamples;
+        private final int cellCount;
+        private final int[] heights;
+
+        private volatile int nextSample;
+        private volatile boolean failed;
+        private int minY = Integer.MAX_VALUE;
+        private int maxY = Integer.MIN_VALUE;
+        private long accumulatedNanos;
+
+        private GenerationJob(LodTileKey key) {
+            this.key = key;
+            this.originX = key.tileX() * TILE_SIZE;
+            this.originZ = key.tileZ() * TILE_SIZE;
+            this.samplesAcross = TILE_SIZE / SAMPLE_SPACING + 1;
+            this.cellsAcross = samplesAcross - 1;
+            this.totalSamples = samplesAcross * samplesAcross;
+            this.cellCount = cellsAcross * cellsAcross;
+            this.heights = new int[totalSamples];
+        }
+
+        private double progressPercent() {
+            return nextSample * 100.0 / totalSamples;
+        }
     }
 
     private record CompletedTile(
