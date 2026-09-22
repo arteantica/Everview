@@ -17,18 +17,20 @@ public final class MaterialTerrainShading {
             int worldX,
             int worldY,
             int worldZ,
-            int lodLevel
+            int sampleSpacing
     ) {
-        float strength = detailStrength(lodLevel);
+        float strength = detailStrength(sampleSpacing);
         if (strength <= 0.0F) {
             return baseRgb;
         }
 
-        int detailScale = 8 << Math.min(4, Math.max(0, lodLevel - 1));
+        int detailScale = sampleSpacing <= 8
+                ? Math.max(4, sampleSpacing)
+                : Math.max(8, sampleSpacing / 2);
         int cellX = Math.floorDiv(worldX, detailScale);
         int cellZ = Math.floorDiv(worldZ, detailScale);
 
-        float coarse = signedNoise(cellX, cellZ, material * 31 + lodLevel * 17);
+        float coarse = signedNoise(cellX, cellZ, material * 31 + sampleSpacing * 17);
         float fine = signedNoise(cellX * 3 + worldY, cellZ * 3 - worldY, 97 + material * 13);
 
         float brightness;
@@ -92,14 +94,20 @@ public final class MaterialTerrainShading {
         }
     }
 
-    private static float detailStrength(int lodLevel) {
-        return switch (lodLevel) {
-            case 1 -> 1.00F;
-            case 2 -> 0.72F;
-            case 3 -> 0.46F;
-            case 4 -> 0.25F;
-            default -> 0.12F;
-        };
+    private static float detailStrength(int sampleSpacing) {
+        if (sampleSpacing <= 8) {
+            return 1.00F;
+        }
+        if (sampleSpacing <= 32) {
+            return 0.72F;
+        }
+        if (sampleSpacing <= 64) {
+            return 0.46F;
+        }
+        if (sampleSpacing <= 128) {
+            return 0.25F;
+        }
+        return 0.12F;
     }
 
     private static float signedNoise(int x, int z, int salt) {

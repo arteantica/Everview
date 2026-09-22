@@ -312,13 +312,41 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static List<WorldgenLodRing> createRings(int innerRadius) {
-        return List.of(
-                new WorldgenLodRing(1, innerRadius, 1_024, 128, 8),
-                new WorldgenLodRing(2, 1_024, 2_048, 256, 32),
-                new WorldgenLodRing(3, 2_048, 4_096, 512, 64),
-                new WorldgenLodRing(4, 4_096, 8_192, 1_024, 128),
-                new WorldgenLodRing(5, 8_192, 16_384, 2_048, 256)
+        List<WorldgenLodRing> rings = new ArrayList<>(6);
+
+        // M3.2.2 introduces a narrow ultra-near band rather than making the
+        // entire 1K ring four times denser. At the current 384-block vanilla
+        // radius this resolves to ~352-544 at 4-block spacing, followed by the
+        // validated 8-block representation out to 1,024.
+        int ultraNearOuter = Math.min(
+                1_024,
+                Math.max(544, innerRadius + 192)
         );
+
+        rings.add(new WorldgenLodRing(
+                1,
+                innerRadius,
+                ultraNearOuter,
+                128,
+                4
+        ));
+
+        if (ultraNearOuter < 1_024) {
+            rings.add(new WorldgenLodRing(
+                    2,
+                    ultraNearOuter,
+                    1_024,
+                    128,
+                    8
+            ));
+        }
+
+        rings.add(new WorldgenLodRing(3, 1_024, 2_048, 256, 32));
+        rings.add(new WorldgenLodRing(4, 2_048, 4_096, 512, 64));
+        rings.add(new WorldgenLodRing(5, 4_096, 8_192, 1_024, 128));
+        rings.add(new WorldgenLodRing(6, 8_192, 16_384, 2_048, 256));
+
+        return List.copyOf(rings);
     }
 
     private static void reset() {
@@ -648,7 +676,7 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static MeshData buildMesh(GenerationJob job, int seaLevel) {
-        if (job.ring.lodLevel() == 1) {
+        if (job.ring.sampleSpacing() <= 8) {
             return buildTerracedMesh(job, seaLevel);
         }
 
@@ -707,19 +735,19 @@ public final class WorldgenSurfaceSampler {
 
                 int c00 = MaterialTerrainShading.apply(
                         shadeSample(job, i00, shade, steepness),
-                        m00, x0, y00, z0, job.ring.lodLevel()
+                        m00, x0, y00, z0, job.ring.sampleSpacing()
                 );
                 int c01 = MaterialTerrainShading.apply(
                         shadeSample(job, i01, shade, steepness),
-                        m01, x0, y01, z1, job.ring.lodLevel()
+                        m01, x0, y01, z1, job.ring.sampleSpacing()
                 );
                 int c11 = MaterialTerrainShading.apply(
                         shadeSample(job, i11, shade, steepness),
-                        m11, x1, y11, z1, job.ring.lodLevel()
+                        m11, x1, y11, z1, job.ring.sampleSpacing()
                 );
                 int c10 = MaterialTerrainShading.apply(
                         shadeSample(job, i10, shade, steepness),
-                        m10, x1, y10, z0, job.ring.lodLevel()
+                        m10, x1, y10, z0, job.ring.sampleSpacing()
                 );
 
                 vertices[vertexOut++] = x0;
@@ -752,8 +780,9 @@ public final class WorldgenSurfaceSampler {
     }
 
     /**
-     * L1 gets a deliberately blockier coarse-voxel surface. Each 8x8 cell is
-     * a flat plateau, with vertical faces between neighboring plateaus and dark
+     * Near Everview rings use deliberately blockier coarse-voxel surfaces.
+     * M3.2.2 uses 4x4 cells closest to vanilla and 8x8 cells farther out, each
+     * as a flat plateau with vertical faces between neighboring plateaus and dark
      * skirts around tile edges. This sacrifices smooth triangles close to the
      * vanilla handoff in favor of silhouettes that read much more like Minecraft.
      */
@@ -818,7 +847,7 @@ public final class WorldgenSurfaceSampler {
                         x,
                         y,
                         z,
-                        job.ring.lodLevel()
+                        job.ring.sampleSpacing()
                 );
             }
         }

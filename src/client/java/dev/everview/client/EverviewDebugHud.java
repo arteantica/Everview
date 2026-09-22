@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.2.1 | FINER L1 TERRAIN");
+        lines.add("Everview M3.2.2 | 4-BLOCK ULTRA-NEAR");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Visual: L1 8-block terraces | 1-block height steps | cliff walls | flat water");
+        lines.add("Visual: L1 4-block ultra-near | L2 8-block near | 1-block steps | cliff walls");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
