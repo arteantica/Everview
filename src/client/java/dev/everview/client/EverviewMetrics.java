@@ -1,9 +1,14 @@
 package dev.everview.client;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * Render/update telemetry used by the alpha HUD.
  */
 public final class EverviewMetrics {
+    private static final int MAX_DIAGNOSTIC_LOD = 3;
+
     private static volatile int activeTiles;
     private static volatile int cells;
     private static volatile int vertices;
@@ -18,6 +23,11 @@ public final class EverviewMetrics {
     private static volatile int tilesCulled;
     private static volatile double updateMs;
     private static volatile double drawMs;
+
+    private static final int[] ringSubmissions = new int[MAX_DIAGNOSTIC_LOD + 1];
+    private static final int[] ringDrawn = new int[MAX_DIAGNOSTIC_LOD + 1];
+    private static final int[] ringCulled = new int[MAX_DIAGNOSTIC_LOD + 1];
+    private static final int[] ringEmittedQuads = new int[MAX_DIAGNOSTIC_LOD + 1];
 
     private static long frameDrawNanos;
 
@@ -42,14 +52,35 @@ public final class EverviewMetrics {
         tilesCulled = 0;
         frameDrawNanos = 0L;
         drawMs = 0.0;
+
+        for (int level = 1; level <= MAX_DIAGNOSTIC_LOD; level++) {
+            ringSubmissions[level] = 0;
+            ringDrawn[level] = 0;
+            ringCulled[level] = 0;
+            ringEmittedQuads[level] = 0;
+        }
     }
 
     public static void recordCulledTile() {
         tilesCulled++;
     }
 
+    public static void recordCulledTile(int lodLevel) {
+        recordCulledTile();
+        if (validLod(lodLevel)) {
+            ringCulled[lodLevel]++;
+        }
+    }
+
     public static void recordSubmission() {
         submissions++;
+    }
+
+    public static void recordSubmission(int lodLevel) {
+        recordSubmission();
+        if (validLod(lodLevel)) {
+            ringSubmissions[lodLevel]++;
+        }
     }
 
     public static void recordTileDraw(long nanos) {
@@ -58,7 +89,28 @@ public final class EverviewMetrics {
         drawMs = frameDrawNanos / 1_000_000.0;
     }
 
+    public static void recordTileDraw(int lodLevel, long nanos, int emittedQuads) {
+        recordTileDraw(nanos);
+
+        if (validLod(lodLevel)) {
+            ringDrawn[lodLevel]++;
+            ringEmittedQuads[lodLevel] += emittedQuads;
+        }
+    }
+
     public static Snapshot snapshot() {
+        List<RingRenderStats> ringStats = new ArrayList<>(MAX_DIAGNOSTIC_LOD);
+
+        for (int level = 1; level <= MAX_DIAGNOSTIC_LOD; level++) {
+            ringStats.add(new RingRenderStats(
+                    level,
+                    ringCulled[level],
+                    ringSubmissions[level],
+                    ringDrawn[level],
+                    ringEmittedQuads[level]
+            ));
+        }
+
         return new Snapshot(
                 activeTiles,
                 cells,
@@ -72,8 +124,22 @@ public final class EverviewMetrics {
                 tilesDrawn,
                 tilesCulled,
                 updateMs,
-                drawMs
+                drawMs,
+                ringStats
         );
+    }
+
+    private static boolean validLod(int lodLevel) {
+        return lodLevel >= 1 && lodLevel <= MAX_DIAGNOSTIC_LOD;
+    }
+
+    public record RingRenderStats(
+            int lodLevel,
+            int culled,
+            int submitted,
+            int drawn,
+            int emittedQuads
+    ) {
     }
 
     public record Snapshot(
@@ -89,7 +155,20 @@ public final class EverviewMetrics {
             int tilesDrawn,
             int tilesCulled,
             double updateMs,
-            double drawMs
+            double drawMs,
+            List<RingRenderStats> ringRenderStats
     ) {
+        public Snapshot {
+            ringRenderStats = List.copyOf(ringRenderStats);
+        }
+
+        public RingRenderStats ring(int lodLevel) {
+            for (RingRenderStats stats : ringRenderStats) {
+                if (stats.lodLevel() == lodLevel) {
+                    return stats;
+                }
+            }
+            return new RingRenderStats(lodLevel, 0, 0, 0, 0);
+        }
     }
 }
