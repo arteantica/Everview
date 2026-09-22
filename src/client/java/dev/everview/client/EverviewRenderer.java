@@ -151,13 +151,23 @@ public final class EverviewRenderer {
     ) {
         double centerX = (tile.minX() + tile.maxX()) * 0.5;
         double centerZ = (tile.minZ() + tile.maxZ()) * 0.5;
-        double distance = Math.hypot(centerX - cameraX, centerZ - cameraZ);
+        double centerDistance = Math.hypot(centerX - cameraX, centerZ - cameraZ);
 
-        double inner = ring.innerRadiusBlocks();
         if (ring.lodLevel() == 1) {
-            inner = Math.max(0.0, inner - tile.tileSize() * 0.5);
+            // Never let a whole persistent L1 tile leak across the intended
+            // inner handoff. The nearest point of the tile must be outside the
+            // 32-block overlap boundary. With 32-block L1 tiles, this keeps the
+            // visible transition tight without falling back to per-quad CPU
+            // clipping every frame.
+            double nearestX = Math.max(tile.minX(), Math.min(cameraX, tile.maxX()));
+            double nearestZ = Math.max(tile.minZ(), Math.min(cameraZ, tile.maxZ()));
+            double nearestDistance = Math.hypot(nearestX - cameraX, nearestZ - cameraZ);
+
+            return nearestDistance >= ring.innerRadiusBlocks()
+                    && centerDistance <= ring.outerRadiusBlocks();
         }
 
-        return distance >= inner && distance <= ring.outerRadiusBlocks();
+        return centerDistance >= ring.innerRadiusBlocks()
+                && centerDistance <= ring.outerRadiusBlocks();
     }
 }
