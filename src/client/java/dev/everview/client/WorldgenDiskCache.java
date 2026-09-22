@@ -47,8 +47,9 @@ public final class WorldgenDiskCache {
                 .resolve(dimensionId + ".evc.gz");
     }
 
-    public static long seedFor(MinecraftServer server) {
-        return server.getWorldData().worldGenOptions().seed();
+    public static long seedFor(MinecraftServer server, ResourceKey<Level> dimension) {
+        var level = server.getLevel(dimension);
+        return level == null ? 0L : level.getSeed();
     }
 
     public static String dimensionId(ResourceKey<Level> dimension) {
