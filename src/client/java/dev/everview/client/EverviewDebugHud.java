@@ -71,6 +71,17 @@ public final class EverviewDebugHud {
                     far.taskInFlight() ? "ON" : "OFF"
             ));
 
+            double tilesPerSecond = far.initialFillSeconds() > 0.0
+                    ? far.readyTileCount() / far.initialFillSeconds()
+                    : 0.0;
+
+            lines.add(String.format(
+                    "Initial fill: %s %s | %.1f tiles/s",
+                    formatDuration(far.initialFillSeconds()),
+                    far.initialFillComplete() ? "DONE" : "RUNNING",
+                    tilesPerSecond
+            ));
+
             lines.add(String.format(
                     "Budget %.2f | slice %.3f ms / %d | L%d tile %.0f%%",
                     far.sliceBudgetMs(),
@@ -113,6 +124,17 @@ public final class EverviewDebugHud {
 
     private static String formatMs(double ms) {
         return String.format("%.3f ms", ms);
+    }
+
+    private static String formatDuration(double seconds) {
+        int wholeMinutes = (int) (seconds / 60.0);
+        double remainingSeconds = seconds - wholeMinutes * 60.0;
+
+        if (wholeMinutes > 0) {
+            return String.format("%d:%04.1f", wholeMinutes, remainingSeconds);
+        }
+
+        return String.format("%.1fs", remainingSeconds);
     }
 
     private static String yesNo(boolean value) {
