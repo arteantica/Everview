@@ -7,7 +7,7 @@ import java.util.List;
  * Render/update telemetry used by the alpha HUD.
  */
 public final class EverviewMetrics {
-    private static final int MAX_DIAGNOSTIC_LOD = 3;
+    private static final int MAX_DIAGNOSTIC_LOD = 5;
 
     private static volatile int activeTiles;
     private static volatile int cells;
@@ -28,6 +28,7 @@ public final class EverviewMetrics {
     private static final int[] ringDrawn = new int[MAX_DIAGNOSTIC_LOD + 1];
     private static final int[] ringCulled = new int[MAX_DIAGNOSTIC_LOD + 1];
     private static final int[] ringEmittedQuads = new int[MAX_DIAGNOSTIC_LOD + 1];
+    private static final double[] ringMaxQuadDistance = new double[MAX_DIAGNOSTIC_LOD + 1];
 
     private static long frameDrawNanos;
 
@@ -58,6 +59,7 @@ public final class EverviewMetrics {
             ringDrawn[level] = 0;
             ringCulled[level] = 0;
             ringEmittedQuads[level] = 0;
+            ringMaxQuadDistance[level] = 0.0;
         }
     }
 
@@ -89,12 +91,19 @@ public final class EverviewMetrics {
         drawMs = frameDrawNanos / 1_000_000.0;
     }
 
-    public static void recordTileDraw(int lodLevel, long nanos, int emittedQuads) {
+    public static void recordTileDraw(
+            int lodLevel,
+            long nanos,
+            int emittedQuads,
+            double maxQuadDistance
+    ) {
         recordTileDraw(nanos);
 
         if (validLod(lodLevel)) {
             ringDrawn[lodLevel]++;
             ringEmittedQuads[lodLevel] += emittedQuads;
+            ringMaxQuadDistance[lodLevel] =
+                    Math.max(ringMaxQuadDistance[lodLevel], maxQuadDistance);
         }
     }
 
@@ -107,7 +116,8 @@ public final class EverviewMetrics {
                     ringCulled[level],
                     ringSubmissions[level],
                     ringDrawn[level],
-                    ringEmittedQuads[level]
+                    ringEmittedQuads[level],
+                    ringMaxQuadDistance[level]
             ));
         }
 
@@ -138,7 +148,8 @@ public final class EverviewMetrics {
             int culled,
             int submitted,
             int drawn,
-            int emittedQuads
+            int emittedQuads,
+            double maxQuadDistance
     ) {
     }
 
@@ -168,7 +179,7 @@ public final class EverviewMetrics {
                     return stats;
                 }
             }
-            return new RingRenderStats(lodLevel, 0, 0, 0, 0);
+            return new RingRenderStats(lodLevel, 0, 0, 0, 0, 0.0);
         }
     }
 }

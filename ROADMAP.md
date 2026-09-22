@@ -30,6 +30,7 @@
 - [x] split distant generation into small server-thread slices
 - [x] soft per-slice CPU budget with bounded queued work
 - [x] multiple progressive LOD rings to 4,096 blocks
+- [x] distance-ladder diagnostic rings to 16,384 blocks
 - [x] per-ring visibility/cull/submission diagnostics
 - [ ] adaptive generation budget based on server/client frame pressure
 - [ ] far-plane extension beyond vanilla camera depth
@@ -64,6 +65,7 @@
 ## Benchmark goals
 - [x] first generator-derived terrain beyond loaded chunks
 - [x] 4,096-block progressive-ring smoke test
+- [x] 16,384-block distance-ladder smoke test
 - [ ] 65,536 blocks
 - [ ] 262,144 blocks
 - [ ] world-scale horizon mode

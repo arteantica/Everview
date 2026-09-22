@@ -22,18 +22,19 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 /**
  * Budgeted progressive distant-worldgen sampler.
  *
- * M2.2 adds multiple rings while preserving M2.1's one-slice-at-a-time server
- * budget. Each ring doubles tile size and sample spacing, so each tile still
- * contains an 8x8 quad grid even as coverage expands exponentially.
+ * M2.4 extends the progressive ladder to 16,384 blocks while preserving
+ * M2.1's one-slice-at-a-time server budget. Every ring doubles tile size and
+ * sample spacing, so each tile remains an 8x8 quad grid while coverage expands
+ * exponentially.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 384;
-    public static final int MAX_OUTER_RADIUS = 4_096;
+    public static final int MAX_OUTER_RADIUS = 16_384;
 
     public static final long SLICE_BUDGET_NANOS = 1_500_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 12;
 
-    private static final int CACHE_LIMIT = 768;
+    private static final int CACHE_LIMIT = 1_536;
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
@@ -55,6 +56,8 @@ public final class WorldgenSurfaceSampler {
     private static long nextSliceId;
     private static double lastGenerationMs;
     private static int generatedTileCount;
+    private static long initialFillStartedNanos;
+    private static long initialFillCompletedNanos;
 
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
@@ -94,9 +97,9 @@ public final class WorldgenSurfaceSampler {
         int innerRadius = Math.max(MIN_INNER_RADIUS, vanillaRadius + 64);
         innerRadius = Math.min(innerRadius, 896);
 
-        // The coarsest ring moves in 512-block tile steps. Rebuild desired sets
-        // only when the camera crosses that grid, while per-quad radius clipping
-        // in the renderer keeps the circular handoff centered on the camera.
+        // Rebuild desired sets on the L1 tile grid. The outer rings are much
+        // coarser, while per-quad radius clipping keeps every annulus centered
+        // on the actual camera rather than the snapped anchor.
         int anchorX = Math.floorDiv(centerX, 128) * 128;
         int anchorZ = Math.floorDiv(centerZ, 128) * 128;
 
@@ -108,6 +111,10 @@ public final class WorldgenSurfaceSampler {
             lastInnerRadius = innerRadius;
             activeRings = createRings(innerRadius);
             wantedTiles = buildWantedTiles(centerX, centerZ, activeRings);
+
+            if (initialFillStartedNanos == 0L && !wantedTiles.isEmpty()) {
+                initialFillStartedNanos = System.nanoTime();
+            }
         }
 
         if (currentJob != null
@@ -138,7 +145,9 @@ public final class WorldgenSurfaceSampler {
         return List.of(
                 new WorldgenLodRing(1, innerRadius, 1_024, 128, 16),
                 new WorldgenLodRing(2, 1_024, 2_048, 256, 32),
-                new WorldgenLodRing(3, 2_048, 4_096, 512, 64)
+                new WorldgenLodRing(3, 2_048, 4_096, 512, 64),
+                new WorldgenLodRing(4, 4_096, 8_192, 1_024, 128),
+                new WorldgenLodRing(5, 8_192, 16_384, 2_048, 256)
         );
     }
 
@@ -157,6 +166,8 @@ public final class WorldgenSurfaceSampler {
         lastSliceMs = 0.0;
         lastSliceSamples = 0;
         generatedTileCount = 0;
+        initialFillStartedNanos = 0L;
+        initialFillCompletedNanos = 0L;
         currentJob = null;
         activeSliceId = 0L;
     }
@@ -509,8 +520,22 @@ public final class WorldgenSurfaceSampler {
             ));
         }
 
+        if (initialFillCompletedNanos == 0L
+                && initialFillStartedNanos != 0L
+                && !wantedTiles.isEmpty()
+                && active.size() == wantedTiles.size()) {
+            initialFillCompletedNanos = System.nanoTime();
+        }
+
         double progress = currentJob == null ? 0.0 : currentJob.progressPercent();
         int currentLevel = currentJob == null ? 0 : currentJob.ring.lodLevel();
+
+        long fillEnd = initialFillCompletedNanos != 0L
+                ? initialFillCompletedNanos
+                : System.nanoTime();
+        double initialFillSeconds = initialFillStartedNanos == 0L
+                ? 0.0
+                : (fillEnd - initialFillStartedNanos) / 1_000_000_000.0;
 
         snapshot = new WorldgenSurfaceSnapshot(
                 active,
@@ -525,7 +550,9 @@ public final class WorldgenSurfaceSampler {
                 lastSliceMs,
                 lastSliceSamples,
                 progress,
-                currentLevel
+                currentLevel,
+                initialFillSeconds,
+                initialFillCompletedNanos != 0L
         );
     }
 

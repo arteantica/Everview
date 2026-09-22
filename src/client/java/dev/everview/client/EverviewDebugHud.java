@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M2.3 | RING VISIBILITY");
+        lines.add("Everview M2.4 | DISTANCE LADDER 16K");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Palette: L1 GREEN | L2 ORANGE | L3 PURPLE");
+        lines.add("Palette: L1 GREEN | L2 ORANGE | L3 PURPLE | L4 RED | L5 YELLOW");
 
         if (far.available()) {
             for (WorldgenRingStatus status : far.rings()) {
@@ -47,7 +47,7 @@ public final class EverviewDebugHud {
                 EverviewMetrics.RingRenderStats render = metrics.ring(ring.lodLevel());
 
                 lines.add(String.format(
-                        "L%d %d-%d s%d: gen %d/%d | c/s/d %d/%d/%d | q %d",
+                        "L%d %d-%d s%d: gen %d/%d | c/s/d %d/%d/%d | q %d | max %.0f",
                         ring.lodLevel(),
                         ring.innerRadiusBlocks(),
                         ring.outerRadiusBlocks(),
@@ -57,7 +57,8 @@ public final class EverviewDebugHud {
                         render.culled(),
                         render.submitted(),
                         render.drawn(),
-                        render.emittedQuads()
+                        render.emittedQuads(),
+                        render.maxQuadDistance()
                 ));
             }
 
@@ -68,6 +69,17 @@ public final class EverviewDebugHud {
                     far.completionPercent(),
                     far.cacheSize(),
                     far.taskInFlight() ? "ON" : "OFF"
+            ));
+
+            double tilesPerSecond = far.initialFillSeconds() > 0.0
+                    ? far.readyTileCount() / far.initialFillSeconds()
+                    : 0.0;
+
+            lines.add(String.format(
+                    "Initial fill: %s %s | %.1f tiles/s",
+                    formatDuration(far.initialFillSeconds()),
+                    far.initialFillComplete() ? "DONE" : "RUNNING",
+                    tilesPerSecond
             ));
 
             lines.add(String.format(
@@ -112,6 +124,17 @@ public final class EverviewDebugHud {
 
     private static String formatMs(double ms) {
         return String.format("%.3f ms", ms);
+    }
+
+    private static String formatDuration(double seconds) {
+        int wholeMinutes = (int) (seconds / 60.0);
+        double remainingSeconds = seconds - wholeMinutes * 60.0;
+
+        if (wholeMinutes > 0) {
+            return String.format("%d:%04.1f", wholeMinutes, remainingSeconds);
+        }
+
+        return String.format("%.1fs", remainingSeconds);
     }
 
     private static String yesNo(boolean value) {
