@@ -1,43 +1,55 @@
-# Everview renderer roadmap
+# Everview roadmap
 
-## M0 - bootstrap
-- [x] NeoForge 1.21.1 client project
+## M0 - 26.3 Fabric foundation
+- [x] Minecraft 26.3 / Fabric baseline
+- [x] Java 25 toolchain
 - [x] clipmap layout
-- [x] world render hook
-- [x] debug overlay
+- [x] tile addressing
 - [x] generation-priority primitive
+- [x] CI build
+- [ ] renderer-backend interface
 
 ## M1 - first visible terrain
-- [ ] custom GPU vertex/index buffers
-- [ ] surface tiles from already-loaded chunks
-- [ ] camera-relative coordinates to avoid far-distance precision loss
-- [ ] ring skirts / crack suppression
-- [ ] depth-correct draw before translucent world geometry
+- [ ] 26.3 render-graph integration
+- [ ] diagnostic terrain mesh
+- [ ] camera-relative coordinates
+- [ ] depth-correct world composition
+- [ ] live debug metrics
+- [ ] loaded-chunk surface sampler
 
 ## M2 - distant generation
 - [ ] off-thread surface sampler
-- [ ] direct worldgen sampling without loading full client chunks
-- [ ] bounded worker queue
-- [ ] tile cache and eviction
+- [ ] direct worldgen sampling without full client chunks
+- [ ] bounded worker queue and cancellation
+- [ ] compact surface tile format
 - [ ] disk persistence
 
-## M3 - optimization
+## M3 - GPU architecture
+- [ ] persistent GPU buffers
+- [ ] batched/indirect terrain submission
 - [ ] frustum culling
 - [ ] horizon/occlusion culling
-- [ ] indirect/batched draws
-- [ ] persistent mapped buffers where supported
 - [ ] screen-space error based detail selection
+- [ ] seam stitching / geomorphing
 
 ## M4 - visual parity
 - [ ] biome tint
-- [ ] water surface
+- [ ] water
 - [ ] snow/material classification
 - [ ] structures
 - [ ] trees
-- [ ] fog and atmospheric handoff
+- [ ] fog and atmosphere
 
-## M5 - shaders
+## M5 - compatibility
+- [ ] Sodium path
 - [ ] Iris detection and safe fallback
-- [ ] depth/fog integration
-- [ ] LOD material metadata
-- [ ] simplified distant shadow caster path
+- [ ] shader depth/fog integration
+- [ ] simplified distant shadows
+- [ ] shader-facing LOD metadata
+
+## Benchmark goals
+- [ ] 65,536 blocks
+- [ ] 262,144 blocks
+- [ ] world-scale horizon mode
+- [ ] fixed RAM/VRAM budgets
+- [ ] standardized comparison scenes and frame-time captures

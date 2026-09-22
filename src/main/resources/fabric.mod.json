@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "everview",
+  "version": "${version}",
+  "name": "Everview",
+  "description": "Experimental extreme-distance terrain LOD renderer for Minecraft.",
+  "authors": [
+    "Everview"
+  ],
+  "contact": {
+    "sources": "https://github.com/arteantica/Everview"
+  },
+  "license": "All-Rights-Reserved",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.everview.client.EverviewClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

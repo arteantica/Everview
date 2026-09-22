@@ -1,18 +1,31 @@
 # Everview
 
-Experimental client-side terrain LOD renderer for Minecraft Java 1.21.1 / NeoForge.
+Everview is an experimental client-side terrain LOD renderer for Minecraft Java.
 
-## Current milestone: 0.0.1-alpha bootstrap
+## Development baseline
 
-This first commit deliberately does **not** fake a finished LOD renderer. It establishes:
+- Minecraft **26.3**
+- **Fabric**
+- Fabric Loader **0.19.5**
+- Fabric API **0.161.0+26.3**
+- Loom **1.17**
+- Java **25**
+- Gradle **9.6**
 
-- a client-only NeoForge 1.21.1 project;
-- camera-centered exponential clipmap planning out to 65,536 blocks;
-- tile addressing and generation-priority primitives;
-- a world-render callback at `AFTER_SOLID_BLOCKS`;
-- a live debug HUD with target distance, clipmap state and callback timing.
+Everview is being built on the newest renderer generation rather than targeting an older Minecraft version just to match another LOD mod. Worldgen packs such as JJThunder are test workloads, not architectural dependencies.
 
-The next milestone replaces the placeholder render callback with a real GPU terrain path.
+## Current milestone: M0 bootstrap
+
+The current code establishes the version-independent LOD core:
+
+- camera-centered exponential clipmap planning;
+- 65,536-block initial target radius;
+- LOD ring metadata;
+- stable tile addressing;
+- generation priority primitives;
+- Fabric 26.3 client bootstrap.
+
+We are intentionally keeping the first renderer hook out of this migration commit. Minecraft 26.x changed the rendering pipeline substantially, so the next step is to integrate Everview with the 26.3 render graph cleanly instead of carrying over the temporary NeoForge 1.21.1 path.
 
 ## Architecture target
 
@@ -20,20 +33,21 @@ The next milestone replaces the placeholder render callback with a real GPU terr
 2. Everview starts outside the handoff radius.
 3. Near LOD stores block-derived surface geometry.
 4. Mid/far LOD uses progressively coarser surface tiles.
-5. Extreme distance uses height/material data rather than full chunks.
-6. Async generation, disk cache and GPU culling are added before increasing quality.
+5. Extreme distance uses compact height/material data rather than full chunks.
+6. Generation, caching and GPU submission remain independent subsystems.
+7. Sodium and Iris are compatibility targets, not hard requirements.
 
-## First performance target
+## Initial performance target
 
 - 65,536-block radius (4,096 chunks)
-- stable memory working set
-- low draw-call count
-- no synchronous chunk generation on the render thread
-- compatible rendering design for Sodium, then Iris
+- stable memory working set as distance grows
+- low CPU submission overhead
+- bounded asynchronous generation
+- no synchronous far-chunk generation on the render thread
 
 ## Build
 
-Requires JDK 21.
+Install JDK 25, then:
 
 ```bash
 ./gradlew build
@@ -45,4 +59,4 @@ On Windows:
 gradlew.bat build
 ```
 
-The built mod JAR is written to `build/libs/`.
+The mod JAR is written to `build/libs/`.
