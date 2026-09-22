@@ -1,0 +1,13 @@
+.gradle/
+build/
+out/
+run/
+.idea/
+*.iml
+*.ipr
+*.iws
+.classpath
+.project
+.settings/
+.DS_Store
+Thumbs.db
