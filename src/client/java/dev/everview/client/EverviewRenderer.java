@@ -6,14 +6,14 @@ import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
+import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4fc;
 
 /**
- * 26.3 render-graph bridge.
+ * M1.2 renderer: cached logical tiles + per-tile frustum culling.
  *
- * M1.1 keeps the visible debug surface but now submits logical 64-block terrain tiles
- * independently. This gives us the exact seam needed for per-tile culling and persistent
- * GPU buffers in the next milestone.
+ * Geometry is still emitted through debugQuads for validation. The CPU tile cache
+ * and culling behavior are deliberately established before persistent GPU buffers.
  */
 public final class EverviewRenderer {
     private EverviewRenderer() {
@@ -36,9 +36,26 @@ public final class EverviewRenderer {
             return;
         }
 
-        EverviewMetrics.beginRenderFrame(snapshot.tiles().size());
+        EverviewMetrics.beginRenderFrame();
+        var frustum = camera.getCullFrustum();
 
         for (SurfaceTile tile : snapshot.tiles()) {
+            AABB bounds = new AABB(
+                    tile.minX(),
+                    tile.minY() - 2.0,
+                    tile.minZ(),
+                    tile.maxX(),
+                    tile.maxY() + 2.0,
+                    tile.maxZ()
+            );
+
+            if (!frustum.isVisible(bounds)) {
+                EverviewMetrics.recordCulledTile();
+                continue;
+            }
+
+            EverviewMetrics.recordSubmission();
+
             context.submitNodeCollector().submitCustomGeometry(
                     context.poseStack(),
                     RenderTypes.debugQuads(),
@@ -65,30 +82,64 @@ public final class EverviewRenderer {
 
         int globalMinY = snapshot.minY();
         int globalMaxY = Math.max(globalMinY + 1, snapshot.maxY());
+        double innerSkipSq =
+                (double) LoadedSurfaceSampler.INNER_SKIP_RADIUS * LoadedSurfaceSampler.INNER_SKIP_RADIUS;
 
-        // Tiny alternating tint makes the logical tile boundaries visible during M1.1.
         float tileTint = ((tile.tileX() + tile.tileZ()) & 1) == 0 ? 1.0F : 0.90F;
 
         int[] vertices = tile.vertices();
-        for (int i = 0; i < vertices.length; i += 3) {
-            int worldX = vertices[i];
-            int worldY = vertices[i + 1];
-            int worldZ = vertices[i + 2];
 
-            float x = (float) (worldX - cameraX);
-            float y = (float) (worldY + 0.16D - cameraY);
-            float z = (float) (worldZ - cameraZ);
+        // Four xyz vertices (12 ints) form one debug quad.
+        for (int i = 0; i < vertices.length; i += 12) {
+            double quadCenterX = (vertices[i] + vertices[i + 6]) * 0.5;
+            double quadCenterZ = (vertices[i + 2] + vertices[i + 8]) * 0.5;
+            double dx = quadCenterX - cameraX;
+            double dz = quadCenterZ - cameraZ;
 
-            float t = (worldY - globalMinY) / (float) (globalMaxY - globalMinY);
-            t = Math.max(0.0F, Math.min(1.0F, t));
+            if (dx * dx + dz * dz < innerSkipSq) {
+                continue;
+            }
 
-            int red = clampColor((45.0F + 175.0F * t) * tileTint);
-            int green = clampColor((145.0F + 90.0F * t) * tileTint);
-            int blue = clampColor((60.0F + 175.0F * t) * tileTint);
-
-            consumer.addVertex(pose, x, y, z)
-                    .setColor(red, green, blue, 145);
+            drawVertex(pose, consumer, vertices, i, cameraX, cameraY, cameraZ,
+                    globalMinY, globalMaxY, tileTint);
+            drawVertex(pose, consumer, vertices, i + 3, cameraX, cameraY, cameraZ,
+                    globalMinY, globalMaxY, tileTint);
+            drawVertex(pose, consumer, vertices, i + 6, cameraX, cameraY, cameraZ,
+                    globalMinY, globalMaxY, tileTint);
+            drawVertex(pose, consumer, vertices, i + 9, cameraX, cameraY, cameraZ,
+                    globalMinY, globalMaxY, tileTint);
         }
+    }
+
+    private static void drawVertex(
+            Matrix4fc pose,
+            VertexConsumer consumer,
+            int[] vertices,
+            int index,
+            double cameraX,
+            double cameraY,
+            double cameraZ,
+            int globalMinY,
+            int globalMaxY,
+            float tileTint
+    ) {
+        int worldX = vertices[index];
+        int worldY = vertices[index + 1];
+        int worldZ = vertices[index + 2];
+
+        float x = (float) (worldX - cameraX);
+        float y = (float) (worldY + 0.16D - cameraY);
+        float z = (float) (worldZ - cameraZ);
+
+        float t = (worldY - globalMinY) / (float) (globalMaxY - globalMinY);
+        t = Math.max(0.0F, Math.min(1.0F, t));
+
+        int red = clampColor((45.0F + 175.0F * t) * tileTint);
+        int green = clampColor((145.0F + 90.0F * t) * tileTint);
+        int blue = clampColor((60.0F + 175.0F * t) * tileTint);
+
+        consumer.addVertex(pose, x, y, z)
+                .setColor(red, green, blue, 145);
     }
 
     private static int clampColor(float value) {
