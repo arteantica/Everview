@@ -12,6 +12,7 @@ import net.minecraft.world.level.levelgen.Heightmap;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -19,35 +20,23 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
- * Budgeted direct-worldgen sampler for Everview.
+ * Budgeted progressive distant-worldgen sampler.
  *
- * M2.0 proved that ChunkGenerator#getBaseHeight can give us seed-derived terrain
- * beyond loaded chunks without intentionally loading/generating those chunks.
- *
- * M2.1 changes the scheduling model: a 128-block tile is no longer sampled in
- * one server task. Sampling is split across many small server-thread slices with
- * a soft CPU budget. Only one slice can be queued at a time, so Everview cannot
- * build up an unbounded backlog when the integrated server is busy.
+ * M2.2 adds multiple rings while preserving M2.1's one-slice-at-a-time server
+ * budget. Each ring doubles tile size and sample spacing, so each tile still
+ * contains an 8x8 quad grid even as coverage expands exponentially.
  */
 public final class WorldgenSurfaceSampler {
-    public static final int SAMPLE_SPACING = 16;
-    public static final int TILE_SIZE = 128;
     public static final int MIN_INNER_RADIUS = 384;
-    public static final int OUTER_RADIUS = 1_024;
+    public static final int MAX_OUTER_RADIUS = 4_096;
 
-    /**
-     * Soft budget per integrated-server task. One individual generator sample can
-     * still exceed this, so the budget is measured and exposed in the HUD rather
-     * than treated as a hard realtime guarantee.
-     */
     public static final long SLICE_BUDGET_NANOS = 1_500_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 12;
 
-    private static final int LOD_LEVEL = 1;
-    private static final int CACHE_LIMIT = 384;
+    private static final int CACHE_LIMIT = 768;
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
-            new LinkedHashMap<>(256, 0.75F, true);
+            new LinkedHashMap<>(512, 0.75F, true);
     private static final ConcurrentLinkedQueue<CompletedTile> COMPLETED =
             new ConcurrentLinkedQueue<>();
 
@@ -58,14 +47,17 @@ public final class WorldgenSurfaceSampler {
 
     private static ClientLevel lastClientLevel;
     private static MinecraftServer lastServer;
-    private static int lastCenterTileX = Integer.MIN_VALUE;
-    private static int lastCenterTileZ = Integer.MIN_VALUE;
+    private static int lastAnchorX = Integer.MIN_VALUE;
+    private static int lastAnchorZ = Integer.MIN_VALUE;
     private static int lastInnerRadius = Integer.MIN_VALUE;
+
     private static long epoch;
     private static long nextSliceId;
     private static double lastGenerationMs;
     private static int generatedTileCount;
-    private static List<LodTileKey> wantedKeys = List.of();
+
+    private static List<WorldgenLodRing> activeRings = List.of();
+    private static List<WantedTile> wantedTiles = List.of();
     private static GenerationJob currentJob;
 
     private WorldgenSurfaceSampler() {
@@ -97,26 +89,30 @@ public final class WorldgenSurfaceSampler {
 
         int centerX = client.player.getBlockX();
         int centerZ = client.player.getBlockZ();
-        int centerTileX = Math.floorDiv(centerX, TILE_SIZE);
-        int centerTileZ = Math.floorDiv(centerZ, TILE_SIZE);
 
         int vanillaRadius = client.options.getEffectiveRenderDistance() * 16;
         int innerRadius = Math.max(MIN_INNER_RADIUS, vanillaRadius + 64);
-        innerRadius = Math.min(innerRadius, OUTER_RADIUS - TILE_SIZE);
+        innerRadius = Math.min(innerRadius, 896);
 
-        if (centerTileX != lastCenterTileX
-                || centerTileZ != lastCenterTileZ
+        // The coarsest ring moves in 512-block tile steps. Rebuild desired sets
+        // only when the camera crosses that grid, while per-quad radius clipping
+        // in the renderer keeps the circular handoff centered on the camera.
+        int anchorX = Math.floorDiv(centerX, 128) * 128;
+        int anchorZ = Math.floorDiv(centerZ, 128) * 128;
+
+        if (anchorX != lastAnchorX
+                || anchorZ != lastAnchorZ
                 || innerRadius != lastInnerRadius) {
-            lastCenterTileX = centerTileX;
-            lastCenterTileZ = centerTileZ;
+            lastAnchorX = anchorX;
+            lastAnchorZ = anchorZ;
             lastInnerRadius = innerRadius;
-            wantedKeys = buildWantedKeys(centerX, centerZ, innerRadius);
+            activeRings = createRings(innerRadius);
+            wantedTiles = buildWantedTiles(centerX, centerZ, activeRings);
         }
 
-        // If movement made the pending tile irrelevant, abandon it between slices.
         if (currentJob != null
                 && activeSliceId == 0L
-                && !wantedKeys.contains(currentJob.key)) {
+                && !containsWantedKey(currentJob.key)) {
             currentJob = null;
         }
 
@@ -125,9 +121,9 @@ public final class WorldgenSurfaceSampler {
         }
 
         if (currentJob == null && activeSliceId == 0L) {
-            LodTileKey next = findNextMissing();
+            WantedTile next = findNextMissing();
             if (next != null) {
-                currentJob = new GenerationJob(next);
+                currentJob = new GenerationJob(next.key(), next.ring());
             }
         }
 
@@ -135,26 +131,33 @@ public final class WorldgenSurfaceSampler {
             scheduleSlice(server, clientLevel.dimension(), currentJob);
         }
 
-        rebuildSnapshot(innerRadius);
+        rebuildSnapshot();
+    }
+
+    private static List<WorldgenLodRing> createRings(int innerRadius) {
+        return List.of(
+                new WorldgenLodRing(1, innerRadius, 1_024, 128, 16),
+                new WorldgenLodRing(2, 1_024, 2_048, 256, 32),
+                new WorldgenLodRing(3, 2_048, 4_096, 512, 64)
+        );
     }
 
     private static void reset() {
         epoch++;
         CACHE.clear();
         COMPLETED.clear();
-        wantedKeys = List.of();
+        activeRings = List.of();
+        wantedTiles = List.of();
         lastClientLevel = null;
         lastServer = null;
-        lastCenterTileX = Integer.MIN_VALUE;
-        lastCenterTileZ = Integer.MIN_VALUE;
+        lastAnchorX = Integer.MIN_VALUE;
+        lastAnchorZ = Integer.MIN_VALUE;
         lastInnerRadius = Integer.MIN_VALUE;
         lastGenerationMs = 0.0;
         lastSliceMs = 0.0;
         lastSliceSamples = 0;
         generatedTileCount = 0;
         currentJob = null;
-
-        // An already queued slice may still finish; epoch makes its result stale.
         activeSliceId = 0L;
     }
 
@@ -178,28 +181,74 @@ public final class WorldgenSurfaceSampler {
         trimCache();
     }
 
-    private static List<LodTileKey> buildWantedKeys(
+    /**
+     * Build a nearest-first list inside each ring, then interleave the three
+     * lists. This makes coarse horizon coverage appear early instead of forcing
+     * the entire 1K ring to finish before 2K/4K generation starts.
+     */
+    private static List<WantedTile> buildWantedTiles(
             int centerX,
             int centerZ,
-            int innerRadius
+            List<WorldgenLodRing> rings
     ) {
-        int minTileX = Math.floorDiv(centerX - OUTER_RADIUS, TILE_SIZE);
-        int maxTileX = Math.floorDiv(centerX + OUTER_RADIUS, TILE_SIZE);
-        int minTileZ = Math.floorDiv(centerZ - OUTER_RADIUS, TILE_SIZE);
-        int maxTileZ = Math.floorDiv(centerZ + OUTER_RADIUS, TILE_SIZE);
+        List<List<WantedTile>> perRing = new ArrayList<>();
 
-        List<LodTileKey> keys = new ArrayList<>();
+        for (WorldgenLodRing ring : rings) {
+            List<WantedTile> entries = buildRingWantedTiles(centerX, centerZ, ring);
+            entries.sort(Comparator.comparingLong(entry ->
+                    tileCenterDistanceSq(entry.key(), entry.ring(), centerX, centerZ)));
+            perRing.add(entries);
+        }
+
+        List<WantedTile> interleaved = new ArrayList<>();
+        int index = 0;
+        boolean added;
+
+        do {
+            added = false;
+            for (List<WantedTile> ringEntries : perRing) {
+                if (index < ringEntries.size()) {
+                    interleaved.add(ringEntries.get(index));
+                    added = true;
+                }
+            }
+            index++;
+        } while (added);
+
+        return List.copyOf(interleaved);
+    }
+
+    private static List<WantedTile> buildRingWantedTiles(
+            int centerX,
+            int centerZ,
+            WorldgenLodRing ring
+    ) {
+        int tileSize = ring.tileSize();
+        int minTileX = Math.floorDiv(centerX - ring.outerRadiusBlocks(), tileSize);
+        int maxTileX = Math.floorDiv(centerX + ring.outerRadiusBlocks(), tileSize);
+        int minTileZ = Math.floorDiv(centerZ - ring.outerRadiusBlocks(), tileSize);
+        int maxTileZ = Math.floorDiv(centerZ + ring.outerRadiusBlocks(), tileSize);
+
+        List<WantedTile> entries = new ArrayList<>();
 
         for (int tileZ = minTileZ; tileZ <= maxTileZ; tileZ++) {
             for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
-                if (tileIntersectsAnnulus(tileX, tileZ, centerX, centerZ, innerRadius, OUTER_RADIUS)) {
-                    keys.add(new LodTileKey(LOD_LEVEL, tileX, tileZ));
+                if (tileIntersectsAnnulus(
+                        tileX,
+                        tileZ,
+                        centerX,
+                        centerZ,
+                        ring.innerRadiusBlocks(),
+                        ring.outerRadiusBlocks(),
+                        tileSize
+                )) {
+                    LodTileKey key = new LodTileKey(ring.lodLevel(), tileX, tileZ);
+                    entries.add(new WantedTile(key, ring));
                 }
             }
         }
 
-        keys.sort(Comparator.comparingLong(key -> tileCenterDistanceSq(key, centerX, centerZ)));
-        return List.copyOf(keys);
+        return entries;
     }
 
     private static boolean tileIntersectsAnnulus(
@@ -208,12 +257,13 @@ public final class WorldgenSurfaceSampler {
             int centerX,
             int centerZ,
             int innerRadius,
-            int outerRadius
+            int outerRadius,
+            int tileSize
     ) {
-        int minX = tileX * TILE_SIZE;
-        int minZ = tileZ * TILE_SIZE;
-        int maxX = minX + TILE_SIZE;
-        int maxZ = minZ + TILE_SIZE;
+        int minX = tileX * tileSize;
+        int minZ = tileZ * tileSize;
+        int maxX = minX + tileSize;
+        int maxZ = minZ + tileSize;
 
         int nearestX = Math.max(minX, Math.min(centerX, maxX));
         int nearestZ = Math.max(minZ, Math.min(centerZ, maxZ));
@@ -231,23 +281,37 @@ public final class WorldgenSurfaceSampler {
         return nearestSq <= outerSq && farthestSq >= innerSq;
     }
 
-    private static long tileCenterDistanceSq(LodTileKey key, int centerX, int centerZ) {
-        long tileCenterX = (long) key.tileX() * TILE_SIZE + TILE_SIZE / 2L;
-        long tileCenterZ = (long) key.tileZ() * TILE_SIZE + TILE_SIZE / 2L;
+    private static long tileCenterDistanceSq(
+            LodTileKey key,
+            WorldgenLodRing ring,
+            int centerX,
+            int centerZ
+    ) {
+        long tileCenterX = (long) key.tileX() * ring.tileSize() + ring.tileSize() / 2L;
+        long tileCenterZ = (long) key.tileZ() * ring.tileSize() + ring.tileSize() / 2L;
         long dx = tileCenterX - centerX;
         long dz = tileCenterZ - centerZ;
         return dx * dx + dz * dz;
     }
 
-    private static LodTileKey findNextMissing() {
+    private static boolean containsWantedKey(LodTileKey key) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        for (LodTileKey key : wantedKeys) {
-            if (key.equals(pending)) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)) {
                 continue;
             }
-            if (!CACHE.containsKey(key)) {
-                return key;
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
             }
         }
 
@@ -275,7 +339,8 @@ public final class WorldgenSurfaceSampler {
                 } catch (Throwable throwable) {
                     job.failed = true;
                     EverviewClient.LOGGER.warn(
-                            "Everview budgeted worldgen slice failed at tile {}, {}",
+                            "Everview L{} worldgen slice failed at tile {}, {}",
+                            job.ring.lodLevel(),
                             job.key.tileX(),
                             job.key.tileZ(),
                             throwable
@@ -312,8 +377,8 @@ public final class WorldgenSurfaceSampler {
             int sampleIndex = job.nextSample;
             int gx = sampleIndex % job.samplesAcross;
             int gz = sampleIndex / job.samplesAcross;
-            int worldX = job.originX + gx * SAMPLE_SPACING;
-            int worldZ = job.originZ + gz * SAMPLE_SPACING;
+            int worldX = job.originX + gx * job.ring.sampleSpacing();
+            int worldZ = job.originZ + gz * job.ring.sampleSpacing();
 
             int y = generator.getBaseHeight(
                     worldX,
@@ -337,7 +402,6 @@ public final class WorldgenSurfaceSampler {
 
         long samplingElapsed = System.nanoTime() - sliceStart;
         job.accumulatedNanos += samplingElapsed;
-
         long sliceElapsed = samplingElapsed;
 
         if (job.nextSample >= job.totalSamples && taskEpoch == epoch) {
@@ -349,8 +413,11 @@ public final class WorldgenSurfaceSampler {
             sliceElapsed += meshElapsed;
 
             WorldgenSurfaceTile tile = new WorldgenSurfaceTile(
+                    job.ring.lodLevel(),
                     job.key.tileX(),
                     job.key.tileZ(),
+                    job.ring.tileSize(),
+                    job.ring.sampleSpacing(),
                     vertices,
                     job.cellCount,
                     job.minY,
@@ -369,14 +436,15 @@ public final class WorldgenSurfaceSampler {
     private static int[] buildVertices(GenerationJob job) {
         int[] vertices = new int[job.cellCount * 12];
         int out = 0;
+        int spacing = job.ring.sampleSpacing();
 
         for (int gz = 0; gz < job.cellsAcross; gz++) {
-            int z0 = job.originZ + gz * SAMPLE_SPACING;
-            int z1 = z0 + SAMPLE_SPACING;
+            int z0 = job.originZ + gz * spacing;
+            int z1 = z0 + spacing;
 
             for (int gx = 0; gx < job.cellsAcross; gx++) {
-                int x0 = job.originX + gx * SAMPLE_SPACING;
-                int x1 = x0 + SAMPLE_SPACING;
+                int x0 = job.originX + gx * spacing;
+                int x1 = x0 + spacing;
 
                 int y00 = job.heights[gz * job.samplesAcross + gx];
                 int y10 = job.heights[gz * job.samplesAcross + gx + 1];
@@ -409,32 +477,46 @@ public final class WorldgenSurfaceSampler {
 
         while (CACHE.size() > CACHE_LIMIT && iterator.hasNext()) {
             LodTileKey key = iterator.next();
-            if (wantedKeys.contains(key)) {
+            if (containsWantedKey(key)) {
                 continue;
             }
             iterator.remove();
         }
     }
 
-    private static void rebuildSnapshot(int innerRadius) {
+    private static void rebuildSnapshot() {
         List<WorldgenSurfaceTile> active = new ArrayList<>();
+        Map<Integer, Integer> desiredByLevel = new HashMap<>();
+        Map<Integer, Integer> readyByLevel = new HashMap<>();
 
-        for (LodTileKey key : wantedKeys) {
-            WorldgenSurfaceTile tile = CACHE.get(key);
+        for (WantedTile wanted : wantedTiles) {
+            int level = wanted.ring().lodLevel();
+            desiredByLevel.merge(level, 1, Integer::sum);
+
+            WorldgenSurfaceTile tile = CACHE.get(wanted.key());
             if (tile != null) {
                 active.add(tile);
+                readyByLevel.merge(level, 1, Integer::sum);
             }
         }
 
+        List<WorldgenRingStatus> ringStatuses = new ArrayList<>();
+        for (WorldgenLodRing ring : activeRings) {
+            ringStatuses.add(new WorldgenRingStatus(
+                    ring,
+                    desiredByLevel.getOrDefault(ring.lodLevel(), 0),
+                    readyByLevel.getOrDefault(ring.lodLevel(), 0)
+            ));
+        }
+
         double progress = currentJob == null ? 0.0 : currentJob.progressPercent();
+        int currentLevel = currentJob == null ? 0 : currentJob.ring.lodLevel();
 
         snapshot = new WorldgenSurfaceSnapshot(
                 active,
-                wantedKeys.size(),
+                ringStatuses,
+                wantedTiles.size(),
                 CACHE.size(),
-                innerRadius,
-                OUTER_RADIUS,
-                SAMPLE_SPACING,
                 true,
                 currentJob != null || activeSliceId != 0L,
                 lastGenerationMs,
@@ -442,12 +524,14 @@ public final class WorldgenSurfaceSampler {
                 SLICE_BUDGET_NANOS / 1_000_000.0,
                 lastSliceMs,
                 lastSliceSamples,
-                progress
+                progress,
+                currentLevel
         );
     }
 
     private static final class GenerationJob {
         private final LodTileKey key;
+        private final WorldgenLodRing ring;
         private final int originX;
         private final int originZ;
         private final int samplesAcross;
@@ -462,12 +546,13 @@ public final class WorldgenSurfaceSampler {
         private int maxY = Integer.MIN_VALUE;
         private long accumulatedNanos;
 
-        private GenerationJob(LodTileKey key) {
+        private GenerationJob(LodTileKey key, WorldgenLodRing ring) {
             this.key = key;
-            this.originX = key.tileX() * TILE_SIZE;
-            this.originZ = key.tileZ() * TILE_SIZE;
-            this.samplesAcross = TILE_SIZE / SAMPLE_SPACING + 1;
-            this.cellsAcross = samplesAcross - 1;
+            this.ring = ring;
+            this.originX = key.tileX() * ring.tileSize();
+            this.originZ = key.tileZ() * ring.tileSize();
+            this.samplesAcross = ring.samplesAcross();
+            this.cellsAcross = ring.cellsAcross();
             this.totalSamples = samplesAcross * samplesAcross;
             this.cellCount = cellsAcross * cellsAcross;
             this.heights = new int[totalSamples];
@@ -476,6 +561,12 @@ public final class WorldgenSurfaceSampler {
         private double progressPercent() {
             return nextSample * 100.0 / totalSamples;
         }
+    }
+
+    private record WantedTile(
+            LodTileKey key,
+            WorldgenLodRing ring
+    ) {
     }
 
     private record CompletedTile(

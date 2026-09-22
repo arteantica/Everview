@@ -5,8 +5,11 @@ package dev.everview.client;
  * generator without loading or generating the corresponding chunks.
  */
 public record WorldgenSurfaceTile(
+        int lodLevel,
         int tileX,
         int tileZ,
+        int tileSize,
+        int sampleSpacing,
         int[] vertices,
         int cellCount,
         int minY,
@@ -19,19 +22,19 @@ public record WorldgenSurfaceTile(
     }
 
     public int minX() {
-        return tileX * WorldgenSurfaceSampler.TILE_SIZE;
+        return tileX * tileSize;
     }
 
     public int minZ() {
-        return tileZ * WorldgenSurfaceSampler.TILE_SIZE;
+        return tileZ * tileSize;
     }
 
     public int maxX() {
-        return minX() + WorldgenSurfaceSampler.TILE_SIZE;
+        return minX() + tileSize;
     }
 
     public int maxZ() {
-        return minZ() + WorldgenSurfaceSampler.TILE_SIZE;
+        return minZ() + tileSize;
     }
 
     public double generationMs() {

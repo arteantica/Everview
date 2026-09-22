@@ -3,15 +3,13 @@ package dev.everview.client;
 import java.util.List;
 
 /**
- * Immutable client-side view of the distant-worldgen LOD ring.
+ * Immutable client-side view of all active distant-worldgen LOD rings.
  */
 public record WorldgenSurfaceSnapshot(
         List<WorldgenSurfaceTile> tiles,
+        List<WorldgenRingStatus> rings,
         int desiredTileCount,
         int cacheSize,
-        int innerRadiusBlocks,
-        int outerRadiusBlocks,
-        int sampleSpacing,
         boolean available,
         boolean taskInFlight,
         double lastTileGenerationMs,
@@ -19,14 +17,13 @@ public record WorldgenSurfaceSnapshot(
         double sliceBudgetMs,
         double lastSliceMs,
         int lastSliceSamples,
-        double currentTileProgressPercent
+        double currentTileProgressPercent,
+        int currentLodLevel
 ) {
     public static final WorldgenSurfaceSnapshot EMPTY =
             new WorldgenSurfaceSnapshot(
                     List.of(),
-                    0,
-                    0,
-                    0,
+                    List.of(),
                     0,
                     0,
                     false,
@@ -36,11 +33,13 @@ public record WorldgenSurfaceSnapshot(
                     0.0,
                     0.0,
                     0,
-                    0.0
+                    0.0,
+                    0
             );
 
     public WorldgenSurfaceSnapshot {
         tiles = List.copyOf(tiles);
+        rings = List.copyOf(rings);
     }
 
     public int readyTileCount() {
@@ -52,5 +51,14 @@ public record WorldgenSurfaceSnapshot(
             return 0.0;
         }
         return readyTileCount() * 100.0 / desiredTileCount;
+    }
+
+    public WorldgenLodRing ringForLevel(int lodLevel) {
+        for (WorldgenRingStatus status : rings) {
+            if (status.ring().lodLevel() == lodLevel) {
+                return status.ring();
+            }
+        }
+        return null;
     }
 }

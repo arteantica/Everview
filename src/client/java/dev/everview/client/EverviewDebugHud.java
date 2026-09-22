@@ -37,29 +37,44 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M2.1 | ACTIVE");
+        lines.add("Everview M2.2 | ACTIVE");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Near: vanilla/Sodium | debug heightfield OFF");
+        lines.add("Near: vanilla/Sodium | progressive WORLDGEN rings");
 
         if (far.available()) {
-            lines.add("Far WORLDGEN: " + far.innerRadiusBlocks() + "-" + far.outerRadiusBlocks()
-                    + " | spacing " + far.sampleSpacing());
+            for (WorldgenRingStatus status : far.rings()) {
+                WorldgenLodRing ring = status.ring();
+                lines.add(String.format(
+                        "L%d %d-%d s%d: %d/%d (%.0f%%)",
+                        ring.lodLevel(),
+                        ring.innerRadiusBlocks(),
+                        ring.outerRadiusBlocks(),
+                        ring.sampleSpacing(),
+                        status.readyTileCount(),
+                        status.desiredTileCount(),
+                        status.completionPercent()
+                ));
+            }
+
             lines.add(String.format(
-                    "Far tiles: %d/%d (%.0f%%) | cache %d | job %s",
+                    "Total: %d/%d (%.0f%%) | cache %d | job %s",
                     far.readyTileCount(),
                     far.desiredTileCount(),
                     far.completionPercent(),
                     far.cacheSize(),
                     far.taskInFlight() ? "ON" : "OFF"
             ));
+
             lines.add(String.format(
-                    "Budget: %.2f ms | slice: %.3f ms / %d samples | tile %.0f%%",
+                    "Budget %.2f | slice %.3f ms / %d | L%d tile %.0f%%",
                     far.sliceBudgetMs(),
                     far.lastSliceMs(),
                     far.lastSliceSamples(),
+                    far.currentLodLevel(),
                     far.currentTileProgressPercent()
             ));
-            lines.add("Last complete tile CPU: " + formatMs(far.lastTileGenerationMs())
+
+            lines.add("Last tile CPU: " + formatMs(far.lastTileGenerationMs())
                     + " | generated " + far.generatedTileCount());
         } else {
             lines.add("Far WORLDGEN: unavailable (singleplayer test path)");

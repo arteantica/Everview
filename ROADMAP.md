@@ -29,8 +29,8 @@
 - [x] first true worldgen LOD ring beyond the vanilla render radius
 - [x] split distant generation into small server-thread slices
 - [x] soft per-slice CPU budget with bounded queued work
+- [x] multiple progressive LOD rings to 4,096 blocks
 - [ ] adaptive generation budget based on server/client frame pressure
-- [ ] multiple progressive LOD rings
 - [ ] far-plane extension beyond vanilla camera depth
 - [ ] compact surface tile format
 - [ ] disk persistence
@@ -62,6 +62,7 @@
 
 ## Benchmark goals
 - [x] first generator-derived terrain beyond loaded chunks
+- [x] 4,096-block progressive-ring smoke test
 - [ ] 65,536 blocks
 - [ ] 262,144 blocks
 - [ ] world-scale horizon mode
