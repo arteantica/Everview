@@ -1,30 +1,44 @@
 package dev.everview.client;
 
-import com.mojang.blaze3d.vertex.VertexConsumer;
-import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
+import com.mojang.renderpearl.api.commands.RenderPass;
+import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.level.LevelTerrainRenderContext;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.world.phys.AABB;
-import org.joml.Matrix4fc;
+import org.joml.Matrix4f;
+import org.joml.Vector3f;
+import org.joml.Vector4f;
+
+import java.util.Optional;
+import java.util.OptionalDouble;
 
 /**
- * M3.1.1 baked-material distant terrain renderer.
+ * M3.3 persistent-GPU distant terrain renderer.
  *
- * Material breakup is precomputed when a tile is generated/loaded from cache.
- * The hot render path now only submits baked vertex colors instead of hashing
- * every visible vertex every frame.
+ * Generated CPU tile meshes are uploaded once to persistent vertex buffers.
+ * Each frame only performs tile culling, a small transform update, and indexed
+ * GPU draws. This replaces the old per-frame VertexConsumer walk over every
+ * visible LOD quad.
  */
 public final class EverviewRenderer {
+    private static final Vector4f COLOR_MODULATOR = new Vector4f(1.0F, 1.0F, 1.0F, 1.0F);
+    private static final Vector3f MODEL_OFFSET = new Vector3f();
+    private static final Matrix4f TEXTURE_MATRIX = new Matrix4f();
+
     private EverviewRenderer() {
     }
 
     public static void register() {
-        LevelRenderEvents.COLLECT_SUBMITS.register(EverviewRenderer::collect);
+        LevelRenderEvents.AFTER_OPAQUE_TERRAIN.register(EverviewRenderer::drawPersistentTerrain);
     }
 
-    private static void collect(LevelRenderContext context) {
+    private static void drawPersistentTerrain(LevelTerrainRenderContext context) {
         Minecraft client = Minecraft.getInstance();
         Camera camera = client.gameRenderer.mainCamera();
 
@@ -32,151 +46,131 @@ public final class EverviewRenderer {
             return;
         }
 
-        WorldgenSurfaceSnapshot far = WorldgenSurfaceSampler.snapshot();
-        if (far.tiles().isEmpty()) {
+        WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
+        if (snapshot.tiles().isEmpty()) {
             return;
         }
 
         EverviewMetrics.beginRenderFrame();
-        submitWorldgenTiles(context, camera, far);
-    }
+        EverviewGpuTileCache.beginFrame(client.level);
 
-    private static void submitWorldgenTiles(
-            LevelRenderContext context,
-            Camera camera,
-            WorldgenSurfaceSnapshot snapshot
-    ) {
-        var frustum = camera.getCullFrustum();
-
-        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
-            WorldgenLodRing ring = snapshot.ringForLevel(tile.lodLevel());
-            if (ring == null) {
-                continue;
-            }
-
-            AABB bounds = new AABB(
-                    tile.minX(),
-                    tile.minY() - 4.0,
-                    tile.minZ(),
-                    tile.maxX(),
-                    tile.maxY() + 4.0,
-                    tile.maxZ()
-            );
-
-            if (!frustum.isVisible(bounds)) {
-                EverviewMetrics.recordCulledTile(tile.lodLevel());
-                continue;
-            }
-
-            EverviewMetrics.recordSubmission(tile.lodLevel());
-
-            context.submitNodeCollector().submitCustomGeometry(
-                    context.poseStack(),
-                    RenderTypes.debugQuads(),
-                    (poseState, consumer) -> {
-                        long start = System.nanoTime();
-                        DrawStats drawStats = drawWorldgenTile(
-                                poseState.pose(),
-                                consumer,
-                                tile,
-                                ring,
-                                camera
-                        );
-                        EverviewMetrics.recordTileDraw(
-                                tile.lodLevel(),
-                                System.nanoTime() - start,
-                                drawStats.emittedQuads(),
-                                drawStats.maxQuadDistance()
-                        );
-                    }
-            );
+        RenderTarget mainTarget = client.gameRenderer.mainRenderTarget();
+        if (mainTarget.getColorTextureView() == null || mainTarget.getDepthTextureView() == null) {
+            return;
         }
-    }
 
-    private static DrawStats drawWorldgenTile(
-            Matrix4fc pose,
-            VertexConsumer consumer,
-            WorldgenSurfaceTile tile,
-            WorldgenLodRing ring,
-            Camera camera
-    ) {
         var cameraPos = camera.position();
         double cameraX = cameraPos.x();
         double cameraY = cameraPos.y();
         double cameraZ = cameraPos.z();
+        var frustum = camera.getCullFrustum();
 
-        double innerSq = (double) ring.innerRadiusBlocks() * ring.innerRadiusBlocks();
-        double outerSq = (double) ring.outerRadiusBlocks() * ring.outerRadiusBlocks();
+        try (RenderPass renderPass = RenderSystem.getDevice()
+                .createCommandEncoder()
+                .createRenderPass(
+                        () -> "Everview persistent LOD terrain",
+                        mainTarget.getColorTextureView(),
+                        Optional.empty(),
+                        mainTarget.getDepthTextureView(),
+                        OptionalDouble.empty()
+                )) {
 
-        int emittedQuads = 0;
-        double maxDistanceSq = 0.0;
-        int[] vertices = tile.vertices();
+            renderPass.setPipeline(EverviewGpuPipeline.TERRAIN);
+            RenderSystem.bindDefaultUniforms(renderPass);
 
-        for (int i = 0; i < vertices.length; i += 12) {
-            double quadCenterX = (vertices[i] + vertices[i + 6]) * 0.5;
-            double quadCenterZ = (vertices[i + 2] + vertices[i + 8]) * 0.5;
-            double dx = quadCenterX - cameraX;
-            double dz = quadCenterZ - cameraZ;
-            double distanceSq = dx * dx + dz * dz;
+            RenderSystem.AutoStorageIndexBuffer quadIndices =
+                    RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
 
-            if (distanceSq < innerSq || distanceSq > outerSq) {
-                continue;
+            for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+                WorldgenLodRing ring = snapshot.ringForLevel(tile.lodLevel());
+                if (ring == null || !tileBelongsToRing(tile, ring, cameraX, cameraZ)) {
+                    continue;
+                }
+
+                AABB bounds = new AABB(
+                        tile.minX(),
+                        tile.minY() - 4.0,
+                        tile.minZ(),
+                        tile.maxX(),
+                        tile.maxY() + 4.0,
+                        tile.maxZ()
+                );
+
+                if (!frustum.isVisible(bounds)) {
+                    EverviewMetrics.recordCulledTile(tile.lodLevel());
+                    continue;
+                }
+
+                EverviewGpuTileCache.GpuTile gpuTile =
+                        EverviewGpuTileCache.getOrUpload(tile);
+                if (gpuTile == null) {
+                    continue;
+                }
+
+                EverviewMetrics.recordSubmission(tile.lodLevel());
+
+                long started = System.nanoTime();
+
+                GpuBuffer indexBuffer = quadIndices.getBuffer(gpuTile.indexCount());
+
+                Matrix4f modelView = RenderSystem.getModelViewMatrixCopy();
+                modelView.translate(
+                        (float) (tile.minX() - cameraX),
+                        (float) (-cameraY - 0.22D),
+                        (float) (tile.minZ() - cameraZ)
+                );
+
+                GpuBufferSlice dynamicTransforms = RenderSystem.getDynamicUniforms()
+                        .writeTransform(
+                                modelView,
+                                COLOR_MODULATOR,
+                                MODEL_OFFSET,
+                                TEXTURE_MATRIX
+                        );
+
+                renderPass.setVertexBuffer(0, gpuTile.vertexBuffer().slice());
+                renderPass.setIndexBuffer(indexBuffer, quadIndices.type());
+                renderPass.setUniform("DynamicTransforms", dynamicTransforms);
+                renderPass.drawIndexed(gpuTile.indexCount(), 1, 0, 0, 0);
+
+                double centerX = (tile.minX() + tile.maxX()) * 0.5;
+                double centerZ = (tile.minZ() + tile.maxZ()) * 0.5;
+                double distance = Math.hypot(centerX - cameraX, centerZ - cameraZ);
+
+                EverviewMetrics.recordTileDraw(
+                        tile.lodLevel(),
+                        System.nanoTime() - started,
+                        tile.vertices().length / 12,
+                        distance
+                );
             }
-
-            drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(),
-                    i, cameraX, cameraY, cameraZ
-            );
-            drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(),
-                    i + 3, cameraX, cameraY, cameraZ
-            );
-            drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(),
-                    i + 6, cameraX, cameraY, cameraZ
-            );
-            drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(),
-                    i + 9, cameraX, cameraY, cameraZ
-            );
-            emittedQuads++;
-            maxDistanceSq = Math.max(maxDistanceSq, distanceSq);
         }
-
-        return new DrawStats(emittedQuads, Math.sqrt(maxDistanceSq));
     }
 
-    private static void drawWorldgenVertex(
-            Matrix4fc pose,
-            VertexConsumer consumer,
-            int[] vertices,
-            int[] colors,
-            int index,
+    /**
+     * Persistent buffers are whole-tile draws, so ring ownership is decided at
+     * tile granularity instead of scanning every quad every frame.
+     *
+     * L1 gets a half-tile allowance on its inner edge so the opaque LOD stays
+     * tucked underneath vanilla terrain during the handoff. Adjacent LOD bands
+     * use center ownership, which prevents the two dense near rings from both
+     * drawing the same 128-block tile.
+     */
+    private static boolean tileBelongsToRing(
+            WorldgenSurfaceTile tile,
+            WorldgenLodRing ring,
             double cameraX,
-            double cameraY,
             double cameraZ
     ) {
-        int worldX = vertices[index];
-        int worldY = vertices[index + 1];
-        int worldZ = vertices[index + 2];
+        double centerX = (tile.minX() + tile.maxX()) * 0.5;
+        double centerZ = (tile.minZ() + tile.maxZ()) * 0.5;
+        double distance = Math.hypot(centerX - cameraX, centerZ - cameraZ);
 
-        float x = (float) (worldX - cameraX);
-        // Keep LOD a fraction below vanilla terrain during the overlap band so
-        // real chunks win depth cleanly instead of z-fighting with the coarse mesh.
-        float y = (float) (worldY - 0.22D - cameraY);
-        float z = (float) (worldZ - cameraZ);
+        double inner = ring.innerRadiusBlocks();
+        if (ring.lodLevel() == 1) {
+            inner = Math.max(0.0, inner - tile.tileSize() * 0.5);
+        }
 
-        int vertexIndex = index / 3;
-        int rgb = colors[vertexIndex];
-        int red = (rgb >> 16) & 0xFF;
-        int green = (rgb >> 8) & 0xFF;
-        int blue = rgb & 0xFF;
-
-        consumer.addVertex(pose, x, y, z)
-                .setColor(red, green, blue, 255);
+        return distance >= inner && distance <= ring.outerRadiusBlocks();
     }
-
-    private record DrawStats(int emittedQuads, double maxQuadDistance) {
-    }
-
 }
