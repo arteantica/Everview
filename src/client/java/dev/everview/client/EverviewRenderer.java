@@ -10,10 +10,13 @@ import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4fc;
 
 /**
- * M1.2 renderer: cached logical tiles + per-tile frustum culling.
+ * M2 renderer.
  *
- * Geometry is still emitted through debugQuads for validation. The CPU tile cache
- * and culling behavior are deliberately established before persistent GPU buffers.
+ * Only the true distant worldgen ring is visible now. The old loaded-chunk
+ * heightfield from M1 is intentionally not submitted: it was useful to prove
+ * renderer integration, but it produces false caps over cave mouths and
+ * overhangs. Near terrain remains vanilla/Sodium until the voxel-derived near
+ * LOD path replaces that diagnostic surface.
  */
 public final class EverviewRenderer {
     private EverviewRenderer() {
@@ -31,21 +34,29 @@ public final class EverviewRenderer {
             return;
         }
 
-        SurfaceSnapshot snapshot = LoadedSurfaceSampler.snapshot();
-        if (snapshot.isEmpty()) {
+        WorldgenSurfaceSnapshot far = WorldgenSurfaceSampler.snapshot();
+        if (far.tiles().isEmpty()) {
             return;
         }
 
         EverviewMetrics.beginRenderFrame();
+        submitWorldgenTiles(context, camera, far);
+    }
+
+    private static void submitWorldgenTiles(
+            LevelRenderContext context,
+            Camera camera,
+            WorldgenSurfaceSnapshot snapshot
+    ) {
         var frustum = camera.getCullFrustum();
 
-        for (SurfaceTile tile : snapshot.tiles()) {
+        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
             AABB bounds = new AABB(
                     tile.minX(),
-                    tile.minY() - 2.0,
+                    tile.minY() - 4.0,
                     tile.minZ(),
                     tile.maxX(),
-                    tile.maxY() + 2.0,
+                    tile.maxY() + 4.0,
                     tile.maxZ()
             );
 
@@ -61,18 +72,18 @@ public final class EverviewRenderer {
                     RenderTypes.debugQuads(),
                     (poseState, consumer) -> {
                         long start = System.nanoTime();
-                        drawTile(poseState.pose(), consumer, tile, snapshot, camera);
+                        drawWorldgenTile(poseState.pose(), consumer, tile, snapshot, camera);
                         EverviewMetrics.recordTileDraw(System.nanoTime() - start);
                     }
             );
         }
     }
 
-    private static void drawTile(
+    private static void drawWorldgenTile(
             Matrix4fc pose,
             VertexConsumer consumer,
-            SurfaceTile tile,
-            SurfaceSnapshot snapshot,
+            WorldgenSurfaceTile tile,
+            WorldgenSurfaceSnapshot snapshot,
             Camera camera
     ) {
         var cameraPos = camera.position();
@@ -80,38 +91,30 @@ public final class EverviewRenderer {
         double cameraY = cameraPos.y();
         double cameraZ = cameraPos.z();
 
-        int globalMinY = snapshot.minY();
-        int globalMaxY = Math.max(globalMinY + 1, snapshot.maxY());
-        double innerSkipSq =
-                (double) LoadedSurfaceSampler.INNER_SKIP_RADIUS * LoadedSurfaceSampler.INNER_SKIP_RADIUS;
-
-        float tileTint = ((tile.tileX() + tile.tileZ()) & 1) == 0 ? 1.0F : 0.90F;
+        double innerSq = (double) snapshot.innerRadiusBlocks() * snapshot.innerRadiusBlocks();
+        double outerSq = (double) snapshot.outerRadiusBlocks() * snapshot.outerRadiusBlocks();
 
         int[] vertices = tile.vertices();
 
-        // Four xyz vertices (12 ints) form one debug quad.
         for (int i = 0; i < vertices.length; i += 12) {
             double quadCenterX = (vertices[i] + vertices[i + 6]) * 0.5;
             double quadCenterZ = (vertices[i + 2] + vertices[i + 8]) * 0.5;
             double dx = quadCenterX - cameraX;
             double dz = quadCenterZ - cameraZ;
+            double distanceSq = dx * dx + dz * dz;
 
-            if (dx * dx + dz * dz < innerSkipSq) {
+            if (distanceSq < innerSq || distanceSq > outerSq) {
                 continue;
             }
 
-            drawVertex(pose, consumer, vertices, i, cameraX, cameraY, cameraZ,
-                    globalMinY, globalMaxY, tileTint);
-            drawVertex(pose, consumer, vertices, i + 3, cameraX, cameraY, cameraZ,
-                    globalMinY, globalMaxY, tileTint);
-            drawVertex(pose, consumer, vertices, i + 6, cameraX, cameraY, cameraZ,
-                    globalMinY, globalMaxY, tileTint);
-            drawVertex(pose, consumer, vertices, i + 9, cameraX, cameraY, cameraZ,
-                    globalMinY, globalMaxY, tileTint);
+            drawWorldgenVertex(pose, consumer, vertices, i, cameraX, cameraY, cameraZ, tile);
+            drawWorldgenVertex(pose, consumer, vertices, i + 3, cameraX, cameraY, cameraZ, tile);
+            drawWorldgenVertex(pose, consumer, vertices, i + 6, cameraX, cameraY, cameraZ, tile);
+            drawWorldgenVertex(pose, consumer, vertices, i + 9, cameraX, cameraY, cameraZ, tile);
         }
     }
 
-    private static void drawVertex(
+    private static void drawWorldgenVertex(
             Matrix4fc pose,
             VertexConsumer consumer,
             int[] vertices,
@@ -119,27 +122,35 @@ public final class EverviewRenderer {
             double cameraX,
             double cameraY,
             double cameraZ,
-            int globalMinY,
-            int globalMaxY,
-            float tileTint
+            WorldgenSurfaceTile tile
     ) {
         int worldX = vertices[index];
         int worldY = vertices[index + 1];
         int worldZ = vertices[index + 2];
 
         float x = (float) (worldX - cameraX);
-        float y = (float) (worldY + 0.16D - cameraY);
+        float y = (float) (worldY + 0.10D - cameraY);
         float z = (float) (worldZ - cameraZ);
 
-        float t = (worldY - globalMinY) / (float) (globalMaxY - globalMinY);
-        t = Math.max(0.0F, Math.min(1.0F, t));
+        int red;
+        int green;
+        int blue;
 
-        int red = clampColor((45.0F + 175.0F * t) * tileTint);
-        int green = clampColor((145.0F + 90.0F * t) * tileTint);
-        int blue = clampColor((60.0F + 175.0F * t) * tileTint);
+        if (worldY <= tile.seaLevel() + 1) {
+            red = 45;
+            green = 115;
+            blue = 205;
+        } else {
+            float t = (worldY - tile.seaLevel()) / 140.0F;
+            t = Math.max(0.0F, Math.min(1.0F, t));
+
+            red = clampColor(70.0F + 165.0F * t);
+            green = clampColor(155.0F + 75.0F * t);
+            blue = clampColor(75.0F + 160.0F * t);
+        }
 
         consumer.addVertex(pose, x, y, z)
-                .setColor(red, green, blue, 145);
+                .setColor(red, green, blue, 175);
     }
 
     private static int clampColor(float value) {
