@@ -20,14 +20,14 @@ public final class MinecraftSurfacePalette {
     public static final byte MATERIAL_SNOW = 4;
     public static final byte MATERIAL_TERRACOTTA = 5;
 
-    private static final int WATER = 0x3F76E4;
-    private static final int SWAMP_WATER = 0x4C6559;
-    private static final int FROZEN_WATER = 0x7FA7D8;
-    private static final int SAND = 0xD8CF9A;
-    private static final int STONE = 0x878787;
-    private static final int SNOW = 0xF4F7F7;
-    private static final int TERRACOTTA = 0xB66A45;
-    private static final int FALLBACK_GRASS = 0x79C05A;
+    private static final int WATER = 0x3B6E98;
+    private static final int SWAMP_WATER = 0x4D6256;
+    private static final int FROZEN_WATER = 0x7897B4;
+    private static final int SAND = 0xCFC28A;
+    private static final int STONE = 0x777A7A;
+    private static final int SNOW = 0xE7EBEC;
+    private static final int TERRACOTTA = 0xA85F43;
+    private static final int FALLBACK_GRASS = 0x6F9D50;
 
     private MinecraftSurfacePalette() {
     }
@@ -45,6 +45,8 @@ public final class MinecraftSurfacePalette {
 
         boolean frozen = containsAny(path,
                 "frozen", "snowy", "ice_spikes", "grove");
+        boolean highSnowPeak = containsAny(path,
+                "frozen_peaks", "jagged_peaks");
         boolean waterBiome = containsAny(path,
                 "ocean", "river");
         boolean swamp = path.contains("swamp");
@@ -72,9 +74,10 @@ public final class MinecraftSurfacePalette {
             return new SampleAppearance(SAND, MATERIAL_SAND);
         }
 
-        // High cold terrain gets a snow cap even before exact surface rules are
-        // represented. The threshold is intentionally conservative.
-        if (frozen && worldY >= seaLevel + 28 || worldY >= seaLevel + 150) {
+        // M3.0.1 keeps snow tied to cold / peak biomes instead of globally
+        // whitening every sufficiently tall mountain.
+        if ((frozen && worldY >= seaLevel + 18)
+                || (highSnowPeak && worldY >= seaLevel + 78)) {
             return new SampleAppearance(SNOW, MATERIAL_SNOW);
         }
 
@@ -88,6 +91,12 @@ public final class MinecraftSurfacePalette {
         } catch (RuntimeException exception) {
             grass = FALLBACK_GRASS;
         }
+
+        // Vanilla grass tints can look overly saturated on an untextured LOD
+        // sheet. Pull them slightly toward a muted natural green while keeping
+        // biome differences visible.
+        grass = blend(grass, 0x6B854B, 0.20F);
+        grass = applyLighting(grass, 0.94F);
 
         return new SampleAppearance(grass, MATERIAL_GRASS);
     }

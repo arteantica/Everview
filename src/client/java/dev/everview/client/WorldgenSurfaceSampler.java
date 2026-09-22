@@ -32,7 +32,8 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  * Everview well below Minecraft's 50 ms server-tick budget.
  */
 public final class WorldgenSurfaceSampler {
-    public static final int MIN_INNER_RADIUS = 384;
+    public static final int MIN_INNER_RADIUS = 256;
+    public static final int HANDOFF_OVERLAP_BLOCKS = 32;
     public static final int MAX_OUTER_RADIUS = 16_384;
 
     public static final long MIN_SLICE_BUDGET_NANOS = 1_000_000L;
@@ -121,12 +122,17 @@ public final class WorldgenSurfaceSampler {
         int centerZ = client.player.getBlockZ();
 
         int vanillaRadius = client.options.getEffectiveRenderDistance() * 16;
-        int innerRadius = Math.max(MIN_INNER_RADIUS, vanillaRadius + 64);
+        int innerRadius = Math.max(
+                MIN_INNER_RADIUS,
+                vanillaRadius - HANDOFF_OVERLAP_BLOCKS
+        );
         innerRadius = Math.min(innerRadius, 896);
 
-        // Rebuild desired sets on the L1 tile grid. The outer rings are much
-        // coarser, while per-quad radius clipping keeps every annulus centered
-        // on the actual camera rather than the snapped anchor.
+        // M3.0.1 keeps only a narrow 32-block overlap under the edge of
+        // vanilla terrain. This is enough to hide small unloaded-chunk/fog
+        // holes without making the coarse LOD visibly take over too early.
+        // The renderer biases LOD slightly downward so vanilla wins depth
+        // wherever both surfaces exist.
         int anchorX = Math.floorDiv(centerX, 128) * 128;
         int anchorZ = Math.floorDiv(centerZ, 128) * 128;
 

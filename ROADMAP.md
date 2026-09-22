@@ -53,6 +53,8 @@
 - [x] first water color pass
 - [x] first sand/stone/snow/material classification pass
 - [x] first slope-based terrain lighting pass
+- [x] naturalized palette + tighter snow classification
+- [x] vanilla-to-LOD overlap handoff pass
 - [ ] structures
 - [ ] trees
 - [ ] fog and atmosphere
