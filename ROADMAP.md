@@ -10,12 +10,16 @@
 - [ ] renderer-backend interface
 
 ## M1 - first visible terrain
-- [ ] 26.3 render-graph integration
-- [ ] diagnostic terrain mesh
-- [ ] camera-relative coordinates
-- [ ] depth-correct world composition
-- [ ] live debug metrics
-- [ ] loaded-chunk surface sampler
+- [x] 26.3 render-graph integration
+- [x] diagnostic terrain mesh
+- [x] camera-relative coordinates
+- [x] loaded-chunk surface sampler
+- [x] logical 64x64 terrain tiles
+- [x] live debug HUD and timings
+- [x] reject fluid surface samples in diagnostic terrain
+- [ ] depth/fog handoff validation
+- [ ] persistent GPU tile buffers
+- [ ] per-tile frustum culling
 
 ## M2 - distant generation
 - [ ] off-thread surface sampler
