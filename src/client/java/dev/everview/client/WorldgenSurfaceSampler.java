@@ -313,7 +313,7 @@ public final class WorldgenSurfaceSampler {
 
     private static List<WorldgenLodRing> createRings(int innerRadius) {
         return List.of(
-                new WorldgenLodRing(1, innerRadius, 1_024, 128, 16),
+                new WorldgenLodRing(1, innerRadius, 1_024, 128, 8),
                 new WorldgenLodRing(2, 1_024, 2_048, 256, 32),
                 new WorldgenLodRing(3, 2_048, 4_096, 512, 64),
                 new WorldgenLodRing(4, 4_096, 8_192, 1_024, 128),
@@ -752,7 +752,7 @@ public final class WorldgenSurfaceSampler {
     }
 
     /**
-     * L1 gets a deliberately blockier coarse-voxel surface. Each 16x16 cell is
+     * L1 gets a deliberately blockier coarse-voxel surface. Each 8x8 cell is
      * a flat plateau, with vertical faces between neighboring plateaus and dark
      * skirts around tile edges. This sacrifices smooth triangles close to the
      * vanilla handoff in favor of silhouettes that read much more like Minecraft.
@@ -1025,9 +1025,12 @@ public final class WorldgenSurfaceSampler {
 
         int average = Math.round(sum / (float) count);
 
-        // Two-block vertical snapping keeps large 16x16 L1 cells from looking
-        // perfectly smooth while avoiding comically tall giant "blocks".
-        return Math.round(average / 2.0F) * 2;
+        // At 8-block horizontal sampling, keep full one-block vertical steps.
+        // This is closer to Minecraft's silhouette without going all the way to
+        // expensive block-by-block geometry.
+        return job.ring.sampleSpacing() <= 8
+                ? average
+                : Math.round(average / 2.0F) * 2;
     }
 
     private static int representativeColor(

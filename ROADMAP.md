@@ -62,7 +62,8 @@
 - [x] terraced L1 plateau geometry
 - [x] vertical cliff faces between near-LOD cells
 - [x] flat water/coastline classification for L1
-- [ ] denser near-LOD sampling after M3.2 performance validation
+- [x] denser L1 sampling: 16 -> 8 blocks after M3.2 performance validation
+- [ ] evaluate 4-block L1 or split near ring after M3.2.1 benchmark
 - [ ] texture-atlas / UV material rendering
 - [ ] structures
 - [ ] trees
