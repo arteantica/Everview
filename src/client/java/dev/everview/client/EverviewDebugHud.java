@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M2.3 | RING VISIBILITY");
+        lines.add("Everview M2.4 | DISTANCE LADDER 16K");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Palette: L1 GREEN | L2 ORANGE | L3 PURPLE");
+        lines.add("Palette: L1 GREEN | L2 ORANGE | L3 PURPLE | L4 RED | L5 YELLOW");
 
         if (far.available()) {
             for (WorldgenRingStatus status : far.rings()) {
@@ -47,7 +47,7 @@ public final class EverviewDebugHud {
                 EverviewMetrics.RingRenderStats render = metrics.ring(ring.lodLevel());
 
                 lines.add(String.format(
-                        "L%d %d-%d s%d: gen %d/%d | c/s/d %d/%d/%d | q %d",
+                        "L%d %d-%d s%d: gen %d/%d | c/s/d %d/%d/%d | q %d | max %.0f",
                         ring.lodLevel(),
                         ring.innerRadiusBlocks(),
                         ring.outerRadiusBlocks(),
@@ -57,7 +57,8 @@ public final class EverviewDebugHud {
                         render.culled(),
                         render.submitted(),
                         render.drawn(),
-                        render.emittedQuads()
+                        render.emittedQuads(),
+                        render.maxQuadDistance()
                 ));
             }
 
