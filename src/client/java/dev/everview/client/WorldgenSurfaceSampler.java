@@ -691,33 +691,50 @@ public final class WorldgenSurfaceSampler {
                 );
                 float steepness = Math.min(1.0F, maxRise / Math.max(1.0F, spacing * 0.95F));
 
-                int c00 = shadeSample(job, i00, shade, steepness);
-                int c01 = shadeSample(job, i01, shade, steepness);
-                int c11 = shadeSample(job, i11, shade, steepness);
-                int c10 = shadeSample(job, i10, shade, steepness);
+                byte m00 = displayMaterial(job, i00, steepness);
+                byte m01 = displayMaterial(job, i01, steepness);
+                byte m11 = displayMaterial(job, i11, steepness);
+                byte m10 = displayMaterial(job, i10, steepness);
+
+                int c00 = MaterialTerrainShading.apply(
+                        shadeSample(job, i00, shade, steepness),
+                        m00, x0, y00, z0, job.ring.lodLevel()
+                );
+                int c01 = MaterialTerrainShading.apply(
+                        shadeSample(job, i01, shade, steepness),
+                        m01, x0, y01, z1, job.ring.lodLevel()
+                );
+                int c11 = MaterialTerrainShading.apply(
+                        shadeSample(job, i11, shade, steepness),
+                        m11, x1, y11, z1, job.ring.lodLevel()
+                );
+                int c10 = MaterialTerrainShading.apply(
+                        shadeSample(job, i10, shade, steepness),
+                        m10, x1, y10, z0, job.ring.lodLevel()
+                );
 
                 vertices[vertexOut++] = x0;
                 vertices[vertexOut++] = y00;
                 vertices[vertexOut++] = z0;
-                materials[colorOut] = displayMaterial(job, i00, steepness);
+                materials[colorOut] = m00;
                 colors[colorOut++] = c00;
 
                 vertices[vertexOut++] = x0;
                 vertices[vertexOut++] = y01;
                 vertices[vertexOut++] = z1;
-                materials[colorOut] = displayMaterial(job, i01, steepness);
+                materials[colorOut] = m01;
                 colors[colorOut++] = c01;
 
                 vertices[vertexOut++] = x1;
                 vertices[vertexOut++] = y11;
                 vertices[vertexOut++] = z1;
-                materials[colorOut] = displayMaterial(job, i11, steepness);
+                materials[colorOut] = m11;
                 colors[colorOut++] = c11;
 
                 vertices[vertexOut++] = x1;
                 vertices[vertexOut++] = y10;
                 vertices[vertexOut++] = z0;
-                materials[colorOut] = displayMaterial(job, i10, steepness);
+                materials[colorOut] = m10;
                 colors[colorOut++] = c10;
             }
         }
