@@ -37,7 +37,7 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M2.6 | FASTER INITIAL FILL");
+        lines.add("Everview M2.7 | PERSISTENT + ADAPTIVE");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Palette: L1 GREEN | L2 ORANGE | L3 PURPLE | L4 RED | L5 YELLOW");
         lines.add(String.format(
@@ -89,8 +89,21 @@ public final class EverviewDebugHud {
             ));
 
             lines.add(String.format(
-                    "Gen budget %.2f ms/tick | last %.3f ms / %d samples | L%d tile %.0f%%",
+                    "Disk: %s | loaded %d in %.1f ms | saved %d %.2f MiB in %.1f ms%s",
+                    far.diskCacheStatus(),
+                    far.diskLoadedTiles(),
+                    far.diskLoadMs(),
+                    far.diskSavedTiles(),
+                    far.diskFileMiB(),
+                    far.diskSaveMs(),
+                    far.diskIoInFlight() ? " | IO" : ""
+            ));
+
+            lines.add(String.format(
+                    "Adaptive gen %.2f ms | server %.1f ms | frame %.1f ms | last %.3f / %d | L%d %.0f%%",
                     far.sliceBudgetMs(),
+                    far.serverTickMs(),
+                    far.clientFrameMs(),
                     far.lastSliceMs(),
                     far.lastSliceSamples(),
                     far.currentLodLevel(),

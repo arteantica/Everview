@@ -20,7 +20,16 @@ public record WorldgenSurfaceSnapshot(
         double currentTileProgressPercent,
         int currentLodLevel,
         double initialFillSeconds,
-        boolean initialFillComplete
+        boolean initialFillComplete,
+        double serverTickMs,
+        double clientFrameMs,
+        int diskLoadedTiles,
+        double diskLoadMs,
+        int diskSavedTiles,
+        double diskSaveMs,
+        double diskFileMiB,
+        String diskCacheStatus,
+        boolean diskIoInFlight
 ) {
     public static final WorldgenSurfaceSnapshot EMPTY =
             new WorldgenSurfaceSnapshot(
@@ -38,6 +47,15 @@ public record WorldgenSurfaceSnapshot(
                     0.0,
                     0,
                     0.0,
+                    false,
+                    0.0,
+                    0.0,
+                    0,
+                    0.0,
+                    0,
+                    0.0,
+                    0.0,
+                    "OFF",
                     false
             );
 

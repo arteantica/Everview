@@ -17,6 +17,8 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.nio.file.Path;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
@@ -33,8 +35,10 @@ public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 384;
     public static final int MAX_OUTER_RADIUS = 16_384;
 
-    public static final long SLICE_BUDGET_NANOS = 4_000_000L;
-    public static final int MAX_SAMPLES_PER_SLICE = 32;
+    public static final long MIN_SLICE_BUDGET_NANOS = 1_000_000L;
+    public static final long BASE_SLICE_BUDGET_NANOS = 4_000_000L;
+    public static final long MAX_SLICE_BUDGET_NANOS = 6_000_000L;
+    public static final int MAX_SAMPLES_PER_SLICE = 48;
 
     private static final int CACHE_LIMIT = 1_536;
 
@@ -47,6 +51,24 @@ public final class WorldgenSurfaceSampler {
     private static volatile long activeSliceId;
     private static volatile double lastSliceMs;
     private static volatile int lastSliceSamples;
+    private static volatile long adaptiveSliceBudgetNanos = BASE_SLICE_BUDGET_NANOS;
+
+    private static double serverTickMs;
+    private static double clientFrameMs;
+
+    private static CompletableFuture<WorldgenDiskCache.LoadResult> diskLoadFuture;
+    private static CompletableFuture<WorldgenDiskCache.SaveResult> diskSaveFuture;
+    private static Path diskCachePath;
+    private static long diskCacheSeed;
+    private static String diskCacheDimension = "";
+    private static boolean diskLoadReady;
+    private static boolean cacheDirty;
+    private static int diskLoadedTiles;
+    private static double diskLoadMs;
+    private static int diskSavedTiles;
+    private static double diskSaveMs;
+    private static double diskFileMiB;
+    private static String diskCacheStatus = "OFF";
 
     private static ClientLevel lastClientLevel;
     private static MinecraftServer lastServer;
@@ -88,8 +110,11 @@ public final class WorldgenSurfaceSampler {
             reset();
             lastClientLevel = clientLevel;
             lastServer = server;
+            startDiskLoad(server, clientLevel.dimension());
         }
 
+        pollDiskIo();
+        updateAdaptiveBudget(client, server);
         drainCompleted();
 
         int centerX = client.player.getBlockX();
@@ -119,6 +144,11 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
+        if (!diskLoadReady) {
+            rebuildSnapshot();
+            return;
+        }
+
         if (currentJob != null
                 && activeSliceId == 0L
                 && !containsWantedKey(currentJob.key)) {
@@ -141,6 +171,137 @@ public final class WorldgenSurfaceSampler {
         }
 
         rebuildSnapshot();
+        maybeScheduleDiskSave();
+    }
+
+    private static void startDiskLoad(
+            MinecraftServer server,
+            ResourceKey<Level> dimension
+    ) {
+        diskCachePath = WorldgenDiskCache.pathFor(server, dimension);
+        diskCacheSeed = WorldgenDiskCache.seedFor(server, dimension);
+        diskCacheDimension = WorldgenDiskCache.dimensionId(dimension);
+        diskCacheStatus = "LOADING";
+        diskLoadReady = false;
+
+        Path path = diskCachePath;
+        long seed = diskCacheSeed;
+        String dimensionId = diskCacheDimension;
+
+        diskLoadFuture = CompletableFuture.supplyAsync(
+                () -> WorldgenDiskCache.load(path, seed, dimensionId)
+        );
+    }
+
+    private static void pollDiskIo() {
+        if (diskLoadFuture != null && diskLoadFuture.isDone()) {
+            try {
+                WorldgenDiskCache.LoadResult result = diskLoadFuture.join();
+
+                for (WorldgenSurfaceTile tile : result.tiles()) {
+                    CACHE.put(
+                            new LodTileKey(tile.lodLevel(), tile.tileX(), tile.tileZ()),
+                            tile
+                    );
+                }
+
+                diskLoadedTiles = result.tiles().size();
+                diskLoadMs = result.elapsedMs();
+                diskCacheStatus = result.status();
+                diskLoadReady = true;
+                trimCache();
+            } catch (RuntimeException exception) {
+                diskCacheStatus = "LOAD_ERROR";
+                diskLoadReady = true;
+                EverviewClient.LOGGER.warn("Everview LOD cache load task failed", exception);
+            } finally {
+                diskLoadFuture = null;
+            }
+        }
+
+        if (diskSaveFuture != null && diskSaveFuture.isDone()) {
+            try {
+                WorldgenDiskCache.SaveResult result = diskSaveFuture.join();
+                diskSavedTiles = result.tileCount();
+                diskSaveMs = result.elapsedMs();
+                diskFileMiB = result.bytes() / (1024.0 * 1024.0);
+                diskCacheStatus = result.status();
+
+                if (!"SAVED".equals(result.status())) {
+                    cacheDirty = true;
+                }
+            } catch (RuntimeException exception) {
+                diskCacheStatus = "SAVE_ERROR";
+                cacheDirty = true;
+                EverviewClient.LOGGER.warn("Everview LOD cache save task failed", exception);
+            } finally {
+                diskSaveFuture = null;
+            }
+        }
+    }
+
+    private static void maybeScheduleDiskSave() {
+        if (!cacheDirty
+                || diskCachePath == null
+                || diskSaveFuture != null
+                || !snapshot.initialFillComplete()) {
+            return;
+        }
+
+        List<WorldgenSurfaceTile> tiles = List.copyOf(CACHE.values());
+        Path path = diskCachePath;
+        long seed = diskCacheSeed;
+        String dimension = diskCacheDimension;
+
+        cacheDirty = false;
+        diskCacheStatus = "SAVING";
+        diskSaveFuture = CompletableFuture.supplyAsync(
+                () -> WorldgenDiskCache.save(path, seed, dimension, tiles)
+        );
+    }
+
+    private static void scheduleDetachedSaveIfDirty() {
+        if (!cacheDirty || diskCachePath == null || CACHE.isEmpty() || diskSaveFuture != null) {
+            return;
+        }
+
+        List<WorldgenSurfaceTile> tiles = List.copyOf(CACHE.values());
+        Path path = diskCachePath;
+        long seed = diskCacheSeed;
+        String dimension = diskCacheDimension;
+
+        CompletableFuture.runAsync(
+                () -> WorldgenDiskCache.save(path, seed, dimension, tiles)
+        );
+    }
+
+    private static void updateAdaptiveBudget(Minecraft client, MinecraftServer server) {
+        serverTickMs = server.getAverageTickTimeNanos() / 1_000_000.0;
+        clientFrameMs = client.getFrameTimeNs() / 1_000_000.0;
+
+        long target;
+
+        if (serverTickMs < 18.0 && (clientFrameMs <= 0.0 || clientFrameMs < 10.0)) {
+            target = MAX_SLICE_BUDGET_NANOS;
+        } else if (serverTickMs < 28.0 && (clientFrameMs <= 0.0 || clientFrameMs < 15.0)) {
+            target = 5_000_000L;
+        } else if (serverTickMs < 38.0 && (clientFrameMs <= 0.0 || clientFrameMs < 24.0)) {
+            target = BASE_SLICE_BUDGET_NANOS;
+        } else if (serverTickMs < 45.0) {
+            target = 2_000_000L;
+        } else {
+            target = MIN_SLICE_BUDGET_NANOS;
+        }
+
+        long step = 250_000L;
+
+        if (adaptiveSliceBudgetNanos < target) {
+            adaptiveSliceBudgetNanos =
+                    Math.min(target, adaptiveSliceBudgetNanos + step);
+        } else if (adaptiveSliceBudgetNanos > target) {
+            adaptiveSliceBudgetNanos =
+                    Math.max(target, adaptiveSliceBudgetNanos - step);
+        }
     }
 
     private static List<WorldgenLodRing> createRings(int innerRadius) {
@@ -154,6 +315,7 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static void reset() {
+        scheduleDetachedSaveIfDirty();
         epoch++;
         CACHE.clear();
         COMPLETED.clear();
@@ -170,6 +332,22 @@ public final class WorldgenSurfaceSampler {
         generatedTileCount = 0;
         initialFillStartedNanos = 0L;
         initialFillCompletedNanos = 0L;
+        adaptiveSliceBudgetNanos = BASE_SLICE_BUDGET_NANOS;
+        serverTickMs = 0.0;
+        clientFrameMs = 0.0;
+        diskLoadFuture = null;
+        diskSaveFuture = null;
+        diskCachePath = null;
+        diskCacheSeed = 0L;
+        diskCacheDimension = "";
+        diskLoadReady = false;
+        cacheDirty = false;
+        diskLoadedTiles = 0;
+        diskLoadMs = 0.0;
+        diskSavedTiles = 0;
+        diskSaveMs = 0.0;
+        diskFileMiB = 0.0;
+        diskCacheStatus = "OFF";
         currentJob = null;
         activeSliceId = 0L;
     }
@@ -185,6 +363,7 @@ public final class WorldgenSurfaceSampler {
             CACHE.put(completed.key(), completed.tile());
             lastGenerationMs = completed.tile().generationMs();
             generatedTileCount++;
+            cacheDirty = true;
 
             if (currentJob != null && currentJob.key.equals(completed.key())) {
                 currentJob = null;
@@ -385,6 +564,7 @@ public final class WorldgenSurfaceSampler {
         var randomState = chunks.randomState();
 
         int processed = 0;
+        long sliceBudgetNanos = adaptiveSliceBudgetNanos;
 
         while (job.nextSample < job.totalSamples && processed < MAX_SAMPLES_PER_SLICE) {
             int sampleIndex = job.nextSample;
@@ -408,7 +588,7 @@ public final class WorldgenSurfaceSampler {
             job.nextSample = sampleIndex + 1;
             processed++;
 
-            if (System.nanoTime() - sliceStart >= SLICE_BUDGET_NANOS) {
+            if (System.nanoTime() - sliceStart >= sliceBudgetNanos) {
                 break;
             }
         }
@@ -548,13 +728,22 @@ public final class WorldgenSurfaceSampler {
                 currentJob != null || activeSliceId != 0L,
                 lastGenerationMs,
                 generatedTileCount,
-                SLICE_BUDGET_NANOS / 1_000_000.0,
+                adaptiveSliceBudgetNanos / 1_000_000.0,
                 lastSliceMs,
                 lastSliceSamples,
                 progress,
                 currentLevel,
                 initialFillSeconds,
-                initialFillCompletedNanos != 0L
+                initialFillCompletedNanos != 0L,
+                serverTickMs,
+                clientFrameMs,
+                diskLoadedTiles,
+                diskLoadMs,
+                diskSavedTiles,
+                diskSaveMs,
+                diskFileMiB,
+                diskCacheStatus,
+                diskLoadFuture != null || diskSaveFuture != null
         );
     }
 

@@ -33,11 +33,11 @@
 - [x] distance-ladder diagnostic rings to 16,384 blocks
 - [x] per-ring visibility/cull/submission diagnostics
 - [x] 4 ms bounded initial-fill generation throughput test
-- [ ] adaptive generation budget based on server/client frame pressure
+- [x] adaptive generation budget based on server/client frame pressure
 - [x] experimental camera/frustum depth extension to 20,480 blocks
 - [ ] validate 16,384-block L5 visibility through extended projection
 - [ ] compact surface tile format
-- [ ] disk persistence
+- [x] compressed per-world/per-dimension disk persistence
 - [ ] multiplayer/server data path
 
 ## M3 - GPU architecture
