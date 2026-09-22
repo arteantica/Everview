@@ -33,6 +33,16 @@ The next milestone replaces the placeholder render callback with a real GPU terr
 
 ## Build
 
-Requires JDK 21 and the NeoForge ModDevGradle dependencies.
+Requires JDK 21.
 
-The source archive intentionally does not bundle a Gradle wrapper binary yet. Once the project is in a repository/build environment, run the project Gradle build and the output JAR will be produced under `build/libs/`.
+```bash
+./gradlew build
+```
+
+On Windows:
+
+```bat
+gradlew.bat build
+```
+
+The built mod JAR is written to `build/libs/`.
