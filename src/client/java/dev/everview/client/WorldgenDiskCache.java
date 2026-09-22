@@ -28,7 +28,7 @@ import java.util.zip.GZIPOutputStream;
  */
 public final class WorldgenDiskCache {
     private static final int MAGIC = 0x45564C31; // EVL1
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
     private static final int MAX_TILES = 100_000;
     private static final int MAX_VERTEX_INTS = 1_000_000;
 
@@ -43,7 +43,7 @@ public final class WorldgenDiskCache {
 
         return server.getWorldPath(LevelResource.ROOT)
                 .resolve("everview")
-                .resolve("lod-cache-v1")
+                .resolve("lod-cache-v2")
                 .resolve(dimensionId + ".evc.gz");
     }
 
@@ -114,6 +114,16 @@ public final class WorldgenDiskCache {
                     vertices[vertex] = input.readInt();
                 }
 
+                int colorLength = input.readInt();
+                if (colorLength != vertexLength / 3 || colorLength > MAX_VERTEX_INTS / 3) {
+                    return new LoadResult(List.of(), false, elapsedMs(started), "CORRUPT");
+                }
+
+                int[] colors = new int[colorLength];
+                for (int color = 0; color < colorLength; color++) {
+                    colors[color] = input.readInt();
+                }
+
                 tiles.add(new WorldgenSurfaceTile(
                         lodLevel,
                         tileX,
@@ -121,6 +131,7 @@ public final class WorldgenDiskCache {
                         tileSize,
                         sampleSpacing,
                         vertices,
+                        colors,
                         cellCount,
                         minY,
                         maxY,
@@ -180,6 +191,12 @@ public final class WorldgenDiskCache {
                     output.writeInt(vertices.length);
                     for (int vertex : vertices) {
                         output.writeInt(vertex);
+                    }
+
+                    int[] colors = tile.colors();
+                    output.writeInt(colors.length);
+                    for (int color : colors) {
+                        output.writeInt(color);
                     }
                 }
             }
