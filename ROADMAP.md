@@ -33,7 +33,8 @@
 - [x] distance-ladder diagnostic rings to 16,384 blocks
 - [x] per-ring visibility/cull/submission diagnostics
 - [ ] adaptive generation budget based on server/client frame pressure
-- [ ] far-plane extension beyond vanilla camera depth
+- [x] experimental camera/frustum depth extension to 20,480 blocks
+- [ ] validate 16,384-block L5 visibility through extended projection
 - [ ] compact surface tile format
 - [ ] disk persistence
 - [ ] multiplayer/server data path
