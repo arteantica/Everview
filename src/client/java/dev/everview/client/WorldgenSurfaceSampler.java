@@ -33,7 +33,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
-    public static final int HANDOFF_OVERLAP_BLOCKS = 96;
+    public static final int HANDOFF_OVERLAP_BLOCKS = 32;
     public static final int MAX_OUTER_RADIUS = 16_384;
 
     public static final long MIN_SLICE_BUDGET_NANOS = 1_000_000L;
@@ -128,10 +128,11 @@ public final class WorldgenSurfaceSampler {
         );
         innerRadius = Math.min(innerRadius, 896);
 
-        // M3.0.1 deliberately overlaps L1 under the last ~96 blocks of vanilla
-        // terrain. The overlap hides unloaded-chunk/fog holes at the handoff;
-        // the renderer biases LOD slightly downward so vanilla wins depth where
-        // both surfaces exist.
+        // M3.0.1 keeps only a narrow 32-block overlap under the edge of
+        // vanilla terrain. This is enough to hide small unloaded-chunk/fog
+        // holes without making the coarse LOD visibly take over too early.
+        // The renderer biases LOD slightly downward so vanilla wins depth
+        // wherever both surfaces exist.
         int anchorX = Math.floorDiv(centerX, 128) * 128;
         int anchorZ = Math.floorDiv(centerZ, 128) * 128;
 
