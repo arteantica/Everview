@@ -148,7 +148,9 @@ public final class EverviewRenderer {
         int worldZ = vertices[index + 2];
 
         float x = (float) (worldX - cameraX);
-        float y = (float) (worldY + 0.10D - cameraY);
+        // Keep LOD a fraction below vanilla terrain during the overlap band so
+        // real chunks win depth cleanly instead of z-fighting with the coarse mesh.
+        float y = (float) (worldY - 0.22D - cameraY);
         float z = (float) (worldZ - cameraZ);
 
         int rgb = colors[index / 3];
