@@ -24,7 +24,8 @@ import java.util.Set;
  * M4 unified hierarchical ownership renderer.
  *
  * Ownership is resolved from fine to coarse on the same draw-batch stream:
- * vanilla > L1 > L2 > L3. L2 no longer disappears as an all-or-nothing
+ * vanilla > L1 > L2 > L3. M4.2 applies vanilla ownership throughout the
+ * complete renderer-overlap area rather than only near the nominal edge. L2 no longer disappears as an all-or-nothing
  * 128-block tile; each section batch retires as its corresponding 32-block L1
  * tile becomes GPU-resident. L3 keeps its per-L2-region fallback. All masks
  * coalesce adjacent visible ranges before submission.
@@ -44,7 +45,7 @@ public final class EverviewRenderer {
     private static final double BASE_TERRAIN_BIAS = 0.22D;
     private static final double RING_LAYER_BIAS = 0.06D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
-    private static final double LIVE_HANDOFF_MARGIN_BLOCKS = 64.0D;
+    private static final double VANILLA_OWNERSHIP_MARGIN_BLOCKS = 64.0D;
     private static final int EARLY_HANDOFF_VISIBLE_NEIGHBOR_SECTIONS = 2;
 
     private static final Map<SectionKey, Long> RECENTLY_COMPILED_SECTIONS =
@@ -196,8 +197,8 @@ public final class EverviewRenderer {
                     dynamicTransforms
             );
 
-            boolean liveHandoff = tile.lodLevel() <= 2
-                    && tileIntersectsLiveHandoffBand(
+            boolean vanillaOwnership = tile.lodLevel() <= 2
+                    && tileIntersectsVanillaOwnershipArea(
                             tile,
                             cameraX,
                             cameraZ,
@@ -226,7 +227,7 @@ public final class EverviewRenderer {
             boolean drewAny = false;
             int drawnQuads = 0;
 
-            if (!liveHandoff && !finerLodMask) {
+            if (!vanillaOwnership && !finerLodMask) {
                 EverviewMetrics.recordSubmission(tile.lodLevel());
                 renderPass.drawIndexed(
                         gpuTile.indexCount(),
@@ -268,7 +269,7 @@ public final class EverviewRenderer {
                                 );
                     }
 
-                    boolean ownedByVanilla = liveHandoff
+                    boolean ownedByVanilla = vanillaOwnership
                             && batch.vanillaSensitive()
                             && vanillaOwnsBatch(
                                     client,
@@ -306,13 +307,13 @@ public final class EverviewRenderer {
                         rangeFirstIndex = batch.firstIndex();
                         rangeIndexCount = batch.indexCount();
                         rangeTouchesVanillaHandoff =
-                                liveHandoff
+                                vanillaOwnership
                                         && batch.vanillaSensitive();
                     } else if (rangeFirstIndex + rangeIndexCount
                             == batch.firstIndex()) {
                         rangeIndexCount += batch.indexCount();
                         rangeTouchesVanillaHandoff |=
-                                liveHandoff
+                                vanillaOwnership
                                         && batch.vanillaSensitive();
                     } else {
                         renderPass.drawIndexed(
@@ -328,7 +329,7 @@ public final class EverviewRenderer {
                         rangeFirstIndex = batch.firstIndex();
                         rangeIndexCount = batch.indexCount();
                         rangeTouchesVanillaHandoff =
-                                liveHandoff
+                                vanillaOwnership
                                         && batch.vanillaSensitive();
                     }
 
@@ -371,7 +372,7 @@ public final class EverviewRenderer {
         }
     }
 
-    private static boolean tileIntersectsLiveHandoffBand(
+    private static boolean tileIntersectsVanillaOwnershipArea(
             WorldgenSurfaceTile tile,
             double cameraX,
             double cameraZ,
@@ -389,24 +390,11 @@ public final class EverviewRenderer {
                 nearestZ - cameraZ
         );
 
-        double farthestDx = Math.max(
-                Math.abs(minX - cameraX),
-                Math.abs(maxX - cameraX)
-        );
-        double farthestDz = Math.max(
-                Math.abs(minZ - cameraZ),
-                Math.abs(maxZ - cameraZ)
-        );
-        double farthestDistance = Math.hypot(farthestDx, farthestDz);
-
-        double bandInner = Math.max(
-                0.0D,
-                vanillaRadius - LIVE_HANDOFF_MARGIN_BLOCKS
-        );
-        double bandOuter = vanillaRadius + LIVE_HANDOFF_MARGIN_BLOCKS;
-
-        return nearestDistance <= bandOuter
-                && farthestDistance >= bandInner;
+        // M4.2: not a thin transition band anymore. Every near LOD tile that
+        // reaches into the vanilla render radius must evaluate its
+        // vanilla-sensitive batches against renderer-visible terrain.
+        return nearestDistance
+                <= vanillaRadius + VANILLA_OWNERSHIP_MARGIN_BLOCKS;
     }
 
     public static void noteRecentlyCompiledSection(BlockPos origin) {
@@ -495,7 +483,7 @@ public final class EverviewRenderer {
         // LOD/worldgen surface height and the vanilla rendered surface can land
         // on opposite sides of a 16-block section boundary. Renderer-visible
         // terrain remains the authoritative ownership signal.
-        for (int offset = -1; offset <= 1; offset++) {
+        for (int offset = -2; offset <= 2; offset++) {
             if (vanillaSectionVisible(
                     client,
                     chunkX,
@@ -509,7 +497,7 @@ public final class EverviewRenderer {
 
         boolean recentlyUploaded = false;
 
-        for (int offset = -1; offset <= 1; offset++) {
+        for (int offset = -2; offset <= 2; offset++) {
             if (recentlyCompiledSection(
                     chunkX,
                     sectionY + offset,
@@ -533,7 +521,7 @@ public final class EverviewRenderer {
         for (int offset = -EARLY_HANDOFF_VISIBLE_NEIGHBOR_SECTIONS;
                 offset <= EARLY_HANDOFF_VISIBLE_NEIGHBOR_SECTIONS;
                 offset++) {
-            if (offset >= -1 && offset <= 1) {
+            if (offset >= -2 && offset <= 2) {
                 continue;
             }
 

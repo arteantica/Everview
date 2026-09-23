@@ -171,3 +171,10 @@
 - [x] keep server coverage streaming while two exact-height workers refine nearest L1
 - [x] cap detached provisional geometry and force appearance catch-up at the backlog limit
 - [x] keep detached exact tiles out of duplicate refinement selection
+
+
+## M4.2 absolute vanilla ownership
+- [x] evaluate vanilla ownership across the full renderer-overlap area instead of only the outer handoff band
+- [x] block the one-draw L1/L2 fast path wherever vanilla may already own visible chunk sections
+- [x] widen surface-section ownership tolerance for water and terrain section-boundary mismatches
+- [x] preserve LOD fallback where vanilla is not actually renderer-visible
