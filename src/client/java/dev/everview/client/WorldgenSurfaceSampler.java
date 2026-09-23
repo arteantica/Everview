@@ -27,10 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.7.3 makes the inner exact belt spatially contiguous instead of assigning
- * quality from 32x32 tile centers. Any visible L1 tile intersecting the inner
- * 64-block annulus now targets 1b; tiles intersecting the next 64 blocks target
- * 2b. This prevents coarse 2b/4b islands from appearing closer than exact L1.
+ * M3.8 adds velocity-aware near streaming. L1/L2 keep their normal camera
+ * guards, while a second predictive guard is placed ahead of sustained motion.
+ * At high speed the scheduler becomes coverage-only and abandons stale detail
+ * refinement so coarse safety terrain reaches the travel direction first.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -42,8 +42,14 @@ public final class WorldgenSurfaceSampler {
     public static final long MAX_SLICE_BUDGET_NANOS = 12_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 128;
 
-    private static final int CACHE_LIMIT = 3_072;
+    private static final int CACHE_LIMIT = 4_096;
     private static final int NEAR_RING_MAX_LEVEL = 2;
+    private static final double PREDICTION_START_BLOCKS_PER_SECOND = 12.0;
+    private static final double HIGH_SPEED_BLOCKS_PER_SECOND = 64.0;
+    private static final double VELOCITY_SMOOTHING = 0.35;
+    private static final double PREDICTION_SECONDS = 1.5;
+    private static final int MAX_PREDICTIVE_LEAD_BLOCKS = 768;
+    private static final int PREDICTIVE_ANCHOR_QUANTUM = 64;
     private static final int REMAINING_COVERAGE_BURST = 8;
     private static final int L1_PREFETCH_BLOCKS = 64;
     private static final int L2_PREFETCH_BLOCKS = 128;
@@ -89,6 +95,18 @@ public final class WorldgenSurfaceSampler {
     private static int lastAnchorZ = Integer.MIN_VALUE;
     private static int lastInnerRadius = Integer.MIN_VALUE;
     private static int lastViewSector = Integer.MIN_VALUE;
+    private static int lastPredictiveAnchorX = Integer.MIN_VALUE;
+    private static int lastPredictiveAnchorZ = Integer.MIN_VALUE;
+    private static boolean lastPredictionActive;
+
+    private static double lastPlayerX = Double.NaN;
+    private static double lastPlayerZ = Double.NaN;
+    private static double velocityXBlocksPerSecond;
+    private static double velocityZBlocksPerSecond;
+    private static double movementSpeedBlocksPerSecond;
+    private static int predictiveLeadBlocks;
+    private static boolean highSpeedCoverageMode;
+    private static int staleJobsCancelled;
 
     private static long epoch;
     private static long nextSliceId;
@@ -107,6 +125,31 @@ public final class WorldgenSurfaceSampler {
 
     public static WorldgenSurfaceSnapshot snapshot() {
         return snapshot;
+    }
+
+    public static StreamingStatus streamingStatus() {
+        int predictiveDesired = 0;
+        int predictiveCovered = 0;
+
+        for (WantedTile wanted : wantedTiles) {
+            if (!wanted.predictive()) {
+                continue;
+            }
+
+            predictiveDesired++;
+            if (CACHE.containsKey(wanted.key())) {
+                predictiveCovered++;
+            }
+        }
+
+        return new StreamingStatus(
+                movementSpeedBlocksPerSecond,
+                predictiveLeadBlocks,
+                highSpeedCoverageMode,
+                predictiveDesired,
+                predictiveCovered,
+                staleJobsCancelled
+        );
     }
 
     public static L1ViewStatus l1ViewStatus() {
@@ -167,16 +210,32 @@ public final class WorldgenSurfaceSampler {
         int centerZ = client.player.getBlockZ();
 
         float viewYaw = client.player.getYRot();
-        int viewSector = Math.floorMod(
-                (int) Math.floor(
-                        (viewYaw + VIEW_SECTOR_DEGREES * 0.5)
-                                / VIEW_SECTOR_DEGREES
-                ),
-                VIEW_SECTOR_COUNT
-        );
         double yawRadians = Math.toRadians(viewYaw);
-        double forwardX = -Math.sin(yawRadians);
-        double forwardZ = Math.cos(yawRadians);
+        double viewForwardX = -Math.sin(yawRadians);
+        double viewForwardZ = Math.cos(yawRadians);
+
+        MotionPrediction motion = updateMotionPrediction(
+                client,
+                viewForwardX,
+                viewForwardZ
+        );
+        double forwardX = motion.forwardX();
+        double forwardZ = motion.forwardZ();
+
+        int viewSector = directionSector(forwardX, forwardZ);
+        int predictiveCenterX = centerX
+                + (int) Math.round(forwardX * predictiveLeadBlocks);
+        int predictiveCenterZ = centerZ
+                + (int) Math.round(forwardZ * predictiveLeadBlocks);
+        int predictiveAnchorX = Math.floorDiv(
+                predictiveCenterX,
+                PREDICTIVE_ANCHOR_QUANTUM
+        ) * PREDICTIVE_ANCHOR_QUANTUM;
+        int predictiveAnchorZ = Math.floorDiv(
+                predictiveCenterZ,
+                PREDICTIVE_ANCHOR_QUANTUM
+        ) * PREDICTIVE_ANCHOR_QUANTUM;
+        boolean predictionActive = predictiveLeadBlocks > 0;
 
         int vanillaRadius = client.options.getEffectiveRenderDistance() * 16;
         int innerRadius = Math.max(
@@ -199,15 +258,25 @@ public final class WorldgenSurfaceSampler {
         if (anchorX != lastAnchorX
                 || anchorZ != lastAnchorZ
                 || innerRadius != lastInnerRadius
-                || viewSector != lastViewSector) {
+                || viewSector != lastViewSector
+                || predictionActive != lastPredictionActive
+                || (predictionActive
+                        && (predictiveAnchorX != lastPredictiveAnchorX
+                        || predictiveAnchorZ != lastPredictiveAnchorZ))) {
             lastAnchorX = anchorX;
             lastAnchorZ = anchorZ;
             lastInnerRadius = innerRadius;
             lastViewSector = viewSector;
+            lastPredictiveAnchorX = predictiveAnchorX;
+            lastPredictiveAnchorZ = predictiveAnchorZ;
+            lastPredictionActive = predictionActive;
             activeRings = createRings(innerRadius);
             wantedTiles = buildWantedTiles(
                     centerX,
                     centerZ,
+                    predictiveAnchorX,
+                    predictiveAnchorZ,
+                    predictionActive,
                     activeRings,
                     forwardX,
                     forwardZ
@@ -227,6 +296,15 @@ public final class WorldgenSurfaceSampler {
                 && activeSliceId == 0L
                 && !containsWantedKey(currentJob.key)) {
             currentJob = null;
+            staleJobsCancelled++;
+        }
+
+        if (currentJob != null
+                && activeSliceId == 0L
+                && highSpeedCoverageMode
+                && currentJob.refinement) {
+            currentJob = null;
+            staleJobsCancelled++;
         }
 
         if (currentJob != null && currentJob.failed && activeSliceId == 0L) {
@@ -243,7 +321,8 @@ public final class WorldgenSurfaceSampler {
                 currentJob = new GenerationJob(
                         next.key(),
                         next.ring(),
-                        sampleSpacing
+                        sampleSpacing,
+                        existing != null
                 );
             }
         }
@@ -254,6 +333,93 @@ public final class WorldgenSurfaceSampler {
 
         rebuildSnapshot();
         maybeScheduleDiskSave();
+    }
+
+    private static MotionPrediction updateMotionPrediction(
+            Minecraft client,
+            double viewForwardX,
+            double viewForwardZ
+    ) {
+        double playerX = client.player.getX();
+        double playerZ = client.player.getZ();
+
+        if (Double.isFinite(lastPlayerX) && Double.isFinite(lastPlayerZ)) {
+            double rawVelocityX = (playerX - lastPlayerX) * 20.0;
+            double rawVelocityZ = (playerZ - lastPlayerZ) * 20.0;
+            double rawSpeed = Math.hypot(rawVelocityX, rawVelocityZ);
+
+            // Teleports should not ask the streamer to manufacture a giant
+            // speculative corridor. Treat a >2048 b/s jump as a fresh anchor.
+            if (rawSpeed <= 2_048.0) {
+                velocityXBlocksPerSecond +=
+                        (rawVelocityX - velocityXBlocksPerSecond)
+                                * VELOCITY_SMOOTHING;
+                velocityZBlocksPerSecond +=
+                        (rawVelocityZ - velocityZBlocksPerSecond)
+                                * VELOCITY_SMOOTHING;
+            } else {
+                velocityXBlocksPerSecond = 0.0;
+                velocityZBlocksPerSecond = 0.0;
+            }
+        }
+
+        lastPlayerX = playerX;
+        lastPlayerZ = playerZ;
+
+        movementSpeedBlocksPerSecond = Math.hypot(
+                velocityXBlocksPerSecond,
+                velocityZBlocksPerSecond
+        );
+
+        double forwardX = viewForwardX;
+        double forwardZ = viewForwardZ;
+
+        if (movementSpeedBlocksPerSecond
+                >= PREDICTION_START_BLOCKS_PER_SECOND) {
+            forwardX = velocityXBlocksPerSecond
+                    / movementSpeedBlocksPerSecond;
+            forwardZ = velocityZBlocksPerSecond
+                    / movementSpeedBlocksPerSecond;
+
+            int rawLead = (int) Math.round(
+                    movementSpeedBlocksPerSecond * PREDICTION_SECONDS
+            );
+            predictiveLeadBlocks = Math.min(
+                    MAX_PREDICTIVE_LEAD_BLOCKS,
+                    Math.max(PREDICTIVE_ANCHOR_QUANTUM, rawLead)
+            );
+            predictiveLeadBlocks =
+                    Math.max(
+                            PREDICTIVE_ANCHOR_QUANTUM,
+                            (predictiveLeadBlocks
+                                    / PREDICTIVE_ANCHOR_QUANTUM)
+                                    * PREDICTIVE_ANCHOR_QUANTUM
+                    );
+        } else {
+            predictiveLeadBlocks = 0;
+        }
+
+        highSpeedCoverageMode = movementSpeedBlocksPerSecond
+                >= HIGH_SPEED_BLOCKS_PER_SECOND;
+
+        return new MotionPrediction(forwardX, forwardZ);
+    }
+
+    private static int directionSector(
+            double forwardX,
+            double forwardZ
+    ) {
+        double yawDegrees = Math.toDegrees(
+                Math.atan2(-forwardX, forwardZ)
+        );
+
+        return Math.floorMod(
+                (int) Math.floor(
+                        (yawDegrees + VIEW_SECTOR_DEGREES * 0.5)
+                                / VIEW_SECTOR_DEGREES
+                ),
+                VIEW_SECTOR_COUNT
+        );
     }
 
     private static void startDiskLoad(
@@ -443,6 +609,17 @@ public final class WorldgenSurfaceSampler {
         lastAnchorZ = Integer.MIN_VALUE;
         lastInnerRadius = Integer.MIN_VALUE;
         lastViewSector = Integer.MIN_VALUE;
+        lastPredictiveAnchorX = Integer.MIN_VALUE;
+        lastPredictiveAnchorZ = Integer.MIN_VALUE;
+        lastPredictionActive = false;
+        lastPlayerX = Double.NaN;
+        lastPlayerZ = Double.NaN;
+        velocityXBlocksPerSecond = 0.0;
+        velocityZBlocksPerSecond = 0.0;
+        movementSpeedBlocksPerSecond = 0.0;
+        predictiveLeadBlocks = 0;
+        highSpeedCoverageMode = false;
+        staleJobsCancelled = 0;
         lastGenerationMs = 0.0;
         lastSliceMs = 0.0;
         lastSliceSamples = 0;
@@ -499,6 +676,9 @@ public final class WorldgenSurfaceSampler {
     private static List<WantedTile> buildWantedTiles(
             int centerX,
             int centerZ,
+            int predictiveCenterX,
+            int predictiveCenterZ,
+            boolean predictionActive,
             List<WorldgenLodRing> rings,
             double forwardX,
             double forwardZ
@@ -509,6 +689,9 @@ public final class WorldgenSurfaceSampler {
             List<WantedTile> entries = buildRingWantedTiles(
                     centerX,
                     centerZ,
+                    predictiveCenterX,
+                    predictiveCenterZ,
+                    predictionActive,
                     ring,
                     forwardX,
                     forwardZ
@@ -518,6 +701,7 @@ public final class WorldgenSurfaceSampler {
                                     (WantedTile entry) -> entry.foreground() ? 0 : 1
                             )
                             .thenComparing(WantedTile::prefetch)
+                            .thenComparingInt(entry -> entry.predictive() ? 0 : 1)
                             .thenComparingLong(entry ->
                                     tileCenterDistanceSq(
                                             entry.key(),
@@ -550,6 +734,9 @@ public final class WorldgenSurfaceSampler {
     private static List<WantedTile> buildRingWantedTiles(
             int centerX,
             int centerZ,
+            int predictiveCenterX,
+            int predictiveCenterZ,
+            boolean predictionActive,
             WorldgenLodRing ring,
             double forwardX,
             double forwardZ
@@ -567,10 +754,25 @@ public final class WorldgenSurfaceSampler {
         );
         int streamOuterRadius = ring.outerRadiusBlocks() + prefetchBlocks;
 
-        int minTileX = Math.floorDiv(centerX - streamOuterRadius, tileSize);
-        int maxTileX = Math.floorDiv(centerX + streamOuterRadius, tileSize);
-        int minTileZ = Math.floorDiv(centerZ - streamOuterRadius, tileSize);
-        int maxTileZ = Math.floorDiv(centerZ + streamOuterRadius, tileSize);
+        boolean predictiveRing = predictionActive
+                && ring.lodLevel() <= NEAR_RING_MAX_LEVEL;
+
+        int minX = centerX - streamOuterRadius;
+        int maxX = centerX + streamOuterRadius;
+        int minZ = centerZ - streamOuterRadius;
+        int maxZ = centerZ + streamOuterRadius;
+
+        if (predictiveRing) {
+            minX = Math.min(minX, predictiveCenterX - streamOuterRadius);
+            maxX = Math.max(maxX, predictiveCenterX + streamOuterRadius);
+            minZ = Math.min(minZ, predictiveCenterZ - streamOuterRadius);
+            maxZ = Math.max(maxZ, predictiveCenterZ + streamOuterRadius);
+        }
+
+        int minTileX = Math.floorDiv(minX, tileSize);
+        int maxTileX = Math.floorDiv(maxX, tileSize);
+        int minTileZ = Math.floorDiv(minZ, tileSize);
+        int maxTileZ = Math.floorDiv(maxZ, tileSize);
 
         List<WantedTile> entries = new ArrayList<>();
 
@@ -586,7 +788,7 @@ public final class WorldgenSurfaceSampler {
                         tileSize
                 );
 
-                boolean inStreamGuard = visibleNow || tileIntersectsAnnulus(
+                boolean normalGuard = visibleNow || tileIntersectsAnnulus(
                         tileX,
                         tileZ,
                         centerX,
@@ -595,6 +797,36 @@ public final class WorldgenSurfaceSampler {
                         streamOuterRadius,
                         tileSize
                 );
+
+                boolean predictive = false;
+
+                if (predictiveRing && !visibleNow) {
+                    predictive = tileIntersectsAnnulus(
+                            tileX,
+                            tileZ,
+                            predictiveCenterX,
+                            predictiveCenterZ,
+                            streamInnerRadius,
+                            streamOuterRadius,
+                            tileSize
+                    );
+
+                    // L2 is the full emergency safety carpet. L1 prediction is
+                    // limited to the forward half of the future annulus so
+                    // exact-sized tiles do not explode speculative work.
+                    if (predictive && ring.lodLevel() == 1) {
+                        double tileCenterX =
+                                tileX * (double) tileSize + tileSize * 0.5;
+                        double tileCenterZ =
+                                tileZ * (double) tileSize + tileSize * 0.5;
+                        double futureDx = tileCenterX - predictiveCenterX;
+                        double futureDz = tileCenterZ - predictiveCenterZ;
+                        predictive = futureDx * forwardX
+                                + futureDz * forwardZ >= -tileSize;
+                    }
+                }
+
+                boolean inStreamGuard = normalGuard || predictive;
 
                 if (inStreamGuard) {
                     LodTileKey key = new LodTileKey(ring.lodLevel(), tileX, tileZ);
@@ -659,7 +891,8 @@ public final class WorldgenSurfaceSampler {
                             ring,
                             !visibleNow,
                             targetSpacing,
-                            foreground
+                            foreground || predictive,
+                            predictive
                     ));
                 }
             }
@@ -762,6 +995,20 @@ public final class WorldgenSurfaceSampler {
             return visibleCoverage;
         }
 
+        // At speed, build the future L2 safety carpet before spending time on
+        // speculative detail. Then bootstrap future L1 in the travel direction.
+        WantedTile predictiveFallback =
+                firstMissingPredictiveFallbackCoverage(pending);
+        if (predictiveFallback != null) {
+            return predictiveFallback;
+        }
+
+        WantedTile predictiveNear =
+                firstMissingPredictiveNearCoverage(pending);
+        if (predictiveNear != null) {
+            return predictiveNear;
+        }
+
         // Keep the foreground roaming guard warm before quality refinement.
         WantedTile nearGuard = firstMissingForegroundNearGuardCoverage(pending);
         if (nearGuard != null) {
@@ -769,6 +1016,13 @@ public final class WorldgenSurfaceSampler {
         }
 
         WantedTile remainingCoverage = firstMissingCoverage(pending);
+
+        // Extreme movement is coverage-only. Refining 4b -> 2b -> 1b while the
+        // player is outrunning the field just spends budget behind the camera.
+        if (highSpeedCoverageMode) {
+            balancedCoverageStep = 0;
+            return remainingCoverage;
+        }
 
         // M3.7.2: concentrate quality where the vanilla handoff is visible.
         // firstExactBandRefinement() returns the nearest exact-band tile that
@@ -842,12 +1096,49 @@ public final class WorldgenSurfaceSampler {
         return null;
     }
 
+    private static WantedTile firstMissingPredictiveFallbackCoverage(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || !wanted.predictive()
+                    || wanted.ring().lodLevel() != 2) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
+    private static WantedTile firstMissingPredictiveNearCoverage(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || !wanted.predictive()
+                    || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
     private static WantedTile firstMissingForegroundNearGuardCoverage(
             LodTileKey pending
     ) {
         for (WantedTile wanted : wantedTiles) {
             if (wanted.key().equals(pending)
                     || !wanted.prefetch()
+                    || wanted.predictive()
                     || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
                 continue;
             }
@@ -2075,6 +2366,7 @@ public final class WorldgenSurfaceSampler {
         private final int[] heights;
         private final int[] sampleColors;
         private final byte[] sampleMaterials;
+        private final boolean refinement;
 
         private volatile int nextSample;
         private volatile boolean failed;
@@ -2085,7 +2377,8 @@ public final class WorldgenSurfaceSampler {
         private GenerationJob(
                 LodTileKey key,
                 WorldgenLodRing ring,
-                int sampleSpacing
+                int sampleSpacing,
+                boolean refinement
         ) {
             if (sampleSpacing <= 0 || ring.tileSize() % sampleSpacing != 0) {
                 throw new IllegalArgumentException(
@@ -2098,6 +2391,7 @@ public final class WorldgenSurfaceSampler {
             this.originX = key.tileX() * ring.tileSize();
             this.originZ = key.tileZ() * ring.tileSize();
             this.sampleSpacing = sampleSpacing;
+            this.refinement = refinement;
             this.samplesAcross = ring.tileSize() / sampleSpacing + 1;
             this.cellsAcross = samplesAcross - 1;
             this.totalSamples = samplesAcross * samplesAcross;
@@ -2204,12 +2498,29 @@ public final class WorldgenSurfaceSampler {
     ) {
     }
 
+    public record StreamingStatus(
+            double speedBlocksPerSecond,
+            int predictiveLeadBlocks,
+            boolean highSpeedCoverageMode,
+            int predictiveDesired,
+            int predictiveCovered,
+            int staleJobsCancelled
+    ) {
+    }
+
+    private record MotionPrediction(
+            double forwardX,
+            double forwardZ
+    ) {
+    }
+
     private record WantedTile(
             LodTileKey key,
             WorldgenLodRing ring,
             boolean prefetch,
             int targetSpacing,
-            boolean foreground
+            boolean foreground,
+            boolean predictive
     ) {
     }
 

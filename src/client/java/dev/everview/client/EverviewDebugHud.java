@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.7.4.6.1 | UPLOAD-TIME HANDOFF");
+        lines.add("Everview M3.8 | VELOCITY PREFETCH");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Handoff: top faces yield on visible OR freshly uploaded vanilla sections");
-        lines.add("LOD bands: inner64 -> 1b | next64 -> 2b | 1.5s compile hint + live fallback");
+        lines.add("Stream: velocity lead + predictive L2 safety carpet | high speed = coverage only");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
@@ -161,6 +161,19 @@ public final class EverviewDebugHud {
                     front.desired(),
                     front.exact(),
                     front.desired()
+            ));
+
+            WorldgenSurfaceSampler.StreamingStatus stream =
+                    WorldgenSurfaceSampler.streamingStatus();
+
+            lines.add(String.format(
+                    "Motion: %.1f b/s | lead %db | ahead %d/%d | %s | stale %d",
+                    stream.speedBlocksPerSecond(),
+                    stream.predictiveLeadBlocks(),
+                    stream.predictiveCovered(),
+                    stream.predictiveDesired(),
+                    stream.highSpeedCoverageMode() ? "COVERAGE" : "NORMAL",
+                    stream.staleJobsCancelled()
             ));
 
             double tilesPerSecond = far.initialFillSeconds() > 0.0

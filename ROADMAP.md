@@ -97,6 +97,11 @@
 - [x] split tall near-LOD vertical faces at vanilla 16-block section boundaries
 - [x] surface-column handoff ownership with +/-1 renderer-visible Y-section tolerance
 - [x] early top-face handoff from vanilla RenderSection upload completion with expiring fallback-safe hints
+- [x] velocity-aware L1/L2 predictive prefetch anchored ahead of sustained motion
+- [x] high-speed coverage-only scheduling with predictive L2 safety carpet
+- [x] abandon stale in-progress refinement after movement priority shifts
+- [x] expose motion speed / lead / ahead-coverage / stale-cancel telemetry
+- [ ] benchmark velocity prefetch at elytra and FlySpeed travel rates
 - [ ] block-faithful 2-block intermediate geometry
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] screen-space error driven detail selection
