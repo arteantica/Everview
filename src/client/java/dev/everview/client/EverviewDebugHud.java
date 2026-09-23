@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.4 | 2-BLOCK ULTRA-NEAR");
+        lines.add("Everview M3.5 | PROGRESSIVE STREAMING");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Render: persistent GPU | L1 2b / 32t | center-owned handoff | L2 8b");
+        lines.add("Render: persistent GPU | 2x bootstrap -> exact refine | L1 2b / 32t");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
@@ -69,12 +69,27 @@ public final class EverviewDebugHud {
                 ));
             }
 
+            int refinedTiles = 0;
+            for (WorldgenSurfaceTile tile : far.tiles()) {
+                WorldgenLodRing targetRing = far.ringForLevel(tile.lodLevel());
+                if (targetRing != null
+                        && tile.sampleSpacing() <= targetRing.sampleSpacing()) {
+                    refinedTiles++;
+                }
+            }
+
+            double refinePercent = far.desiredTileCount() > 0
+                    ? refinedTiles * 100.0 / far.desiredTileCount()
+                    : 0.0;
+
             lines.add(String.format(
-                    "Total: %d/%d (%.0f%%) | cache %d | job %s",
+                    "Coverage: %d/%d (%.0f%%) | refine %d/%d (%.0f%%) | job %s",
                     far.readyTileCount(),
                     far.desiredTileCount(),
                     far.completionPercent(),
-                    far.cacheSize(),
+                    refinedTiles,
+                    far.desiredTileCount(),
+                    refinePercent,
                     far.taskInFlight() ? "ON" : "OFF"
             ));
 

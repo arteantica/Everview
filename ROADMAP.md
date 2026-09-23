@@ -65,7 +65,10 @@
 - [x] flat water/coastline classification for L1
 - [x] denser L1 sampling: 16 -> 8 blocks after M3.2 performance validation
 - [x] split near ring: 4-block ultra-near + 8-block near after M3.2.1 benchmark
-- [ ] validate 2-block ultra-near L1 after persistent-GPU benchmark
+- [x] validate 2-block ultra-near L1 after persistent-GPU benchmark
+- [x] progressive 2x-spacing bootstrap tiles before exact refinement
+- [x] adaptive initial-stream generation budget up to 12 ms
+- [ ] view-direction / screen-space generation priority
 - [ ] texture-atlas / UV material rendering
 - [ ] structures
 - [ ] trees

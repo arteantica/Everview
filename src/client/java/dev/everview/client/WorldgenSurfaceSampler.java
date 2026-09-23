@@ -27,10 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M2.6 keeps one bounded integrated-server task per client tick, but raises the
- * initial-fill budget from the deliberately conservative 1.5 ms used in M2.1
- * to 4.0 ms. This should cut first-fill time dramatically while still keeping
- * Everview well below Minecraft's 50 ms server-tick budget.
+ * M3.5 adds progressive terrain streaming. Every tile first appears from a
+ * cheap 2x-spacing bootstrap pass, then refines to its exact target spacing.
+ * The adaptive server-thread budget can rise to 12 ms when tick/frame headroom
+ * is large and backs off automatically under load.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -38,9 +38,9 @@ public final class WorldgenSurfaceSampler {
     public static final int MAX_OUTER_RADIUS = 16_384;
 
     public static final long MIN_SLICE_BUDGET_NANOS = 1_000_000L;
-    public static final long BASE_SLICE_BUDGET_NANOS = 4_000_000L;
-    public static final long MAX_SLICE_BUDGET_NANOS = 6_000_000L;
-    public static final int MAX_SAMPLES_PER_SLICE = 48;
+    public static final long BASE_SLICE_BUDGET_NANOS = 6_000_000L;
+    public static final long MAX_SLICE_BUDGET_NANOS = 12_000_000L;
+    public static final int MAX_SAMPLES_PER_SLICE = 128;
 
     private static final int CACHE_LIMIT = 2_304;
 
@@ -172,7 +172,21 @@ public final class WorldgenSurfaceSampler {
         if (currentJob == null && activeSliceId == 0L) {
             WantedTile next = findNextMissing();
             if (next != null) {
-                currentJob = new GenerationJob(next.key(), next.ring());
+                WorldgenSurfaceTile existing = CACHE.get(next.key());
+
+                // First coverage pass uses twice the target spacing. It is much
+                // cheaper and gives the renderer a complete terrain tile quickly.
+                // Once every wanted tile exists, findNextMissing() revisits tiles
+                // whose spacing is still coarser than the ring target.
+                int sampleSpacing = existing == null
+                        ? Math.min(next.ring().tileSize(), next.ring().sampleSpacing() * 2)
+                        : next.ring().sampleSpacing();
+
+                currentJob = new GenerationJob(
+                        next.key(),
+                        next.ring(),
+                        sampleSpacing
+                );
             }
         }
 
@@ -291,19 +305,24 @@ public final class WorldgenSurfaceSampler {
 
         long target;
 
-        if (serverTickMs < 18.0 && (clientFrameMs <= 0.0 || clientFrameMs < 10.0)) {
+        // M3.5 uses the large amount of singleplayer tick headroom during
+        // initial streaming, then backs off automatically as either the server
+        // tick or client frame becomes busy.
+        if (serverTickMs < 15.0 && (clientFrameMs <= 0.0 || clientFrameMs < 10.0)) {
             target = MAX_SLICE_BUDGET_NANOS;
-        } else if (serverTickMs < 28.0 && (clientFrameMs <= 0.0 || clientFrameMs < 15.0)) {
-            target = 5_000_000L;
+        } else if (serverTickMs < 22.0 && (clientFrameMs <= 0.0 || clientFrameMs < 13.0)) {
+            target = 10_000_000L;
+        } else if (serverTickMs < 30.0 && (clientFrameMs <= 0.0 || clientFrameMs < 18.0)) {
+            target = 8_000_000L;
         } else if (serverTickMs < 38.0 && (clientFrameMs <= 0.0 || clientFrameMs < 24.0)) {
             target = BASE_SLICE_BUDGET_NANOS;
         } else if (serverTickMs < 45.0) {
-            target = 2_000_000L;
+            target = 3_000_000L;
         } else {
             target = MIN_SLICE_BUDGET_NANOS;
         }
 
-        long step = 250_000L;
+        long step = 500_000L;
 
         if (adaptiveSliceBudgetNanos < target) {
             adaptiveSliceBudgetNanos =
@@ -536,11 +555,27 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
+        // Pass 1: coverage. Missing tiles are generated at 2x target spacing
+        // so the entire LOD field becomes visible quickly.
         for (WantedTile wanted : wantedTiles) {
             if (wanted.key().equals(pending)) {
                 continue;
             }
             if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        // Pass 2: exact refinement. Replace bootstrap tiles with the ring's
+        // target spacing in the same nearest-first/interleaved order.
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)) {
+                continue;
+            }
+
+            WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+            if (tile != null
+                    && tile.sampleSpacing() > wanted.ring().sampleSpacing()) {
                 return wanted;
             }
         }
@@ -608,8 +643,8 @@ public final class WorldgenSurfaceSampler {
             int sampleIndex = job.nextSample;
             int gx = sampleIndex % job.samplesAcross;
             int gz = sampleIndex / job.samplesAcross;
-            int worldX = job.originX + gx * job.ring.sampleSpacing();
-            int worldZ = job.originZ + gz * job.ring.sampleSpacing();
+            int worldX = job.originX + gx * job.sampleSpacing;
+            int worldZ = job.originZ + gz * job.sampleSpacing;
 
             int y = generator.getBaseHeight(
                     worldX,
@@ -660,7 +695,7 @@ public final class WorldgenSurfaceSampler {
                     job.key.tileX(),
                     job.key.tileZ(),
                     job.ring.tileSize(),
-                    job.ring.sampleSpacing(),
+                    job.sampleSpacing,
                     mesh.vertices(),
                     mesh.colors(),
                     mesh.materials(),
@@ -679,7 +714,7 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static MeshData buildMesh(GenerationJob job, int seaLevel) {
-        if (job.ring.sampleSpacing() <= 8) {
+        if (job.sampleSpacing <= 8) {
             return buildTerracedMesh(job, seaLevel);
         }
 
@@ -692,7 +727,7 @@ public final class WorldgenSurfaceSampler {
         byte[] materials = new byte[job.cellCount * 4];
         int vertexOut = 0;
         int colorOut = 0;
-        int spacing = job.ring.sampleSpacing();
+        int spacing = job.sampleSpacing;
 
         for (int gz = 0; gz < job.cellsAcross; gz++) {
             int z0 = job.originZ + gz * spacing;
@@ -738,19 +773,19 @@ public final class WorldgenSurfaceSampler {
 
                 int c00 = MaterialTerrainShading.apply(
                         shadeSample(job, i00, shade, steepness),
-                        m00, x0, y00, z0, job.ring.sampleSpacing()
+                        m00, x0, y00, z0, job.sampleSpacing
                 );
                 int c01 = MaterialTerrainShading.apply(
                         shadeSample(job, i01, shade, steepness),
-                        m01, x0, y01, z1, job.ring.sampleSpacing()
+                        m01, x0, y01, z1, job.sampleSpacing
                 );
                 int c11 = MaterialTerrainShading.apply(
                         shadeSample(job, i11, shade, steepness),
-                        m11, x1, y11, z1, job.ring.sampleSpacing()
+                        m11, x1, y11, z1, job.sampleSpacing
                 );
                 int c10 = MaterialTerrainShading.apply(
                         shadeSample(job, i10, shade, steepness),
-                        m10, x1, y10, z0, job.ring.sampleSpacing()
+                        m10, x1, y10, z0, job.sampleSpacing
                 );
 
                 vertices[vertexOut++] = x0;
@@ -791,7 +826,7 @@ public final class WorldgenSurfaceSampler {
      */
     private static MeshData buildTerracedMesh(GenerationJob job, int seaLevel) {
         int cells = job.cellsAcross;
-        int spacing = job.ring.sampleSpacing();
+        int spacing = job.sampleSpacing;
         int[] topY = new int[job.cellCount];
         int[] topColor = new int[job.cellCount];
         byte[] topMaterial = new byte[job.cellCount];
@@ -850,7 +885,7 @@ public final class WorldgenSurfaceSampler {
                         x,
                         y,
                         z,
-                        job.ring.sampleSpacing()
+                        job.sampleSpacing
                 );
             }
         }
@@ -1060,7 +1095,7 @@ public final class WorldgenSurfaceSampler {
         // At near-ring sampling (8 blocks or finer), keep full one-block
         // vertical steps. The new 2-block L1 therefore gains horizontal detail
         // without smoothing away Minecraft's stepped silhouette.
-        return job.ring.sampleSpacing() <= 8
+        return job.sampleSpacing <= 8
                 ? average
                 : Math.round(average / 2.0F) * 2;
     }
@@ -1288,6 +1323,7 @@ public final class WorldgenSurfaceSampler {
         private final WorldgenLodRing ring;
         private final int originX;
         private final int originZ;
+        private final int sampleSpacing;
         private final int samplesAcross;
         private final int cellsAcross;
         private final int totalSamples;
@@ -1302,13 +1338,24 @@ public final class WorldgenSurfaceSampler {
         private int maxY = Integer.MIN_VALUE;
         private long accumulatedNanos;
 
-        private GenerationJob(LodTileKey key, WorldgenLodRing ring) {
+        private GenerationJob(
+                LodTileKey key,
+                WorldgenLodRing ring,
+                int sampleSpacing
+        ) {
+            if (sampleSpacing <= 0 || ring.tileSize() % sampleSpacing != 0) {
+                throw new IllegalArgumentException(
+                        "tile size must be divisible by generation spacing"
+                );
+            }
+
             this.key = key;
             this.ring = ring;
             this.originX = key.tileX() * ring.tileSize();
             this.originZ = key.tileZ() * ring.tileSize();
-            this.samplesAcross = ring.samplesAcross();
-            this.cellsAcross = ring.cellsAcross();
+            this.sampleSpacing = sampleSpacing;
+            this.samplesAcross = ring.tileSize() / sampleSpacing + 1;
+            this.cellsAcross = samplesAcross - 1;
             this.totalSamples = samplesAcross * samplesAcross;
             this.cellCount = cellsAcross * cellsAcross;
             this.heights = new int[totalSamples];
