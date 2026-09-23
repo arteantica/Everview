@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.6 | 1-BLOCK L1");
+        lines.add("Everview M3.6.1 | STAGED 1-BLOCK L1");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Detail: L1 bootstrap 2b -> exact 1b | conditional L2 safety net underneath");
+        lines.add("Detail: L1 4b bootstrap -> 2b intermediate -> 1b exact | L2 safety net");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
@@ -73,11 +73,19 @@ public final class EverviewDebugHud {
             int nearDesired = 0;
             int nearCovered = 0;
             int nearRefined = 0;
+            int l1Desired = 0;
+            int l1Covered = 0;
+            int l1Intermediate = 0;
+            int l1Exact = 0;
 
             for (WorldgenRingStatus status : far.rings()) {
                 if (status.ring().lodLevel() <= 2) {
                     nearDesired += status.desiredTileCount();
                     nearCovered += status.readyTileCount();
+                }
+                if (status.ring().lodLevel() == 1) {
+                    l1Desired = status.desiredTileCount();
+                    l1Covered = status.readyTileCount();
                 }
             }
 
@@ -88,6 +96,15 @@ public final class EverviewDebugHud {
                     refinedTiles++;
                     if (tile.lodLevel() <= 2) {
                         nearRefined++;
+                    }
+                }
+
+                if (tile.lodLevel() == 1) {
+                    if (tile.sampleSpacing() <= 2) {
+                        l1Intermediate++;
+                    }
+                    if (tile.sampleSpacing() <= 1) {
+                        l1Exact++;
                     }
                 }
             }
@@ -121,6 +138,16 @@ public final class EverviewDebugHud {
                     nearRefined,
                     nearDesired,
                     nearRefinePercent
+            ));
+
+            lines.add(String.format(
+                    "L1 stages: cover %d/%d | <=2b %d/%d | 1b %d/%d",
+                    l1Covered,
+                    l1Desired,
+                    l1Intermediate,
+                    l1Desired,
+                    l1Exact,
+                    l1Desired
             ));
 
             double tilesPerSecond = far.initialFillSeconds() > 0.0

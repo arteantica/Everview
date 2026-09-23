@@ -75,8 +75,9 @@
 - [x] persistent overlapping L2 fallback underlay beneath the full L1 band
 - [x] prioritize missing visible L2 fallback tiles before all refinement
 - [x] suppress interior L2 underlay draws once resident L1 coverage is complete
-- [x] exact 1-block horizontal L1 refinement with 2-block progressive bootstrap
-- [ ] benchmark 1-block L1 generation / VRAM / roaming refinement cost
+- [x] exact 1-block horizontal L1 refinement
+- [x] staged L1 streaming: 4b bootstrap -> 2b intermediate -> 1b low-priority exact
+- [ ] benchmark staged 1-block L1 generation / VRAM / roaming refinement cost
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] view-direction / screen-space generation priority
 - [ ] texture-atlas / UV material rendering

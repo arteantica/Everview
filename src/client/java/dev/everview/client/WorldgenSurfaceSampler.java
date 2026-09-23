@@ -27,10 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.6 keeps the conditional L2 roaming underlay but pushes exact L1 surface
- * fidelity to one block horizontally. Progressive coverage still starts at
- * 2-block L1, then near-first refinement replaces those tiles with true
- * 1-block terraced surface geometry.
+ * M3.6.1 turns L1 into a three-stage stream: 4-block bootstrap for fast
+ * coverage, 2-block visible intermediate detail, then low-priority 1-block
+ * exact refinement. The conditional L2 underlay remains available underneath
+ * so final fidelity never blocks world coverage.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -48,6 +48,10 @@ public final class WorldgenSurfaceSampler {
     private static final int NEAR_REFINE_BURST = 2;
     private static final int L1_PREFETCH_BLOCKS = 64;
     private static final int L2_PREFETCH_BLOCKS = 128;
+    private static final int L1_BOOTSTRAP_SPACING = 4;
+    private static final int L1_INTERMEDIATE_SPACING = 2;
+    private static final int L1_EXACT_SPACING = 1;
+    private static final int EXACT_REFINE_COVERAGE_STEPS = 2;
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
@@ -90,6 +94,7 @@ public final class WorldgenSurfaceSampler {
     private static long initialFillStartedNanos;
     private static long initialFillCompletedNanos;
     private static int nearRefineScheduleStep;
+    private static int exactRefineCoverageStep;
 
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
@@ -180,13 +185,7 @@ public final class WorldgenSurfaceSampler {
             if (next != null) {
                 WorldgenSurfaceTile existing = CACHE.get(next.key());
 
-                // First coverage pass uses twice the target spacing. It is much
-                // cheaper and gives the renderer a complete terrain tile quickly.
-                // Once every wanted tile exists, findNextMissing() revisits tiles
-                // whose spacing is still coarser than the ring target.
-                int sampleSpacing = existing == null
-                        ? Math.min(next.ring().tileSize(), next.ring().sampleSpacing() * 2)
-                        : next.ring().sampleSpacing();
+                int sampleSpacing = nextGenerationSpacing(next, existing);
 
                 currentJob = new GenerationJob(
                         next.key(),
@@ -397,6 +396,7 @@ public final class WorldgenSurfaceSampler {
         initialFillStartedNanos = 0L;
         initialFillCompletedNanos = 0L;
         nearRefineScheduleStep = 0;
+        exactRefineCoverageStep = 0;
         adaptiveSliceBudgetNanos = BASE_SLICE_BUDGET_NANOS;
         serverTickMs = 0.0;
         clientFrameMs = 0.0;
@@ -592,12 +592,31 @@ public final class WorldgenSurfaceSampler {
         return false;
     }
 
+    private static int nextGenerationSpacing(
+            WantedTile wanted,
+            WorldgenSurfaceTile existing
+    ) {
+        WorldgenLodRing ring = wanted.ring();
+
+        if (ring.lodLevel() == 1) {
+            if (existing == null) {
+                return L1_BOOTSTRAP_SPACING;
+            }
+            if (existing.sampleSpacing() > L1_INTERMEDIATE_SPACING) {
+                return L1_INTERMEDIATE_SPACING;
+            }
+            return L1_EXACT_SPACING;
+        }
+
+        return existing == null
+                ? Math.min(ring.tileSize(), ring.sampleSpacing() * 2)
+                : ring.sampleSpacing();
+    }
+
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        // M3.5.4 priority zero: establish the L2 fallback underlay first.
-        // If L1 is absent after camera motion, this coarse surface is what
-        // prevents sky/white holes from becoming visible.
+        // Priority zero stays the coarse L2 safety net.
         WantedTile fallback = firstMissingFallbackCoverage(pending);
         if (fallback != null) {
             return fallback;
@@ -605,18 +624,8 @@ public final class WorldgenSurfaceSampler {
 
         WantedTile coverage = firstMissingCoverage(pending);
 
-        if (coverage == null) {
-            // Coverage + guard band are complete. Finish near detail before
-            // progressively refining the remaining outer rings.
-            WantedTile nearRefine = firstRefinement(pending, true);
-            return nearRefine != null
-                    ? nearRefine
-                    : firstRefinement(pending, false);
-        }
-
-        // A missing tile in the currently visible annulus is a real hole, so
-        // fill it immediately before any exact-detail refinement work.
-        if (!coverage.prefetch()) {
+        // Any currently visible hole, in any ring, beats quality refinement.
+        if (coverage != null && !coverage.prefetch()) {
             return coverage;
         }
 
@@ -624,20 +633,44 @@ public final class WorldgenSurfaceSampler {
             return coverage;
         }
 
-        WantedTile nearRefine = firstRefinement(pending, true);
-        if (nearRefine != null) {
-            // Two exact L1/L2 replacements, then one bootstrap coverage tile.
-            // This keeps the horizon growing while making nearby terrain visibly
-            // sharpen long before total 16K coverage reaches 100%.
-            if (nearRefineScheduleStep < NEAR_REFINE_BURST) {
+        // Stage 2: upgrade visible L1 from 4b -> 2b and visible L2 from
+        // bootstrap -> exact. This is still "coverage quality", not final L1.
+        WantedTile intermediate = firstIntermediateNearRefinement(pending);
+        if (intermediate != null) {
+            if (coverage == null || nearRefineScheduleStep < NEAR_REFINE_BURST) {
                 nearRefineScheduleStep++;
-                return nearRefine;
+                return intermediate;
             }
 
             nearRefineScheduleStep = 0;
+            return coverage;
         }
 
-        return coverage;
+        // Stage 3: true 1-block L1 is intentionally low priority while guard
+        // coverage is still outstanding. Do two guard-coverage selections for
+        // every exact L1 refinement. Once guard coverage is done, refine L1
+        // continuously nearest-first.
+        WantedTile exactL1 = firstExactL1Refinement(pending);
+        if (exactL1 != null) {
+            if (coverage == null) {
+                exactRefineCoverageStep = 0;
+                return exactL1;
+            }
+
+            if (exactRefineCoverageStep >= EXACT_REFINE_COVERAGE_STEPS) {
+                exactRefineCoverageStep = 0;
+                return exactL1;
+            }
+
+            exactRefineCoverageStep++;
+            return coverage;
+        }
+
+        if (coverage != null) {
+            return coverage;
+        }
+
+        return firstRefinement(pending, false);
     }
 
     private static WantedTile firstMissingFallbackCoverage(LodTileKey pending) {
@@ -675,6 +708,54 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
             if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
+    private static WantedTile firstIntermediateNearRefinement(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending) || wanted.prefetch()) {
+                continue;
+            }
+
+            int level = wanted.ring().lodLevel();
+            WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+
+            if (tile == null) {
+                continue;
+            }
+
+            if (level == 1
+                    && tile.sampleSpacing() > L1_INTERMEDIATE_SPACING) {
+                return wanted;
+            }
+
+            if (level == 2
+                    && tile.sampleSpacing() > wanted.ring().sampleSpacing()) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
+    private static WantedTile firstExactL1Refinement(LodTileKey pending) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || wanted.prefetch()
+                    || wanted.ring().lodLevel() != 1) {
+                continue;
+            }
+
+            WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+            if (tile != null
+                    && tile.sampleSpacing() > L1_EXACT_SPACING
+                    && tile.sampleSpacing() <= L1_INTERMEDIATE_SPACING) {
                 return wanted;
             }
         }
