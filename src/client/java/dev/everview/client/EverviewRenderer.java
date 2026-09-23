@@ -21,10 +21,10 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * M3.8.1 persistent-GPU distant terrain renderer. Expensive section-level
- * live ownership is now confined to a narrow band around the vanilla render
- * boundary. Near tiles safely outside that band render as one full GPU draw,
- * keeping the proven live fallback only where vanilla can actually overlap.
+ * M3.8.2 persistent-GPU distant terrain renderer. Section-level ownership is
+ * still confined to the vanilla boundary, but adjacent visible handoff batches
+ * are now coalesced into contiguous index ranges before submission. This keeps
+ * the exact same ownership decisions while drastically reducing CPU draw calls.
  *
  * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
  * Minecraft's opaque terrain RenderPass is still open. Everview therefore
@@ -211,13 +211,30 @@ public final class EverviewRenderer {
                 drewAny = true;
                 drawnQuads = gpuTile.indexCount() / 6;
             } else {
+                int rangeFirstIndex = -1;
+                int rangeIndexCount = 0;
+
                 for (EverviewGpuTileCache.DrawBatch batch : gpuTile.drawBatches()) {
-                    if (batch.vanillaSensitive()
+                    boolean ownedByVanilla = batch.vanillaSensitive()
                             && vanillaOwnsBatch(
                                     client,
                                     batch,
                                     vanillaVisibility
-                            )) {
+                            );
+
+                    if (ownedByVanilla) {
+                        if (rangeIndexCount > 0) {
+                            renderPass.drawIndexed(
+                                    rangeIndexCount,
+                                    1,
+                                    rangeFirstIndex,
+                                    0,
+                                    0
+                            );
+                            EverviewMetrics.recordDrawCall(true);
+                            rangeFirstIndex = -1;
+                            rangeIndexCount = 0;
+                        }
                         continue;
                     }
 
@@ -226,15 +243,40 @@ public final class EverviewRenderer {
                         drewAny = true;
                     }
 
+                    // DrawBatch ranges are stored consecutively in the shared
+                    // index stream. If the next visible batch directly follows
+                    // the current range, fold it into the same draw call.
+                    if (rangeIndexCount == 0) {
+                        rangeFirstIndex = batch.firstIndex();
+                        rangeIndexCount = batch.indexCount();
+                    } else if (rangeFirstIndex + rangeIndexCount
+                            == batch.firstIndex()) {
+                        rangeIndexCount += batch.indexCount();
+                    } else {
+                        renderPass.drawIndexed(
+                                rangeIndexCount,
+                                1,
+                                rangeFirstIndex,
+                                0,
+                                0
+                        );
+                        EverviewMetrics.recordDrawCall(true);
+                        rangeFirstIndex = batch.firstIndex();
+                        rangeIndexCount = batch.indexCount();
+                    }
+
+                    drawnQuads += batch.indexCount() / 6;
+                }
+
+                if (rangeIndexCount > 0) {
                     renderPass.drawIndexed(
-                            batch.indexCount(),
+                            rangeIndexCount,
                             1,
-                            batch.firstIndex(),
+                            rangeFirstIndex,
                             0,
                             0
                     );
                     EverviewMetrics.recordDrawCall(true);
-                    drawnQuads += batch.indexCount() / 6;
                 }
             }
 

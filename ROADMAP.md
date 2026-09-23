@@ -104,7 +104,8 @@
 - [x] restrict expensive live section ownership to a narrow vanilla-boundary band
 - [x] one-draw-per-tile fast path outside the vanilla handoff zone
 - [x] expose real draw-call / handoff-batch telemetry
-- [ ] benchmark boundary-only batching CPU cost at full 1b residency
+- [x] coalesce adjacent visible handoff batches into contiguous indexed draw ranges
+- [ ] benchmark coalesced handoff CPU cost at full 1b residency
 - [ ] benchmark velocity prefetch at elytra and FlySpeed travel rates
 - [ ] block-faithful 2-block intermediate geometry
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
