@@ -7,7 +7,7 @@
 - [x] tile addressing
 - [x] generation-priority primitive
 - [x] CI build
-- [ ] renderer-backend interface
+- [x] renderer-backend interface
 
 ## M1 - first visible terrain
 - [x] 26.3 render-graph integration
@@ -73,6 +73,7 @@
 - [ ] near voxel-derived LOD for cave mouths/overhangs (issue #5)
 
 ## M5 - compatibility
+- [x] shader-ready terrain backend seam
 - [ ] Sodium path
 - [ ] Iris detection and safe fallback
 - [ ] shader depth/fog integration

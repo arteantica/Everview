@@ -1,30 +1,22 @@
 package dev.everview.client;
 
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.renderpearl.api.buffers.GpuBuffer;
-import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.renderpearl.api.commands.RenderPass;
-import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4f;
-import org.joml.Vector3f;
-import org.joml.Vector4f;
 
 /**
- * M3.3 persistent-GPU distant terrain renderer.
+ * Persistent-GPU distant terrain renderer.
  *
- * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
- * Minecraft's opaque terrain RenderPass is still open. Everview therefore
- * draws into that existing pass instead of trying to create a nested pass.
+ * M3.5 keeps visibility/ownership policy here while delegating concrete GPU
+ * uploads, vertex formats, pipelines and draw submission to a terrain backend.
+ * That boundary is intentional: a future Iris/shader backend can consume the
+ * same generated tiles without coupling the worldgen/LOD code to shader APIs.
  */
 public final class EverviewRenderer {
-    private static final Vector4f COLOR_MODULATOR = new Vector4f(1.0F, 1.0F, 1.0F, 1.0F);
-    private static final Vector3f MODEL_OFFSET = new Vector3f();
-    private static final Matrix4f TEXTURE_MATRIX = new Matrix4f();
-
     private EverviewRenderer() {
     }
 
@@ -43,7 +35,7 @@ public final class EverviewRenderer {
 
             WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
             if (!snapshot.tiles().isEmpty()) {
-                EverviewGpuTileCache.prepareFrame(client.level, snapshot);
+                EverviewRenderBackends.active().prepareFrame(client.level, snapshot);
             }
         });
     }
@@ -68,12 +60,9 @@ public final class EverviewRenderer {
         double cameraY = cameraPos.y();
         double cameraZ = cameraPos.z();
         var frustum = camera.getCullFrustum();
+        EverviewTerrainBackend backend = EverviewRenderBackends.active();
 
-        renderPass.setPipeline(RenderSystem.getCompiledPipeline(EverviewGpuPipeline.TERRAIN));
-        RenderSystem.bindDefaultUniforms(renderPass);
-
-        RenderSystem.AutoStorageIndexBuffer quadIndices =
-                RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
+        backend.beginOpaquePass(renderPass);
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
             WorldgenLodRing ring = snapshot.ringForLevel(tile.lodLevel());
@@ -95,17 +84,6 @@ public final class EverviewRenderer {
                 continue;
             }
 
-            EverviewGpuTileCache.GpuTile gpuTile =
-                    EverviewGpuTileCache.getResident(tile);
-            if (gpuTile == null) {
-                continue;
-            }
-
-            EverviewMetrics.recordSubmission(tile.lodLevel());
-            long started = System.nanoTime();
-
-            GpuBuffer indexBuffer = quadIndices.getBuffer(gpuTile.indexCount());
-
             Matrix4f modelView = RenderSystem.getModelViewMatrixCopy();
             modelView.translate(
                     (float) (tile.minX() - cameraX),
@@ -113,18 +91,12 @@ public final class EverviewRenderer {
                     (float) (tile.minZ() - cameraZ)
             );
 
-            GpuBufferSlice dynamicTransforms = RenderSystem.getDynamicUniforms()
-                    .writeTransform(
-                            modelView,
-                            COLOR_MODULATOR,
-                            MODEL_OFFSET,
-                            TEXTURE_MATRIX
-                    );
+            long started = System.nanoTime();
+            if (!backend.drawTile(renderPass, tile, modelView)) {
+                continue;
+            }
 
-            renderPass.setVertexBuffer(0, gpuTile.vertexBuffer().slice());
-            renderPass.setIndexBuffer(indexBuffer, quadIndices.type());
-            renderPass.setUniform("DynamicTransforms", dynamicTransforms);
-            renderPass.drawIndexed(gpuTile.indexCount(), 1, 0, 0, 0);
+            EverviewMetrics.recordSubmission(tile.lodLevel());
 
             double centerX = (tile.minX() + tile.maxX()) * 0.5;
             double centerZ = (tile.minZ() + tile.maxZ()) * 0.5;
@@ -153,12 +125,8 @@ public final class EverviewRenderer {
         double centerZ = (tile.minZ() + tile.maxZ()) * 0.5;
         double centerDistance = Math.hypot(centerX - cameraX, centerZ - cameraZ);
 
-        // M3.3.1 over-corrected the handoff by requiring the entire
-        // 32-block L1 tile to sit outside the inner radius. That creates an
-        // extra camera-centered dead zone, making the LOD appear to "run away"
-        // as the player moves. Center ownership keeps the boundary stable while
-        // the small 32-block L1 tiles limit inward spill to roughly half a tile.
-        // Vanilla depth still wins where the two representations overlap.
+        // Center ownership is the stable M3.3.2 handoff: 32-block L1 tiles may
+        // overlap slightly under vanilla terrain, with depth deciding the winner.
         return centerDistance >= ring.innerRadiusBlocks()
                 && centerDistance <= ring.outerRadiusBlocks();
     }

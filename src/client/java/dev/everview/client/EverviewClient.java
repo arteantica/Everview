@@ -16,6 +16,11 @@ public final class EverviewClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
+        // Select the rendering backend before any render hooks are registered.
+        // M3.5 deliberately keeps terrain generation independent from the
+        // concrete GPU/shader path so an Iris backend can be added later
+        // without rewriting the LOD mesher or disk cache.
+        EverviewRenderBackends.initialize();
         EverviewRenderer.register();
         EverviewDebugHud.register();
 
