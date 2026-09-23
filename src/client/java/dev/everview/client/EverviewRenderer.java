@@ -101,7 +101,9 @@ public final class EverviewRenderer {
         double cameraZ = cameraPos.z();
         var frustum = camera.getCullFrustum();
 
-        renderPass.setPipeline(RenderSystem.getCompiledPipeline(EverviewGpuPipeline.TERRAIN));
+        renderPass.setPipeline(
+                RenderSystem.getCompiledPipeline(EverviewGpuPipeline.TERRAIN)
+        );
         RenderSystem.bindDefaultUniforms(renderPass);
 
         RenderSystem.AutoStorageIndexBuffer quadIndices =
@@ -115,23 +117,27 @@ public final class EverviewRenderer {
         double vanillaRadius =
                 client.options.getEffectiveRenderDistance() * 16.0D;
 
-        if (l1Ring != null || l2Ring != null) {
-            for (WorldgenSurfaceTile tile : snapshot.tiles()) {
-                if (EverviewGpuTileCache.getResident(tile) == null) {
-                    continue;
-                }
+        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+            if (EverviewGpuTileCache.getResident(tile) == null) {
+                continue;
+            }
 
-                if (tile.lodLevel() == 1) {
-                    residentL1Tiles.add(packTile(tile.tileX(), tile.tileZ()));
-                } else if (tile.lodLevel() == 2) {
-                    residentL2Tiles.add(packTile(tile.tileX(), tile.tileZ()));
-                }
+            if (tile.lodLevel() == 1) {
+                residentL1Tiles.add(packTile(tile.tileX(), tile.tileZ()));
+            } else if (tile.lodLevel() == 2) {
+                residentL2Tiles.add(packTile(tile.tileX(), tile.tileZ()));
             }
         }
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
             WorldgenLodRing ring = snapshot.ringForLevel(tile.lodLevel());
-            if (ring == null || !tileBelongsToRing(tile, ring, cameraX, cameraZ)) {
+            if (ring == null
+                    || !tileBelongsToRing(
+                            tile,
+                            ring,
+                            cameraX,
+                            cameraZ
+                    )) {
                 continue;
             }
 
@@ -156,29 +162,39 @@ public final class EverviewRenderer {
             }
 
             long started = System.nanoTime();
-
-            GpuBuffer indexBuffer = quadIndices.getBuffer(gpuTile.indexCount());
+            GpuBuffer indexBuffer =
+                    quadIndices.getBuffer(gpuTile.indexCount());
 
             Matrix4f modelView = RenderSystem.getModelViewMatrixCopy();
             double verticalBias = BASE_TERRAIN_BIAS
-                    + Math.max(0, tile.lodLevel() - 1) * RING_LAYER_BIAS;
+                    + Math.max(0, tile.lodLevel() - 1)
+                    * RING_LAYER_BIAS;
             modelView.translate(
                     (float) (tile.minX() - cameraX),
                     (float) (-cameraY - verticalBias),
                     (float) (tile.minZ() - cameraZ)
             );
 
-            GpuBufferSlice dynamicTransforms = RenderSystem.getDynamicUniforms()
-                    .writeTransform(
+            GpuBufferSlice dynamicTransforms =
+                    RenderSystem.getDynamicUniforms().writeTransform(
                             modelView,
                             COLOR_MODULATOR,
                             MODEL_OFFSET,
                             TEXTURE_MATRIX
                     );
 
-            renderPass.setVertexBuffer(0, gpuTile.vertexBuffer().slice());
-            renderPass.setIndexBuffer(indexBuffer, quadIndices.type());
-            renderPass.setUniform("DynamicTransforms", dynamicTransforms);
+            renderPass.setVertexBuffer(
+                    0,
+                    gpuTile.vertexBuffer().slice()
+            );
+            renderPass.setIndexBuffer(
+                    indexBuffer,
+                    quadIndices.type()
+            );
+            renderPass.setUniform(
+                    "DynamicTransforms",
+                    dynamicTransforms
+            );
 
             boolean liveHandoff = tile.lodLevel() <= 2
                     && tileIntersectsLiveHandoffBand(
@@ -211,8 +227,6 @@ public final class EverviewRenderer {
             int drawnQuads = 0;
 
             if (!liveHandoff && !finerLodMask) {
-                // Common fast path: nothing finer can own any part of this
-                // tile, so submit the complete resident mesh in one draw.
                 EverviewMetrics.recordSubmission(tile.lodLevel());
                 renderPass.drawIndexed(
                         gpuTile.indexCount(),
@@ -227,8 +241,10 @@ public final class EverviewRenderer {
             } else {
                 int rangeFirstIndex = -1;
                 int rangeIndexCount = 0;
+                boolean rangeTouchesVanillaHandoff = false;
 
-                for (EverviewGpuTileCache.DrawBatch batch : gpuTile.drawBatches()) {
+                for (EverviewGpuTileCache.DrawBatch batch
+                        : gpuTile.drawBatches()) {
                     boolean ownedByFinerLod = false;
 
                     if (tile.lodLevel() == 2 && l1Ring != null) {
@@ -239,7 +255,8 @@ public final class EverviewRenderer {
                                 cameraX,
                                 cameraZ
                         );
-                    } else if (tile.lodLevel() == 3 && l2Ring != null) {
+                    } else if (tile.lodLevel() == 3
+                            && l2Ring != null) {
                         ownedByFinerLod = batch.underlayRegion()
                                 && finerRingOwnsRegion(
                                         batch.regionTileX(),
@@ -268,20 +285,82 @@ public final class EverviewRenderer {
                                     0,
                                     0
                             );
-                            EverviewMetrics.recordDrawCall(ownedByVanilla);
+                            EverviewMetrics.recordDrawCall(
+                                    rangeTouchesVanillaHandoff
+                            );
                             rangeFirstIndex = -1;
                             rangeIndexCount = 0;
+                            rangeTouchesVanillaHandoff = false;
                         }
                         continue;
                     }
 
                     if (!drewAny) {
+                        EverviewMetrics.recordSubmission(
+                                tile.lodLevel()
+                        );
+                        drewAny = true;
+                    }
+
+                    if (rangeIndexCount == 0) {
+                        rangeFirstIndex = batch.firstIndex();
+                        rangeIndexCount = batch.indexCount();
+                        rangeTouchesVanillaHandoff =
+                                liveHandoff
+                                        && batch.vanillaSensitive();
+                    } else if (rangeFirstIndex + rangeIndexCount
+                            == batch.firstIndex()) {
+                        rangeIndexCount += batch.indexCount();
+                        rangeTouchesVanillaHandoff |=
+                                liveHandoff
+                                        && batch.vanillaSensitive();
+                    } else {
+                        renderPass.drawIndexed(
+                                rangeIndexCount,
+                                1,
+                                rangeFirstIndex,
+                                0,
+                                0
+                        );
+                        EverviewMetrics.recordDrawCall(
+                                rangeTouchesVanillaHandoff
+                        );
+                        rangeFirstIndex = batch.firstIndex();
+                        rangeIndexCount = batch.indexCount();
+                        rangeTouchesVanillaHandoff =
+                                liveHandoff
+                                        && batch.vanillaSensitive();
+                    }
+
+                    drawnQuads += batch.indexCount() / 6;
+                }
+
+                if (rangeIndexCount > 0) {
+                    renderPass.drawIndexed(
+                            rangeIndexCount,
+                            1,
+                            rangeFirstIndex,
+                            0,
+                            0
+                    );
+                    EverviewMetrics.recordDrawCall(
+                            rangeTouchesVanillaHandoff
+                    );
+                }
+            }
+
+            if (!drewAny) {
                 continue;
             }
 
-            double centerX = (tile.minX() + tile.maxX()) * 0.5;
-            double centerZ = (tile.minZ() + tile.maxZ()) * 0.5;
-            double distance = Math.hypot(centerX - cameraX, centerZ - cameraZ);
+            double centerX =
+                    (tile.minX() + tile.maxX()) * 0.5;
+            double centerZ =
+                    (tile.minZ() + tile.maxZ()) * 0.5;
+            double distance = Math.hypot(
+                    centerX - cameraX,
+                    centerZ - cameraZ
+            );
 
             EverviewMetrics.recordTileDraw(
                     tile.lodLevel(),
