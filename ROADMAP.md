@@ -117,6 +117,10 @@
 - [x] preserve partial refinement samples when a moving player cancels a detail job
 - [x] allow exact-target L1 tiles to refine directly from 4b to 1b
 - [x] expose L1 sample-reuse telemetry in the debug HUD
+- [x] split exact L1 refinement into geometry-first and appearance-second passes
+- [x] borrow nearest cached material/color while missing 1b heights are generated
+- [x] defer per-block biome/palette sampling until exact geometry is already resident
+- [x] expose exact-appearance tile progress and biome-sample telemetry
 - [x] prioritize current/predictive emergency underlay before L2/L1 detail coverage
 - [ ] benchmark emergency-underlay continuity at x7 FlySpeed and normal elytra speeds
 - [ ] benchmark fallback-safe handoff CPU cost at full 1b residency

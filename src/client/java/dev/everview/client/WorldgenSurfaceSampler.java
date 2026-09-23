@@ -27,10 +27,11 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.10 adds a persistent fine-sample hierarchy for L1 refinement. Worldgen
- * samples gathered by 4b/2b/1b passes are retained on a fixed 1-block grid and
- * reused by later refinement (including cancelled jobs). Exact-target tiles
- * may jump directly from 4b to 1b without an unnecessary intermediate mesh.
+ * M3.11 splits exact L1 into geometry-first and appearance-second passes.
+ * Missing 1-block heights are generated first while temporary material/color is
+ * borrowed from nearby cached samples. Once exact geometry is resident, a
+ * lower-priority appearance pass fills the missing biome/palette samples and
+ * rebuilds the same 1b tile at full fidelity.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -116,8 +117,11 @@ public final class WorldgenSurfaceSampler {
     private static int staleJobsCancelled;
     private static int lastRefineReusedSamples;
     private static int lastRefineGeneratedSamples;
+    private static int lastAppearanceGeneratedSamples;
+    private static int lastProvisionalAppearanceSamples;
     private static long totalRefineReusedSamples;
     private static long totalRefineGeneratedSamples;
+    private static long totalAppearanceGeneratedSamples;
 
     private static long epoch;
     private static long nextSliceId;
@@ -188,12 +192,39 @@ public final class WorldgenSurfaceSampler {
     }
 
     public static RefinementReuseStatus refinementReuseStatus() {
+        int appearanceDesired = 0;
+        int appearanceReady = 0;
+
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.ring().lodLevel() != 1
+                    || wanted.prefetch()
+                    || wanted.targetSpacing() != L1_EXACT_SPACING) {
+                continue;
+            }
+
+            WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+            if (tile == null || tile.sampleSpacing() != L1_EXACT_SPACING) {
+                continue;
+            }
+
+            appearanceDesired++;
+            L1SampleGrid grid = L1_SAMPLE_CACHE.get(wanted.key());
+            if (grid == null || !grid.requiresAppearanceRefinement) {
+                appearanceReady++;
+            }
+        }
+
         return new RefinementReuseStatus(
                 lastRefineReusedSamples,
                 lastRefineGeneratedSamples,
+                lastAppearanceGeneratedSamples,
+                lastProvisionalAppearanceSamples,
                 totalRefineReusedSamples,
                 totalRefineGeneratedSamples,
-                L1_SAMPLE_CACHE.size()
+                totalAppearanceGeneratedSamples,
+                L1_SAMPLE_CACHE.size(),
+                appearanceReady,
+                appearanceDesired
         );
     }
 
@@ -364,12 +395,21 @@ public final class WorldgenSurfaceSampler {
                 int sampleSpacing = nextGenerationSpacing(next, existing);
 
                 L1SampleGrid sampleGrid = null;
+                boolean appearanceOnly = false;
                 if (next.ring().lodLevel() == 1) {
                     sampleGrid = L1_SAMPLE_CACHE.computeIfAbsent(
                             next.key(),
                             ignored -> new L1SampleGrid(next.ring().tileSize())
                     );
                     trimL1SampleCache();
+
+                    appearanceOnly = existing != null
+                            && existing.sampleSpacing() == L1_EXACT_SPACING
+                            && sampleGrid.requiresAppearanceRefinement
+                            && next.targetSpacing() == L1_EXACT_SPACING;
+                    if (appearanceOnly) {
+                        sampleSpacing = L1_EXACT_SPACING;
+                    }
                 }
 
                 currentJob = new GenerationJob(
@@ -377,7 +417,8 @@ public final class WorldgenSurfaceSampler {
                         next.ring(),
                         sampleSpacing,
                         existing != null,
-                        sampleGrid
+                        sampleGrid,
+                        appearanceOnly
                 );
             }
         }
@@ -682,8 +723,11 @@ public final class WorldgenSurfaceSampler {
         staleJobsCancelled = 0;
         lastRefineReusedSamples = 0;
         lastRefineGeneratedSamples = 0;
+        lastAppearanceGeneratedSamples = 0;
+        lastProvisionalAppearanceSamples = 0;
         totalRefineReusedSamples = 0L;
         totalRefineGeneratedSamples = 0L;
+        totalAppearanceGeneratedSamples = 0L;
         lastGenerationMs = 0.0;
         lastSliceMs = 0.0;
         lastSliceSamples = 0;
@@ -727,8 +771,11 @@ public final class WorldgenSurfaceSampler {
             if (completed.tile().lodLevel() == 1) {
                 lastRefineReusedSamples = completed.reusedSamples();
                 lastRefineGeneratedSamples = completed.generatedSamples();
+                lastAppearanceGeneratedSamples = completed.appearanceGeneratedSamples();
+                lastProvisionalAppearanceSamples = completed.provisionalAppearanceSamples();
                 totalRefineReusedSamples += completed.reusedSamples();
                 totalRefineGeneratedSamples += completed.generatedSamples();
+                totalAppearanceGeneratedSamples += completed.appearanceGeneratedSamples();
             }
 
             if (currentJob != null && currentJob.key.equals(completed.key())) {
@@ -1205,7 +1252,12 @@ public final class WorldgenSurfaceSampler {
             return frontQuality;
         }
 
-        return firstRefinement(pending, false);
+        WantedTile remainingRefinement = firstRefinement(pending, false);
+        if (remainingRefinement != null) {
+            return remainingRefinement;
+        }
+
+        return firstExactAppearanceRefinement(pending);
     }
 
     private static boolean isEmergencyUnderlayWanted(
@@ -1494,6 +1546,30 @@ public final class WorldgenSurfaceSampler {
         return null;
     }
 
+    private static WantedTile firstExactAppearanceRefinement(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || wanted.prefetch()
+                    || wanted.ring().lodLevel() != 1
+                    || wanted.targetSpacing() != L1_EXACT_SPACING) {
+                continue;
+            }
+
+            WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+            L1SampleGrid grid = L1_SAMPLE_CACHE.get(wanted.key());
+            if (tile != null
+                    && tile.sampleSpacing() == L1_EXACT_SPACING
+                    && grid != null
+                    && grid.requiresAppearanceRefinement) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
     private static WantedTile firstRefinement(
             LodTileKey pending,
             boolean nearOnly
@@ -1576,66 +1652,115 @@ public final class WorldgenSurfaceSampler {
         int processed = 0;
         long sliceBudgetNanos = adaptiveSliceBudgetNanos;
 
-        while (job.nextSample < job.totalSamples && processed < MAX_SAMPLES_PER_SLICE) {
+        while (job.nextSample < job.totalSamples
+                && processed < MAX_SAMPLES_PER_SLICE) {
             int sampleIndex = job.nextSample;
             int gx = sampleIndex % job.samplesAcross;
             int gz = sampleIndex / job.samplesAcross;
             int worldX = job.originX + gx * job.sampleSpacing;
             int worldZ = job.originZ + gz * job.sampleSpacing;
-
             int fineIndex = job.fineGridIndex(gx, gz);
-            if (fineIndex >= 0 && job.sampleGrid.sampled[fineIndex]) {
-                int y = job.sampleGrid.heights[fineIndex];
+
+            if (job.sampleGrid == null || fineIndex < 0) {
+                int y = generator.getBaseHeight(
+                        worldX,
+                        worldZ,
+                        Heightmap.Types.WORLD_SURFACE_WG,
+                        level,
+                        randomState
+                );
+                y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
+
+                var biome = level.getNoiseBiome(worldX >> 2, y >> 2, worldZ >> 2);
+                var appearance = MinecraftSurfacePalette.sample(
+                        biome,
+                        worldX,
+                        y,
+                        worldZ,
+                        level.getSeaLevel()
+                );
+
                 job.heights[sampleIndex] = y;
-                job.sampleColors[sampleIndex] = job.sampleGrid.colors[fineIndex];
-                job.sampleMaterials[sampleIndex] = job.sampleGrid.materials[fineIndex];
-                job.minY = Math.min(job.minY, y);
-                job.maxY = Math.max(job.maxY, y);
-                job.nextSample = sampleIndex + 1;
-                job.reusedSamples++;
+                job.sampleColors[sampleIndex] = appearance.rgb();
+                job.sampleMaterials[sampleIndex] = appearance.material();
+                job.generatedSamples++;
+                job.appearanceGeneratedSamples++;
+                processed++;
+            } else {
+                L1SampleGrid grid = job.sampleGrid;
+                int fineX = gx * job.sampleSpacing;
+                int fineZ = gz * job.sampleSpacing;
 
-                // Cached points should be nearly free, but still respect the
-                // slice clock if an entire job is already populated.
-                if (System.nanoTime() - sliceStart >= sliceBudgetNanos) {
-                    break;
+                int y;
+                if (grid.heightSampled[fineIndex]) {
+                    y = grid.heights[fineIndex];
+                    job.reusedSamples++;
+                } else {
+                    y = generator.getBaseHeight(
+                            worldX,
+                            worldZ,
+                            Heightmap.Types.WORLD_SURFACE_WG,
+                            level,
+                            randomState
+                    );
+                    y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
+                    grid.heights[fineIndex] = y;
+                    grid.heightSampled[fineIndex] = true;
+                    job.generatedSamples++;
+                    processed++;
                 }
-                continue;
+                job.heights[sampleIndex] = y;
+
+                if (grid.appearanceSampled[fineIndex]) {
+                    job.sampleColors[sampleIndex] = grid.colors[fineIndex];
+                    job.sampleMaterials[sampleIndex] = grid.materials[fineIndex];
+                } else if (job.exactGeometryOnly) {
+                    int borrowed = grid.nearestAppearanceIndex(fineX, fineZ);
+                    if (borrowed >= 0) {
+                        job.sampleColors[sampleIndex] = grid.colors[borrowed];
+                        job.sampleMaterials[sampleIndex] = grid.materials[borrowed];
+                        grid.requiresAppearanceRefinement = true;
+                        job.provisionalAppearanceSamples++;
+                    } else {
+                        var biome = level.getNoiseBiome(worldX >> 2, y >> 2, worldZ >> 2);
+                        var appearance = MinecraftSurfacePalette.sample(
+                                biome,
+                                worldX,
+                                y,
+                                worldZ,
+                                level.getSeaLevel()
+                        );
+                        grid.colors[fineIndex] = appearance.rgb();
+                        grid.materials[fineIndex] = appearance.material();
+                        grid.appearanceSampled[fineIndex] = true;
+                        job.sampleColors[sampleIndex] = appearance.rgb();
+                        job.sampleMaterials[sampleIndex] = appearance.material();
+                        job.appearanceGeneratedSamples++;
+                        processed++;
+                    }
+                } else {
+                    var biome = level.getNoiseBiome(worldX >> 2, y >> 2, worldZ >> 2);
+                    var appearance = MinecraftSurfacePalette.sample(
+                            biome,
+                            worldX,
+                            y,
+                            worldZ,
+                            level.getSeaLevel()
+                    );
+                    grid.colors[fineIndex] = appearance.rgb();
+                    grid.materials[fineIndex] = appearance.material();
+                    grid.appearanceSampled[fineIndex] = true;
+                    job.sampleColors[sampleIndex] = appearance.rgb();
+                    job.sampleMaterials[sampleIndex] = appearance.material();
+                    job.appearanceGeneratedSamples++;
+                    processed++;
+                }
             }
 
-            int y = generator.getBaseHeight(
-                    worldX,
-                    worldZ,
-                    Heightmap.Types.WORLD_SURFACE_WG,
-                    level,
-                    randomState
-            );
-
-            y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
-            job.heights[sampleIndex] = y;
-
-            var biome = level.getNoiseBiome(worldX >> 2, y >> 2, worldZ >> 2);
-            var appearance = MinecraftSurfacePalette.sample(
-                    biome,
-                    worldX,
-                    y,
-                    worldZ,
-                    level.getSeaLevel()
-            );
-            job.sampleColors[sampleIndex] = appearance.rgb();
-            job.sampleMaterials[sampleIndex] = appearance.material();
-
-            if (fineIndex >= 0) {
-                job.sampleGrid.heights[fineIndex] = y;
-                job.sampleGrid.colors[fineIndex] = appearance.rgb();
-                job.sampleGrid.materials[fineIndex] = appearance.material();
-                job.sampleGrid.sampled[fineIndex] = true;
-            }
-
+            int y = job.heights[sampleIndex];
             job.minY = Math.min(job.minY, y);
             job.maxY = Math.max(job.maxY, y);
             job.nextSample = sampleIndex + 1;
-            job.generatedSamples++;
-            processed++;
 
             if (System.nanoTime() - sliceStart >= sliceBudgetNanos) {
                 break;
@@ -1647,6 +1772,10 @@ public final class WorldgenSurfaceSampler {
         long sliceElapsed = samplingElapsed;
 
         if (job.nextSample >= job.totalSamples && taskEpoch == epoch) {
+            if (job.appearanceOnly && job.sampleGrid != null) {
+                job.sampleGrid.requiresAppearanceRefinement = false;
+            }
+
             long meshStart = System.nanoTime();
             MeshData mesh = buildMesh(job, level.getSeaLevel());
             long meshElapsed = System.nanoTime() - meshStart;
@@ -1675,7 +1804,9 @@ public final class WorldgenSurfaceSampler {
                     job.key,
                     tile,
                     job.reusedSamples,
-                    job.generatedSamples
+                    job.generatedSamples,
+                    job.appearanceGeneratedSamples,
+                    job.provisionalAppearanceSamples
             ));
         }
 
@@ -2695,10 +2826,14 @@ public final class WorldgenSurfaceSampler {
         private final byte[] sampleMaterials;
         private final boolean refinement;
         private final L1SampleGrid sampleGrid;
+        private final boolean appearanceOnly;
+        private final boolean exactGeometryOnly;
 
         private volatile int nextSample;
         private int reusedSamples;
         private int generatedSamples;
+        private int appearanceGeneratedSamples;
+        private int provisionalAppearanceSamples;
         private volatile boolean failed;
         private int minY = Integer.MAX_VALUE;
         private int maxY = Integer.MIN_VALUE;
@@ -2709,7 +2844,8 @@ public final class WorldgenSurfaceSampler {
                 WorldgenLodRing ring,
                 int sampleSpacing,
                 boolean refinement,
-                L1SampleGrid sampleGrid
+                L1SampleGrid sampleGrid,
+                boolean appearanceOnly
         ) {
             if (sampleSpacing <= 0 || ring.tileSize() % sampleSpacing != 0) {
                 throw new IllegalArgumentException(
@@ -2724,6 +2860,10 @@ public final class WorldgenSurfaceSampler {
             this.sampleSpacing = sampleSpacing;
             this.refinement = refinement;
             this.sampleGrid = sampleGrid;
+            this.appearanceOnly = appearanceOnly;
+            this.exactGeometryOnly = ring.lodLevel() == 1
+                    && sampleSpacing == L1_EXACT_SPACING
+                    && !appearanceOnly;
             this.samplesAcross = ring.tileSize() / sampleSpacing + 1;
             this.cellsAcross = samplesAcross - 1;
             this.totalSamples = samplesAcross * samplesAcross;
@@ -2760,7 +2900,9 @@ public final class WorldgenSurfaceSampler {
         private final int[] heights;
         private final int[] colors;
         private final byte[] materials;
-        private final boolean[] sampled;
+        private final boolean[] heightSampled;
+        private final boolean[] appearanceSampled;
+        private boolean requiresAppearanceRefinement;
 
         private L1SampleGrid(int tileSize) {
             if (tileSize + 1 != L1_FINE_GRID_SAMPLES) {
@@ -2774,7 +2916,45 @@ public final class WorldgenSurfaceSampler {
             this.heights = new int[total];
             this.colors = new int[total];
             this.materials = new byte[total];
-            this.sampled = new boolean[total];
+            this.heightSampled = new boolean[total];
+            this.appearanceSampled = new boolean[total];
+        }
+
+        private int nearestAppearanceIndex(int x, int z) {
+            int clampedX = Math.max(0, Math.min(samplesAcross - 1, x));
+            int clampedZ = Math.max(0, Math.min(samplesAcross - 1, z));
+            int direct = clampedZ * samplesAcross + clampedX;
+            if (appearanceSampled[direct]) {
+                return direct;
+            }
+
+            for (int radius = 1; radius <= L1_BOOTSTRAP_SPACING; radius++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    int remaining = radius - Math.abs(dz);
+                    int testZ = clampedZ + dz;
+                    if (testZ < 0 || testZ >= samplesAcross) {
+                        continue;
+                    }
+
+                    int leftX = clampedX - remaining;
+                    if (leftX >= 0) {
+                        int index = testZ * samplesAcross + leftX;
+                        if (appearanceSampled[index]) {
+                            return index;
+                        }
+                    }
+
+                    int rightX = clampedX + remaining;
+                    if (rightX != leftX && rightX < samplesAcross) {
+                        int index = testZ * samplesAcross + rightX;
+                        if (appearanceSampled[index]) {
+                            return index;
+                        }
+                    }
+                }
+            }
+
+            return -1;
         }
     }
 
@@ -2873,9 +3053,14 @@ public final class WorldgenSurfaceSampler {
     public record RefinementReuseStatus(
             int lastReusedSamples,
             int lastGeneratedSamples,
+            int lastAppearanceGeneratedSamples,
+            int lastProvisionalAppearanceSamples,
             long totalReusedSamples,
             long totalGeneratedSamples,
-            int cachedL1Grids
+            long totalAppearanceGeneratedSamples,
+            int cachedL1Grids,
+            int appearanceReadyTiles,
+            int appearanceDesiredTiles
     ) {
     }
 
@@ -2915,7 +3100,9 @@ public final class WorldgenSurfaceSampler {
             LodTileKey key,
             WorldgenSurfaceTile tile,
             int reusedSamples,
-            int generatedSamples
+            int generatedSamples,
+            int appearanceGeneratedSamples,
+            int provisionalAppearanceSamples
     ) {
     }
 }

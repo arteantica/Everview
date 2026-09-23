@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.10 | PERSISTENT SAMPLE HIERARCHY");
+        lines.add("Everview M3.11 | GEOMETRY-FIRST EXACT L1");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Render: merged handoff ranges | uploads yield only after same-column vanilla is visible");
-        lines.add("Refine: persistent L1 samples | exact targets can jump 4b -> 1b");
+        lines.add("Refine: exact 1b heights first -> full biome/material appearance second");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
@@ -225,12 +225,19 @@ public final class EverviewDebugHud {
                     ? reuse.lastReusedSamples() * 100.0 / lastTotalSamples
                     : 0.0;
             lines.add(String.format(
-                    "L1 samples: last reuse %d/%d (%.0f%%) | grids %d | session saved %d",
+                    "L1 samples: height reuse %d/%d (%.0f%%) | new appearance %d | borrowed %d | grids %d",
                     reuse.lastReusedSamples(),
                     lastTotalSamples,
                     reusePercent,
-                    reuse.cachedL1Grids(),
-                    reuse.totalReusedSamples()
+                    reuse.lastAppearanceGeneratedSamples(),
+                    reuse.lastProvisionalAppearanceSamples(),
+                    reuse.cachedL1Grids()
+            ));
+            lines.add(String.format(
+                    "L1 appearance: %d/%d exact tiles | session biome samples %d",
+                    reuse.appearanceReadyTiles(),
+                    reuse.appearanceDesiredTiles(),
+                    reuse.totalAppearanceGeneratedSamples()
             ));
         } else {
             lines.add("Far WORLDGEN: unavailable (singleplayer test path)");
