@@ -20,9 +20,10 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * M3.7.4.3 persistent-GPU distant terrain renderer. Near LOD geometry stays
- * permanently resident; renderer-visible vanilla sections suppress small GPU
- * draw batches live instead of triggering destructive tile re-uploads.
+ * M3.7.4.5 persistent-GPU distant terrain renderer. Near LOD geometry stays
+ * permanently resident; horizontal surface batches use renderer-visible
+ * chunk-column ownership with +/-1 section tolerance while section-split walls
+ * retain strict ownership.
  *
  * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
  * Minecraft's opaque terrain RenderPass is still open. Everview therefore
@@ -219,6 +220,16 @@ public final class EverviewRenderer {
             EverviewGpuTileCache.DrawBatch batch,
             Map<SectionKey, Boolean> visibility
     ) {
+        if (batch.surface()) {
+            return vanillaSurfaceColumnVisible(
+                    client,
+                    batch.chunkAX(),
+                    batch.sectionY(),
+                    batch.chunkAZ(),
+                    visibility
+            );
+        }
+
         boolean aVisible = vanillaSectionVisible(
                 client,
                 batch.chunkAX(),
@@ -243,6 +254,33 @@ public final class EverviewRenderer {
         // adjacent vanilla side is renderer-ready, the wall is no longer
         // needed as a safety face and is suppressed.
         return aVisible || bVisible;
+    }
+
+    private static boolean vanillaSurfaceColumnVisible(
+            Minecraft client,
+            int chunkX,
+            int sectionY,
+            int chunkZ,
+            Map<SectionKey, Boolean> visibility
+    ) {
+        // LOD/worldgen surface height and the vanilla rendered surface can land
+        // on opposite sides of a 16-block section boundary. Treat the same
+        // chunk column as vanilla-owned when terrain is renderer-visible in
+        // the target section or one section above/below. This removes bright
+        // LOD top patches without using a broad distance/loaded-chunk guess.
+        for (int offset = -1; offset <= 1; offset++) {
+            if (vanillaSectionVisible(
+                    client,
+                    chunkX,
+                    sectionY + offset,
+                    chunkZ,
+                    visibility
+            )) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static boolean vanillaSectionVisible(

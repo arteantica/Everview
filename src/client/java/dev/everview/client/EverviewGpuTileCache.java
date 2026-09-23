@@ -21,10 +21,9 @@ import java.util.Map;
  * Render-thread-owned persistent GPU storage for generated LOD tiles.
  *
  * Tile geometry is uploaded once as POSITION_COLOR data in tile-local X/Z.
- * M3.7.4.4 splits tall L1/L2 vertical faces at 16-block section boundaries,
- * then groups the resulting pieces into chunk/section-sized draw batches.
- * Vanilla ownership stays live at draw time, so no visibility change ever
- * destructively edits or rebuilds an LOD tile.
+ * M3.7.4.5 keeps section-split walls and marks horizontal surface batches
+ * separately so the renderer can use a small vertical ownership tolerance for
+ * top faces without weakening wall/seam ownership.
  */
 public final class EverviewGpuTileCache {
     private static final int MAX_GPU_TILES = 3_072;
@@ -214,6 +213,7 @@ public final class EverviewGpuTileCache {
                         firstIndex,
                         indexCount,
                         key.vanillaSensitive(),
+                        key.surface(),
                         key.chunkAX(),
                         key.chunkAZ(),
                         key.sectionY(),
@@ -357,7 +357,7 @@ public final class EverviewGpuTileCache {
             int chunkZ = Math.floorDiv(sampleZ, 16);
             int sectionY = Math.floorDiv(minY - 1, 16);
 
-            return BatchKey.single(chunkX, chunkZ, sectionY);
+            return BatchKey.surface(chunkX, chunkZ, sectionY);
         }
 
         // Vertical X wall. If it lies exactly on a vanilla chunk boundary,
@@ -380,7 +380,7 @@ public final class EverviewGpuTileCache {
                 );
             }
 
-            return BatchKey.single(
+            return BatchKey.wall(
                     Math.floorDiv(minX, 16),
                     chunkZ,
                     sectionY
@@ -404,7 +404,7 @@ public final class EverviewGpuTileCache {
                 );
             }
 
-            return BatchKey.single(
+            return BatchKey.wall(
                     chunkX,
                     Math.floorDiv(minZ, 16),
                     sectionY
@@ -417,6 +417,7 @@ public final class EverviewGpuTileCache {
 
     private record BatchKey(
             boolean vanillaSensitive,
+            boolean surface,
             int chunkAX,
             int chunkAZ,
             int sectionY,
@@ -425,15 +426,33 @@ public final class EverviewGpuTileCache {
             int chunkBZ
     ) {
         private static final BatchKey ALWAYS =
-                new BatchKey(false, 0, 0, 0, false, 0, 0);
+                new BatchKey(false, false, 0, 0, 0, false, 0, 0);
 
-        private static BatchKey single(
+        private static BatchKey surface(
                 int chunkX,
                 int chunkZ,
                 int sectionY
         ) {
             return new BatchKey(
                     true,
+                    true,
+                    chunkX,
+                    chunkZ,
+                    sectionY,
+                    false,
+                    0,
+                    0
+            );
+        }
+
+        private static BatchKey wall(
+                int chunkX,
+                int chunkZ,
+                int sectionY
+        ) {
+            return new BatchKey(
+                    true,
+                    false,
                     chunkX,
                     chunkZ,
                     sectionY,
@@ -452,6 +471,7 @@ public final class EverviewGpuTileCache {
         ) {
             return new BatchKey(
                     true,
+                    false,
                     chunkAX,
                     chunkAZ,
                     sectionY,
@@ -477,6 +497,7 @@ public final class EverviewGpuTileCache {
             int firstIndex,
             int indexCount,
             boolean vanillaSensitive,
+            boolean surface,
             int chunkAX,
             int chunkAZ,
             int sectionY,

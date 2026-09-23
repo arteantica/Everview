@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.7.4.4 | SECTION-SPLIT WALLS");
+        lines.add("Everview M3.7.4.5 | SURFACE-COLUMN OWNERSHIP");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Handoff: persistent L1/L2 batches + vertical walls split every 16 Y blocks");
-        lines.add("LOD bands: inner64 -> 1b | next64 -> 2b | live fallback / no stale holes");
+        lines.add("Handoff: top faces use chunk-column visibility +/-1 Y section | walls stay split");
+        lines.add("LOD bands: inner64 -> 1b | next64 -> 2b | persistent live fallback");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
