@@ -80,6 +80,7 @@
 - [x] distance-tiered L1 targets: inner 64b at 1-block, next 64b at 2-block, outer L1 at 4-block
 - [x] coverage-first scheduler: visible coarse field + near guard before any detail refinement
 - [ ] benchmark coverage-first distance-tiered L1 generation / VRAM / roaming cost
+- [x] isolate M3.6.3 scheduler with fresh v15 disk cache benchmark
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] view-direction / screen-space generation priority
 - [ ] texture-atlas / UV material rendering

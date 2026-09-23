@@ -37,7 +37,7 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.6.3 | COVERAGE-FIRST L1");
+        lines.add("Everview M3.6.3.1 | CLEAN CACHE BENCH");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Scheduler: visible coverage -> L1/L2 guard -> 2b -> 1b | distance-tiered L1");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
