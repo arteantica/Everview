@@ -189,3 +189,7 @@
 - [x] outer vanilla fringe: renderer-visible test retains no-hole fallback
 - [x] expose vanilla/finer/visible ownership batch counts in HUD
 - [ ] stress-test land, ocean, coast, x7 flight, and rapid direction reversal
+
+- [x] convert detached exact generation from two workers on one tile to two independent tile jobs
+- [x] cancel detached exact work immediately when high-speed coverage mode takes priority
+- [x] keep sample-cache entries pinned while either exact worker owns them

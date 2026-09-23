@@ -247,8 +247,9 @@ public final class EverviewDebugHud {
                     12,
                     reuse.totalAppearanceGeneratedSamples()
             ));
-            lines.add("Exact heights: 2 workers | async "
-                    + (reuse.asyncExactActive() ? "ACTIVE" : "idle")
+            lines.add("Exact heights: "
+                    + reuse.exactJobsActive()
+                    + "/2 tile workers"
                     + (reuse.serverExactFallback()
                             ? " | SERVER FALLBACK"
                             : ""));
