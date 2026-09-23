@@ -70,6 +70,8 @@
 - [x] adaptive initial-stream generation budget up to 12 ms
 - [x] near-first exact refinement after 70% L1/L2 bootstrap coverage
 - [x] weighted 2:1 near-refine / remaining-coverage scheduler
+- [x] conservative AABB overlap pass across LOD-ring seams
+- [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] view-direction / screen-space generation priority
 - [ ] texture-atlas / UV material rendering
 - [ ] structures

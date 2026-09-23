@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.5.1 | NEAR-FIRST REFINE");
+        lines.add("Everview M3.5.2 | SEAM OVERLAP");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Render: 2x bootstrap | near refine 2:1 after 70% L1/L2 | L1 2b");
+        lines.add("Render: near refine 2:1 | AABB ring overlap | layered depth | L1 2b");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",

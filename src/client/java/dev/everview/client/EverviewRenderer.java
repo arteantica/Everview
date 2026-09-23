@@ -25,6 +25,12 @@ public final class EverviewRenderer {
     private static final Vector3f MODEL_OFFSET = new Vector3f();
     private static final Matrix4f TEXTURE_MATRIX = new Matrix4f();
 
+    // Keep finer rings slightly above coarser overlapping rings. The offset is
+    // intentionally sub-block so it closes transition cracks without making
+    // distant terrain visibly sink at ring boundaries.
+    private static final double BASE_TERRAIN_BIAS = 0.22D;
+    private static final double RING_LAYER_BIAS = 0.06D;
+
     private EverviewRenderer() {
     }
 
@@ -107,9 +113,11 @@ public final class EverviewRenderer {
             GpuBuffer indexBuffer = quadIndices.getBuffer(gpuTile.indexCount());
 
             Matrix4f modelView = RenderSystem.getModelViewMatrixCopy();
+            double verticalBias = BASE_TERRAIN_BIAS
+                    + Math.max(0, tile.lodLevel() - 1) * RING_LAYER_BIAS;
             modelView.translate(
                     (float) (tile.minX() - cameraX),
-                    (float) (-cameraY - 0.22D),
+                    (float) (-cameraY - verticalBias),
                     (float) (tile.minZ() - cameraZ)
             );
 
@@ -140,8 +148,12 @@ public final class EverviewRenderer {
     }
 
     /**
-     * Persistent buffers are whole-tile draws, so ring ownership is decided at
-     * tile granularity instead of scanning every quad every frame.
+     * M3.5.2 keeps center ownership only at the vanilla -> L1 inner boundary,
+     * where it already proved stable in M3.3.2. Every LOD-to-LOD boundary uses
+     * tile/annulus intersection instead. The sampler already generates those
+     * intersecting boundary tiles; rendering them removes the empty wedges that
+     * center-only ownership can leave when neighboring rings use different tile
+     * sizes.
      */
     private static boolean tileBelongsToRing(
             WorldgenSurfaceTile tile,
@@ -149,17 +161,44 @@ public final class EverviewRenderer {
             double cameraX,
             double cameraZ
     ) {
-        double centerX = (tile.minX() + tile.maxX()) * 0.5;
-        double centerZ = (tile.minZ() + tile.maxZ()) * 0.5;
-        double centerDistance = Math.hypot(centerX - cameraX, centerZ - cameraZ);
+        double minX = tile.minX();
+        double minZ = tile.minZ();
+        double maxX = tile.maxX();
+        double maxZ = tile.maxZ();
 
-        // M3.3.1 over-corrected the handoff by requiring the entire
-        // 32-block L1 tile to sit outside the inner radius. That creates an
-        // extra camera-centered dead zone, making the LOD appear to "run away"
-        // as the player moves. Center ownership keeps the boundary stable while
-        // the small 32-block L1 tiles limit inward spill to roughly half a tile.
-        // Vanilla depth still wins where the two representations overlap.
-        return centerDistance >= ring.innerRadiusBlocks()
-                && centerDistance <= ring.outerRadiusBlocks();
+        double nearestX = Math.max(minX, Math.min(cameraX, maxX));
+        double nearestZ = Math.max(minZ, Math.min(cameraZ, maxZ));
+        double nearestDistance = Math.hypot(
+                nearestX - cameraX,
+                nearestZ - cameraZ
+        );
+
+        double farthestDx = Math.max(
+                Math.abs(minX - cameraX),
+                Math.abs(maxX - cameraX)
+        );
+        double farthestDz = Math.max(
+                Math.abs(minZ - cameraZ),
+                Math.abs(maxZ - cameraZ)
+        );
+        double farthestDistance = Math.hypot(farthestDx, farthestDz);
+
+        if (ring.lodLevel() == 1) {
+            double centerX = (minX + maxX) * 0.5;
+            double centerZ = (minZ + maxZ) * 0.5;
+            double centerDistance = Math.hypot(
+                    centerX - cameraX,
+                    centerZ - cameraZ
+            );
+
+            // Preserve the stable M3.3.2 vanilla handoff: L1 does not move
+            // farther inward than center ownership allows. Its outer edge may
+            // overlap L2, however, so there is always terrain under that seam.
+            return centerDistance >= ring.innerRadiusBlocks()
+                    && nearestDistance <= ring.outerRadiusBlocks();
+        }
+
+        return nearestDistance <= ring.outerRadiusBlocks()
+                && farthestDistance >= ring.innerRadiusBlocks();
     }
 }
