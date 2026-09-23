@@ -68,6 +68,8 @@
 - [x] validate 2-block ultra-near L1 after persistent-GPU benchmark
 - [x] progressive 2x-spacing bootstrap tiles before exact refinement
 - [x] adaptive initial-stream generation budget up to 12 ms
+- [x] near-first exact refinement after 70% L1/L2 bootstrap coverage
+- [x] weighted 2:1 near-refine / remaining-coverage scheduler
 - [ ] view-direction / screen-space generation priority
 - [ ] texture-atlas / UV material rendering
 - [ ] structures

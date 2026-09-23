@@ -27,10 +27,11 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.5 adds progressive terrain streaming. Every tile first appears from a
- * cheap 2x-spacing bootstrap pass, then refines to its exact target spacing.
- * The adaptive server-thread budget can rise to 12 ms when tick/frame headroom
- * is large and backs off automatically under load.
+ * M3.5.1 adds near-first refinement on top of progressive terrain streaming.
+ * Bootstrap coverage still advances across every ring, but once L1/L2 reach
+ * 70% coverage the scheduler mixes two near exact-detail tiles for every one
+ * remaining coverage tile. This lets the area around vanilla sharpen before
+ * the entire 16K field has finished bootstrapping.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -43,6 +44,9 @@ public final class WorldgenSurfaceSampler {
     public static final int MAX_SAMPLES_PER_SLICE = 128;
 
     private static final int CACHE_LIMIT = 2_304;
+    private static final int NEAR_RING_MAX_LEVEL = 2;
+    private static final double NEAR_REFINE_TRIGGER = 0.70;
+    private static final int NEAR_REFINE_BURST = 2;
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
@@ -84,6 +88,7 @@ public final class WorldgenSurfaceSampler {
     private static int generatedTileCount;
     private static long initialFillStartedNanos;
     private static long initialFillCompletedNanos;
+    private static int nearRefineScheduleStep;
 
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
@@ -389,6 +394,7 @@ public final class WorldgenSurfaceSampler {
         generatedTileCount = 0;
         initialFillStartedNanos = 0L;
         initialFillCompletedNanos = 0L;
+        nearRefineScheduleStep = 0;
         adaptiveSliceBudgetNanos = BASE_SLICE_BUDGET_NANOS;
         serverTickMs = 0.0;
         clientFrameMs = 0.0;
@@ -554,9 +560,38 @@ public final class WorldgenSurfaceSampler {
 
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
+        WantedTile coverage = firstMissingCoverage(pending);
 
-        // Pass 1: coverage. Missing tiles are generated at 2x target spacing
-        // so the entire LOD field becomes visible quickly.
+        if (coverage == null) {
+            // Coverage is complete. Finish near detail before progressively
+            // refining the remaining outer rings.
+            WantedTile nearRefine = firstRefinement(pending, true);
+            return nearRefine != null
+                    ? nearRefine
+                    : firstRefinement(pending, false);
+        }
+
+        if (nearCoverageRatio() < NEAR_REFINE_TRIGGER) {
+            return coverage;
+        }
+
+        WantedTile nearRefine = firstRefinement(pending, true);
+        if (nearRefine != null) {
+            // Two exact L1/L2 replacements, then one bootstrap coverage tile.
+            // This keeps the horizon growing while making nearby terrain visibly
+            // sharpen long before total 16K coverage reaches 100%.
+            if (nearRefineScheduleStep < NEAR_REFINE_BURST) {
+                nearRefineScheduleStep++;
+                return nearRefine;
+            }
+
+            nearRefineScheduleStep = 0;
+        }
+
+        return coverage;
+    }
+
+    private static WantedTile firstMissingCoverage(LodTileKey pending) {
         for (WantedTile wanted : wantedTiles) {
             if (wanted.key().equals(pending)) {
                 continue;
@@ -566,10 +601,18 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
-        // Pass 2: exact refinement. Replace bootstrap tiles with the ring's
-        // target spacing in the same nearest-first/interleaved order.
+        return null;
+    }
+
+    private static WantedTile firstRefinement(
+            LodTileKey pending,
+            boolean nearOnly
+    ) {
         for (WantedTile wanted : wantedTiles) {
             if (wanted.key().equals(pending)) {
+                continue;
+            }
+            if (nearOnly && wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
                 continue;
             }
 
@@ -581,6 +624,24 @@ public final class WorldgenSurfaceSampler {
         }
 
         return null;
+    }
+
+    private static double nearCoverageRatio() {
+        int desired = 0;
+        int covered = 0;
+
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
+                continue;
+            }
+
+            desired++;
+            if (CACHE.containsKey(wanted.key())) {
+                covered++;
+            }
+        }
+
+        return desired == 0 ? 0.0 : covered / (double) desired;
     }
 
     private static void scheduleSlice(

@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.5 | PROGRESSIVE STREAMING");
+        lines.add("Everview M3.5.1 | NEAR-FIRST REFINE");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Render: persistent GPU | 2x bootstrap -> exact refine | L1 2b / 32t");
+        lines.add("Render: 2x bootstrap | near refine 2:1 after 70% L1/L2 | L1 2b");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
@@ -70,16 +70,36 @@ public final class EverviewDebugHud {
             }
 
             int refinedTiles = 0;
+            int nearDesired = 0;
+            int nearCovered = 0;
+            int nearRefined = 0;
+
+            for (WorldgenRingStatus status : far.rings()) {
+                if (status.ring().lodLevel() <= 2) {
+                    nearDesired += status.desiredTileCount();
+                    nearCovered += status.readyTileCount();
+                }
+            }
+
             for (WorldgenSurfaceTile tile : far.tiles()) {
                 WorldgenLodRing targetRing = far.ringForLevel(tile.lodLevel());
                 if (targetRing != null
                         && tile.sampleSpacing() <= targetRing.sampleSpacing()) {
                     refinedTiles++;
+                    if (tile.lodLevel() <= 2) {
+                        nearRefined++;
+                    }
                 }
             }
 
             double refinePercent = far.desiredTileCount() > 0
                     ? refinedTiles * 100.0 / far.desiredTileCount()
+                    : 0.0;
+            double nearCoveragePercent = nearDesired > 0
+                    ? nearCovered * 100.0 / nearDesired
+                    : 0.0;
+            double nearRefinePercent = nearDesired > 0
+                    ? nearRefined * 100.0 / nearDesired
                     : 0.0;
 
             lines.add(String.format(
@@ -91,6 +111,16 @@ public final class EverviewDebugHud {
                     far.desiredTileCount(),
                     refinePercent,
                     far.taskInFlight() ? "ON" : "OFF"
+            ));
+
+            lines.add(String.format(
+                    "Near L1/L2: cover %d/%d (%.0f%%) | refine %d/%d (%.0f%%)",
+                    nearCovered,
+                    nearDesired,
+                    nearCoveragePercent,
+                    nearRefined,
+                    nearDesired,
+                    nearRefinePercent
             ));
 
             double tilesPerSecond = far.initialFillSeconds() > 0.0
