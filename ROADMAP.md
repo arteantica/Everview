@@ -84,6 +84,7 @@
 - [x] camera-facing L1 generation priority with rear-half L2 fallback
 - [x] rebuild L1 priority on 22.5-degree view sectors
 - [x] interleave deferred coverage and front L1 refinement at 3:1
+- [x] lighten deferred-coverage weighting to 8:1 for faster full-field completion
 - [x] defer exact L2 refinement until coverage/front L1 quality are complete
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] screen-space error driven detail selection

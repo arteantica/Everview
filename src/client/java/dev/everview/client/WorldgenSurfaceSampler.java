@@ -27,11 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.6.5 keeps view-priority but removes the long post-front stall. After the
- * 360-degree L2 safety net, front L1 coverage, and front guard are ready, the
- * scheduler mixes three remaining coverage tiles for every one front L1
- * refinement tile. Exact L2 refinement is deferred until coverage/front detail
- * work is done.
+ * M3.6.6 keeps the balanced view-priority scheduler but makes refinement much
+ * lighter during the remaining coverage phase. After the L2 safety net, front
+ * L1 coverage, and front guard are ready, eight remaining coverage tiles earn
+ * one front L1 refinement tile. Exact L2 refinement stays deferred.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -45,7 +44,7 @@ public final class WorldgenSurfaceSampler {
 
     private static final int CACHE_LIMIT = 3_072;
     private static final int NEAR_RING_MAX_LEVEL = 2;
-    private static final int REMAINING_COVERAGE_BURST = 3;
+    private static final int REMAINING_COVERAGE_BURST = 8;
     private static final int L1_PREFETCH_BLOCKS = 64;
     private static final int L2_PREFETCH_BLOCKS = 128;
     private static final int L1_BOOTSTRAP_SPACING = 4;
@@ -760,8 +759,8 @@ public final class WorldgenSurfaceSampler {
             frontQuality = firstExactL1Refinement(pending);
         }
 
-        // M3.6.5: keep total coverage visibly moving instead of appearing
-        // frozen at ~79%. Three remaining coverage selections earn one front
+        // M3.6.6: keep front quality progressing without materially delaying
+        // total coverage. Eight remaining coverage selections earn one front
         // refinement selection while both queues contain work.
         if (remainingCoverage != null && frontQuality != null) {
             if (balancedCoverageStep < REMAINING_COVERAGE_BURST) {
