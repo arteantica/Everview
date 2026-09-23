@@ -7,7 +7,6 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
@@ -28,23 +27,6 @@ public abstract class RenderSectionMixin {
         EverviewRenderer.noteRecentlyCompiledSection(
                 this.getRenderOrigin()
         );
-    }
-
-    /**
-     * Catch every vanilla caller, not only LevelRenderer.compileSections.
-     * Sodium also binds its fade UI to the vanilla option, which Everview
-     * forces to zero from the client tick.
-     */
-    @ModifyVariable(
-            method = "setFadeDuration",
-            at = @At("HEAD"),
-            argsOnly = true,
-            ordinal = 0
-    )
-    private long everview$forceImmediateSectionPresentation(
-            long fadeDuration
-    ) {
-        return 0L;
     }
 
 }
