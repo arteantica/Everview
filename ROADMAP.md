@@ -106,6 +106,10 @@
 - [x] expose real draw-call / handoff-batch telemetry
 - [x] coalesce adjacent visible handoff batches into contiguous indexed draw ranges
 - [x] gate upload-time top-face ownership on renderer-visible terrain in the same chunk column
+- [x] replace interleaved ring coverage with a nearest-to-farthest outward frontier
+- [x] make visible L1/L2 holes absolute priority over prediction, far rings, and refinement
+- [x] expose outward-frontier distance and near-field continuity telemetry
+- [ ] benchmark outward-frontier streaming at x7 FlySpeed and normal elytra speeds
 - [ ] benchmark fallback-safe handoff CPU cost at full 1b residency
 - [ ] benchmark velocity prefetch at elytra and FlySpeed travel rates
 - [ ] block-faithful 2-block intermediate geometry

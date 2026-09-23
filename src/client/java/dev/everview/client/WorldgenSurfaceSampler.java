@@ -27,10 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.8 adds velocity-aware near streaming. L1/L2 keep their normal camera
- * guards, while a second predictive guard is placed ahead of sustained motion.
- * At high speed the scheduler becomes coverage-only and abandons stale detail
- * refinement so coarse safety terrain reaches the travel direction first.
+ * M3.9 makes coverage a true outward frontier. Missing L1/L2 terrain nearest
+ * the vanilla edge is always filled before farther visible rings; movement only
+ * biases the direction inside that frontier. Predictive/guard coverage follows,
+ * and quality refinement cannot jump ahead of a nearer visible hole.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -60,6 +60,7 @@ public final class WorldgenSurfaceSampler {
     private static final int L1_INTERMEDIATE_BAND_BLOCKS = 128;
     private static final int VIEW_SECTOR_COUNT = 16;
     private static final double VIEW_SECTOR_DEGREES = 360.0 / VIEW_SECTOR_COUNT;
+    private static final int COVERAGE_FRONTIER_BUCKET_BLOCKS = 64;
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
@@ -130,15 +131,26 @@ public final class WorldgenSurfaceSampler {
     public static StreamingStatus streamingStatus() {
         int predictiveDesired = 0;
         int predictiveCovered = 0;
+        int outwardFrontierBlocks = -1;
+        boolean nearCoverageComplete = true;
 
         for (WantedTile wanted : wantedTiles) {
-            if (!wanted.predictive()) {
-                continue;
+            boolean covered = CACHE.containsKey(wanted.key());
+
+            if (wanted.predictive()) {
+                predictiveDesired++;
+                if (covered) {
+                    predictiveCovered++;
+                }
             }
 
-            predictiveDesired++;
-            if (CACHE.containsKey(wanted.key())) {
-                predictiveCovered++;
+            if (!wanted.prefetch() && !covered) {
+                if (outwardFrontierBlocks < 0) {
+                    outwardFrontierBlocks = wanted.frontierDistanceBlocks();
+                }
+                if (wanted.ring().lodLevel() <= NEAR_RING_MAX_LEVEL) {
+                    nearCoverageComplete = false;
+                }
             }
         }
 
@@ -148,6 +160,8 @@ public final class WorldgenSurfaceSampler {
                 highSpeedCoverageMode,
                 predictiveDesired,
                 predictiveCovered,
+                outwardFrontierBlocks,
+                nearCoverageComplete,
                 staleJobsCancelled
         );
     }
@@ -669,9 +683,12 @@ public final class WorldgenSurfaceSampler {
     }
 
     /**
-     * Build a nearest-first list inside each ring, then interleave the three
-     * lists. This makes coarse horizon coverage appear early instead of forcing
-     * the entire 1K ring to finish before 2K/4K generation starts.
+     * Build one global outward coverage order instead of interleaving rings.
+     * Visible terrain is ordered by radial frontier from the player, in 64-block
+     * buckets. Within a frontier bucket, coarse L2 safety terrain wins before L1
+     * bootstrap and forward-facing tiles win before rear tiles. Predictive and
+     * guard entries stay marked as prefetch so the scheduler can place them
+     * between near coverage and distant horizon work.
      */
     private static List<WantedTile> buildWantedTiles(
             int centerX,
@@ -683,10 +700,10 @@ public final class WorldgenSurfaceSampler {
             double forwardX,
             double forwardZ
     ) {
-        List<List<WantedTile>> perRing = new ArrayList<>();
+        List<WantedTile> ordered = new ArrayList<>();
 
         for (WorldgenLodRing ring : rings) {
-            List<WantedTile> entries = buildRingWantedTiles(
+            ordered.addAll(buildRingWantedTiles(
                     centerX,
                     centerZ,
                     predictiveCenterX,
@@ -695,40 +712,45 @@ public final class WorldgenSurfaceSampler {
                     ring,
                     forwardX,
                     forwardZ
-            );
-            entries.sort(
-                    Comparator.comparingInt(
-                                    (WantedTile entry) -> entry.foreground() ? 0 : 1
-                            )
-                            .thenComparing(WantedTile::prefetch)
-                            .thenComparingInt(entry -> entry.predictive() ? 0 : 1)
-                            .thenComparingLong(entry ->
-                                    tileCenterDistanceSq(
-                                            entry.key(),
-                                            entry.ring(),
-                                            centerX,
-                                            centerZ
-                                    ))
-            );
-            perRing.add(entries);
+            ));
         }
 
-        List<WantedTile> interleaved = new ArrayList<>();
-        int index = 0;
-        boolean added;
+        ordered.sort(
+                Comparator.comparing(WantedTile::prefetch)
+                        .thenComparingInt(entry ->
+                                entry.frontierDistanceBlocks()
+                                        / COVERAGE_FRONTIER_BUCKET_BLOCKS
+                        )
+                        .thenComparingInt(entry ->
+                                coverageLevelRank(entry.ring().lodLevel())
+                        )
+                        .thenComparingInt(
+                                entry -> entry.foreground() ? 0 : 1
+                        )
+                        .thenComparingInt(
+                                entry -> entry.predictive() ? 0 : 1
+                        )
+                        .thenComparingInt(WantedTile::frontierDistanceBlocks)
+                        .thenComparingLong(entry ->
+                                tileCenterDistanceSq(
+                                        entry.key(),
+                                        entry.ring(),
+                                        centerX,
+                                        centerZ
+                                ))
+        );
 
-        do {
-            added = false;
-            for (List<WantedTile> ringEntries : perRing) {
-                if (index < ringEntries.size()) {
-                    interleaved.add(ringEntries.get(index));
-                    added = true;
-                }
-            }
-            index++;
-        } while (added);
+        return List.copyOf(ordered);
+    }
 
-        return List.copyOf(interleaved);
+    private static int coverageLevelRank(int lodLevel) {
+        if (lodLevel == 2) {
+            return 0;
+        }
+        if (lodLevel == 1) {
+            return 1;
+        }
+        return lodLevel + 1;
     }
 
     private static List<WantedTile> buildRingWantedTiles(
@@ -892,7 +914,14 @@ public final class WorldgenSurfaceSampler {
                             !visibleNow,
                             targetSpacing,
                             foreground || predictive,
-                            predictive
+                            predictive,
+                            tileNearestDistanceBlocks(
+                                    tileX,
+                                    tileZ,
+                                    centerX,
+                                    centerZ,
+                                    tileSize
+                            )
                     ));
                 }
             }
@@ -929,6 +958,26 @@ public final class WorldgenSurfaceSampler {
         long outerSq = (long) outerRadius * outerRadius;
 
         return nearestSq <= outerSq && farthestSq >= innerSq;
+    }
+
+    private static int tileNearestDistanceBlocks(
+            int tileX,
+            int tileZ,
+            int centerX,
+            int centerZ,
+            int tileSize
+    ) {
+        int minX = tileX * tileSize;
+        int minZ = tileZ * tileSize;
+        int maxX = minX + tileSize;
+        int maxZ = minZ + tileSize;
+
+        int nearestX = Math.max(minX, Math.min(centerX, maxX));
+        int nearestZ = Math.max(minZ, Math.min(centerZ, maxZ));
+        long dx = (long) nearestX - centerX;
+        long dz = (long) nearestZ - centerZ;
+
+        return (int) Math.floor(Math.sqrt(dx * dx + dz * dz));
     }
 
     private static long tileCenterDistanceSq(
@@ -983,60 +1032,66 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        // Priority zero stays the coarse L2 safety net.
-        WantedTile fallback = firstMissingFallbackCoverage(pending);
-        if (fallback != null) {
-            return fallback;
+        // 1) Never allow a farther ring, prediction, or refinement to jump over
+        // a currently visible L1/L2 hole. This is the true outward frontier.
+        WantedTile nearCoverage =
+                firstMissingCurrentNearCoverage(pending);
+        if (nearCoverage != null) {
+            balancedCoverageStep = 0;
+            return nearCoverage;
         }
 
-        // Camera-facing L1 coarse coverage is still the first high-detail goal.
-        WantedTile visibleCoverage = firstMissingForegroundVisibleCoverage(pending);
-        if (visibleCoverage != null) {
-            return visibleCoverage;
+        // 2) Once the immediate near field is continuous, warm the travel
+        // corridor. L2 safety tiles sort before L1 bootstrap within each band.
+        WantedTile predictiveCoverage =
+                firstMissingPredictiveCoverage(pending);
+        if (predictiveCoverage != null) {
+            balancedCoverageStep = 0;
+            return predictiveCoverage;
         }
 
-        // At speed, build the future L2 safety carpet before spending time on
-        // speculative detail. Then bootstrap future L1 in the travel direction.
-        WantedTile predictiveFallback =
-                firstMissingPredictiveFallbackCoverage(pending);
-        if (predictiveFallback != null) {
-            return predictiveFallback;
-        }
-
-        WantedTile predictiveNear =
-                firstMissingPredictiveNearCoverage(pending);
-        if (predictiveNear != null) {
-            return predictiveNear;
-        }
-
-        // Keep the foreground roaming guard warm before quality refinement.
-        WantedTile nearGuard = firstMissingForegroundNearGuardCoverage(pending);
-        if (nearGuard != null) {
+        // 3) At extreme speed, keep the next near guard warm before caring
+        // about distant horizon coverage or any refinement.
+        WantedTile nearGuard =
+                firstMissingNearGuardCoverage(pending);
+        if (highSpeedCoverageMode && nearGuard != null) {
+            balancedCoverageStep = 0;
             return nearGuard;
         }
 
-        WantedTile remainingCoverage = firstMissingCoverage(pending);
+        // 4) Remaining visible coverage now expands strictly outward through
+        // L3/L4/L5/L6 instead of being interleaved inward/outward.
+        WantedTile remainingVisible =
+                firstMissingCurrentFarCoverage(pending);
 
-        // Extreme movement is coverage-only. Refining 4b -> 2b -> 1b while the
-        // player is outrunning the field just spends budget behind the camera.
         if (highSpeedCoverageMode) {
+            if (remainingVisible != null) {
+                balancedCoverageStep = 0;
+                return remainingVisible;
+            }
+
             balancedCoverageStep = 0;
-            return remainingCoverage;
+            return nearGuard != null
+                    ? nearGuard
+                    : firstMissingOtherGuardCoverage(pending);
         }
 
-        // M3.7.2: concentrate quality where the vanilla handoff is visible.
-        // firstExactBandRefinement() returns the nearest exact-band tile that
-        // has not reached 1b yet. Because nextGenerationSpacing() advances it
-        // 4b->2b->1b, the same tile is completed before the scheduler moves on.
+        // 5) Normal-speed quality work may interleave only after the entire
+        // visible near field is solid. Far horizon coverage keeps the existing
+        // 8:1 advantage over refinement.
         WantedTile frontQuality = firstExactBandRefinement(pending);
         if (frontQuality == null) {
             frontQuality = firstIntermediateNearRefinement(pending);
         }
-        boolean hasFrontQuality = frontQuality != null;
 
-        // Keep the proven M3.6.6 8:1 coverage/refinement balance unchanged
-        // while total coverage is still incomplete.
-        if (remainingCoverage != null && hasFrontQuality) {
+        WantedTile remainingCoverage = remainingVisible != null
+                ? remainingVisible
+                : nearGuard;
+        if (remainingCoverage == null) {
+            remainingCoverage = firstMissingOtherGuardCoverage(pending);
+        }
+
+        if (remainingCoverage != null && frontQuality != null) {
             if (balancedCoverageStep < REMAINING_COVERAGE_BURST) {
                 balancedCoverageStep++;
                 return remainingCoverage;
@@ -1051,14 +1106,103 @@ public final class WorldgenSurfaceSampler {
             return remainingCoverage;
         }
 
-        if (hasFrontQuality) {
+        if (frontQuality != null) {
             balancedCoverageStep = 0;
             return frontQuality;
         }
 
-        // Exact L2 and other low-value refinement only happen after coverage
-        // and camera-facing L1 quality no longer need generation time.
         return firstRefinement(pending, false);
+    }
+
+    private static WantedTile firstMissingCurrentNearCoverage(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || wanted.prefetch()
+                    || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
+    private static WantedTile firstMissingPredictiveCoverage(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || !wanted.predictive()
+                    || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
+    private static WantedTile firstMissingNearGuardCoverage(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || !wanted.prefetch()
+                    || wanted.predictive()
+                    || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
+    private static WantedTile firstMissingCurrentFarCoverage(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || wanted.prefetch()
+                    || wanted.ring().lodLevel() <= NEAR_RING_MAX_LEVEL) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
+    private static WantedTile firstMissingOtherGuardCoverage(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || !wanted.prefetch()
+                    || wanted.predictive()) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
     }
 
     private static WantedTile firstMissingFallbackCoverage(LodTileKey pending) {
@@ -2504,6 +2648,8 @@ public final class WorldgenSurfaceSampler {
             boolean highSpeedCoverageMode,
             int predictiveDesired,
             int predictiveCovered,
+            int outwardFrontierBlocks,
+            boolean nearCoverageComplete,
             int staleJobsCancelled
     ) {
     }
@@ -2520,7 +2666,8 @@ public final class WorldgenSurfaceSampler {
             boolean prefetch,
             int targetSpacing,
             boolean foreground,
-            boolean predictive
+            boolean predictive,
+            int frontierDistanceBlocks
     ) {
     }
 
