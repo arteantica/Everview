@@ -3,7 +3,8 @@
   "package": "dev.everview.mixin.client",
   "client": [
     "CameraFarPlaneMixin",
-    "LevelRendererMixin"
+    "LevelRendererMixin",
+    "RenderSectionMixin"
   ],
   "injectors": {
     "defaultRequire": 1

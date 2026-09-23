@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.7.4.6 | EARLY SURFACE HANDOFF");
+        lines.add("Everview M3.7.4.6.1 | UPLOAD-TIME HANDOFF");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Handoff: top faces yield on visible OR freshly compiled vanilla sections");
+        lines.add("Handoff: top faces yield on visible OR freshly uploaded vanilla sections");
         lines.add("LOD bands: inner64 -> 1b | next64 -> 2b | 1.5s compile hint + live fallback");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",

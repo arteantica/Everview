@@ -21,9 +21,9 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * M3.7.4.6 persistent-GPU distant terrain renderer. Near LOD geometry stays
+ * M3.7.4.6.1 persistent-GPU distant terrain renderer. Near LOD geometry stays
  * permanently resident. Horizontal surface batches still use renderer-visible
- * chunk-column ownership, but freshly compiled vanilla sections now provide a
+ * chunk-column ownership, while RenderSection upload completion provides a
  * short early-handoff hint before the visibility list catches up.
  *
  * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
@@ -325,12 +325,12 @@ public final class EverviewRenderer {
             }
         }
 
-        // M3.7.4.6: LevelRenderer reports a section to
-        // addRecentlyCompiledSection() slightly before its visibility list
-        // necessarily reflects it. Use that exact renderer compile event as a
-        // short-lived early-ownership hint for TOP faces only. The hint expires
-        // automatically, so if vanilla never becomes visible the persistent
-        // Everview fallback returns instead of leaving a stale hole.
+        // M3.7.4.6.1: RenderSection.updateUploadTime() fires when the compiled
+        // vanilla mesh reaches the upload handoff, slightly before the section
+        // necessarily appears in the final visibility list. Use that exact
+        // event as a short-lived early-ownership hint for TOP faces only. The
+        // hint expires automatically, so if vanilla never becomes visible the
+        // persistent Everview fallback returns instead of leaving a stale hole.
         for (int offset = -1; offset <= 1; offset++) {
             if (recentlyCompiledSection(
                     chunkX,
