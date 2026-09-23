@@ -155,9 +155,12 @@
 ## M4 unified LOD engine
 - [x] explicit tile lifecycle: coverage / exact geometry / exact appearance
 - [x] invalidate M3 cache format and persist only disk-safe tile states
-- [ ] unified hierarchical ownership: vanilla > L1 > L2 > L3
+- [x] unified hierarchical ownership: vanilla > L1 > L2 > L3
 - [x] stage-priority scheduler: coverage > exact geometry > exact appearance
 - [x] cap provisional exact-geometry backlog so borrowed appearance cannot spread indefinitely
 - [x] high-throughput exact L1 generation via two-worker height pipeline
-- [ ] remove coarse/green fallback slabs during finer ownership
-- [ ] integrated stress pass before first M4 test jar
+- [x] remove whole-tile coarse fallback ownership in favor of finer per-region retirement
+- [x] CI integration pass before first M4 test jar
+- [ ] in-game M4 stress validation: stationary / normal flight / x7 FlySpeed / reload
+
+- [x] automatic server-thread fallback if async exact-height sampling is rejected

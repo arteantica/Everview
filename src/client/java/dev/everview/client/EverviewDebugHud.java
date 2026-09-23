@@ -37,7 +37,7 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M4 DEV | UNIFIED LOD ENGINE");
+        lines.add("Everview M4.0 ALPHA | UNIFIED LOD ENGINE");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Render: merged handoff ranges | uploads yield only after same-column vanilla is visible");
         lines.add("Refine: coverage -> async 1b heights -> bounded appearance catch-up");
@@ -240,11 +240,18 @@ public final class EverviewDebugHud {
                     reuse.cachedL1Grids()
             ));
             lines.add(String.format(
-                    "L1 appearance: %d/%d exact tiles | session biome samples %d",
+                    "L1 appearance: %d/%d exact tiles | provisional %d/%d | biome samples %d",
                     reuse.appearanceReadyTiles(),
                     reuse.appearanceDesiredTiles(),
+                    reuse.provisionalExactTiles(),
+                    12,
                     reuse.totalAppearanceGeneratedSamples()
             ));
+            lines.add("Exact heights: 2 workers | async "
+                    + (reuse.asyncExactActive() ? "ACTIVE" : "idle")
+                    + (reuse.serverExactFallback()
+                            ? " | SERVER FALLBACK"
+                            : ""));
         } else {
             lines.add("Far WORLDGEN: unavailable (singleplayer test path)");
         }

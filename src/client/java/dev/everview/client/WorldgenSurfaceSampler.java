@@ -241,7 +241,12 @@ public final class WorldgenSurfaceSampler {
                 totalAppearanceGeneratedSamples,
                 L1_SAMPLE_CACHE.size(),
                 appearanceReady,
-                appearanceDesired
+                appearanceDesired,
+                provisionalExactTileCount(),
+                currentJob != null
+                        && currentJob.asyncHeightFuture != null
+                        && !currentJob.asyncHeightFuture.isDone(),
+                currentJob != null && currentJob.asyncExactDisabled
         );
     }
 
@@ -1739,6 +1744,7 @@ public final class WorldgenSurfaceSampler {
         var randomState = chunks.randomState();
 
         if (job.exactGeometryOnly
+                && !job.asyncExactDisabled
                 && job.sampleGrid != null
                 && job.sampleGrid.hasAnyAppearance()) {
             runAsyncExactGeometry(
@@ -2009,12 +2015,29 @@ public final class WorldgenSurfaceSampler {
         try {
             result = job.asyncHeightFuture.join();
         } catch (RuntimeException exception) {
-            job.failed = true;
+            job.asyncExactDisabled = true;
+            job.asyncHeightFuture = null;
+            job.nextSample = 0;
             EverviewClient.LOGGER.warn(
-                    "Everview async exact-height batch failed at {}, {}",
+                    "Everview async exact-height batch failed at {}, {}; "
+                            + "falling back to server-thread sampling",
                     job.key.tileX(),
                     job.key.tileZ(),
                     exception
+            );
+            return;
+        }
+
+        if (result.sampleIndices().length
+                != job.asyncMissingSampleIndices.length) {
+            job.asyncExactDisabled = true;
+            job.asyncHeightFuture = null;
+            job.nextSample = 0;
+            EverviewClient.LOGGER.warn(
+                    "Everview async exact-height batch was incomplete at {}, {}; "
+                            + "falling back to server-thread sampling",
+                    job.key.tileX(),
+                    job.key.tileZ()
             );
             return;
         }
@@ -3204,6 +3227,7 @@ public final class WorldgenSurfaceSampler {
         private CompletableFuture<HeightBatchResult> asyncHeightFuture;
         private int[] asyncMissingSampleIndices = new int[0];
         private long asyncStartedNanos;
+        private boolean asyncExactDisabled;
         private volatile boolean failed;
         private int minY = Integer.MAX_VALUE;
         private int maxY = Integer.MIN_VALUE;
@@ -3483,7 +3507,10 @@ public final class WorldgenSurfaceSampler {
             long totalAppearanceGeneratedSamples,
             int cachedL1Grids,
             int appearanceReadyTiles,
-            int appearanceDesiredTiles
+            int appearanceDesiredTiles,
+            int provisionalExactTiles,
+            boolean asyncExactActive,
+            boolean serverExactFallback
     ) {
     }
 
