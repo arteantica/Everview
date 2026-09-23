@@ -24,9 +24,16 @@ public final class MaterialTerrainShading {
             return baseRgb;
         }
 
-        int detailScale = sampleSpacing <= 8
-                ? Math.max(4, sampleSpacing)
-                : Math.max(8, sampleSpacing / 2);
+        int detailScale;
+        if (sampleSpacing <= 1) {
+            detailScale = 1;
+        } else if (sampleSpacing <= 2) {
+            detailScale = 2;
+        } else if (sampleSpacing <= 8) {
+            detailScale = 4;
+        } else {
+            detailScale = Math.max(8, sampleSpacing / 2);
+        }
         int cellX = Math.floorDiv(worldX, detailScale);
         int cellZ = Math.floorDiv(worldZ, detailScale);
 
@@ -59,6 +66,10 @@ public final class MaterialTerrainShading {
                     brightness -= strength * 0.05F;
                 }
 
+                return scale(baseRgb, brightness);
+            }
+            case MinecraftSurfacePalette.MATERIAL_DIRT -> {
+                brightness = 1.0F + (coarse * 0.70F + fine * 0.30F) * strength * 0.34F;
                 return scale(baseRgb, brightness);
             }
             case MinecraftSurfacePalette.MATERIAL_SNOW -> {
@@ -95,6 +106,12 @@ public final class MaterialTerrainShading {
     }
 
     private static float detailStrength(int sampleSpacing) {
+        if (sampleSpacing <= 1) {
+            return 0.68F;
+        }
+        if (sampleSpacing <= 2) {
+            return 0.84F;
+        }
         if (sampleSpacing <= 8) {
             return 1.00F;
         }

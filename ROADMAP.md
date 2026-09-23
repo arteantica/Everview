@@ -86,6 +86,10 @@
 - [x] interleave deferred coverage and front L1 refinement at 3:1
 - [x] lighten deferred-coverage weighting to 8:1 for faster full-field completion
 - [x] defer exact L2 refinement until coverage/front L1 quality are complete
+- [x] exact L1 one-column-per-block geometry (no four-corner height averaging)
+- [x] deterministic east/south exact-tile edge walls without deep skirts
+- [x] layered grass-column side walls: shallow dirt over stone
+- [ ] block-faithful 2-block intermediate geometry
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] screen-space error driven detail selection
 - [ ] texture-atlas / UV material rendering

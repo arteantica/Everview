@@ -19,6 +19,7 @@ public final class MinecraftSurfacePalette {
     public static final byte MATERIAL_STONE = 3;
     public static final byte MATERIAL_SNOW = 4;
     public static final byte MATERIAL_TERRACOTTA = 5;
+    public static final byte MATERIAL_DIRT = 6;
 
     private static final int WATER = 0x3B6E98;
     private static final int SWAMP_WATER = 0x4D6256;
@@ -27,6 +28,7 @@ public final class MinecraftSurfacePalette {
     private static final int STONE = 0x777A7A;
     private static final int SNOW = 0xE7EBEC;
     private static final int TERRACOTTA = 0xA85F43;
+    private static final int DIRT = 0x866043;
     private static final int FALLBACK_GRASS = 0x6F9D50;
 
     private MinecraftSurfacePalette() {
@@ -103,6 +105,10 @@ public final class MinecraftSurfacePalette {
 
     public static int stoneColor() {
         return STONE;
+    }
+
+    public static int dirtColor() {
+        return DIRT;
     }
 
     public static int applyLighting(int rgb, float shade) {

@@ -27,10 +27,11 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.6.6 keeps the balanced view-priority scheduler but makes refinement much
- * lighter during the remaining coverage phase. After the L2 safety net, front
- * L1 coverage, and front guard are ready, eight remaining coverage tiles earn
- * one front L1 refinement tile. Exact L2 refinement stays deferred.
+ * M3.7 begins block-faithful visual geometry. Exact 1-block L1 tiles no longer
+ * average four corner samples into broad plateaus: each 1x1 cell now represents
+ * one sampled Minecraft column, with deterministic shared-edge walls and simple
+ * soil/stone layering. Coarser bootstrap/intermediate tiles keep the proven
+ * M3.6.6 streaming path.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -1069,11 +1070,382 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static MeshData buildMesh(GenerationJob job, int seaLevel) {
+        if (job.ring.lodLevel() == 1
+                && job.sampleSpacing == L1_EXACT_SPACING) {
+            return buildBlockColumnMesh(job, seaLevel);
+        }
+
         if (job.sampleSpacing <= 8) {
             return buildTerracedMesh(job, seaLevel);
         }
 
         return buildSmoothMesh(job);
+    }
+
+    /**
+     * Exact L1 is represented as Minecraft-like surface columns instead of
+     * four-corner averaged plateaus. Each cell takes the height/material/color
+     * sampled at its own block coordinate. East and south tile edges use the
+     * extra sample row/column already present in the generation job, so adjacent
+     * exact tiles meet deterministically without deep crack-hiding skirts.
+     */
+    private static MeshData buildBlockColumnMesh(GenerationJob job, int seaLevel) {
+        int cells = job.cellsAcross;
+        int[] topY = new int[job.cellCount];
+        int[] topColor = new int[job.cellCount];
+        byte[] topMaterial = new byte[job.cellCount];
+
+        for (int gz = 0; gz < cells; gz++) {
+            for (int gx = 0; gx < cells; gx++) {
+                int cell = gz * cells + gx;
+                int sample = gz * job.samplesAcross + gx;
+                int x = job.originX + gx;
+                int z = job.originZ + gz;
+
+                byte material = job.sampleMaterials[sample];
+                int y = exactColumnHeight(job, sample, material, seaLevel);
+                int color = MaterialTerrainShading.apply(
+                        MinecraftSurfacePalette.applyLighting(
+                                job.sampleColors[sample],
+                                material == MinecraftSurfacePalette.MATERIAL_WATER
+                                        ? 0.97F
+                                        : 1.00F
+                        ),
+                        material,
+                        x,
+                        y,
+                        z,
+                        L1_EXACT_SPACING
+                );
+
+                topY[cell] = y;
+                topColor[cell] = color;
+                topMaterial[cell] = material;
+            }
+        }
+
+        MeshBuilder mesh = new MeshBuilder(job.cellCount * 4);
+
+        // One top quad per sampled Minecraft column.
+        for (int gz = 0; gz < cells; gz++) {
+            int z0 = job.originZ + gz;
+            int z1 = z0 + 1;
+
+            for (int gx = 0; gx < cells; gx++) {
+                int x0 = job.originX + gx;
+                int x1 = x0 + 1;
+                int cell = gz * cells + gx;
+
+                mesh.addQuad(
+                        x0, topY[cell], z0,
+                        x0, topY[cell], z1,
+                        x1, topY[cell], z1,
+                        x1, topY[cell], z0,
+                        topColor[cell],
+                        topMaterial[cell]
+                );
+            }
+        }
+
+        // Shared east/west faces inside the tile.
+        for (int gz = 0; gz < cells; gz++) {
+            int z0 = job.originZ + gz;
+            int z1 = z0 + 1;
+
+            for (int gx = 0; gx < cells - 1; gx++) {
+                int left = gz * cells + gx;
+                int right = left + 1;
+                addBlockBoundaryWall(
+                        mesh,
+                        job.originX + gx + 1, z0,
+                        job.originX + gx + 1, z1,
+                        topY[left], topMaterial[left], topColor[left],
+                        topY[right], topMaterial[right], topColor[right],
+                        0.82F
+                );
+            }
+
+            // The extra x=max sample is the first column sample of the tile
+            // immediately to the east. This makes exact-tile seams deterministic.
+            int inside = gz * cells + cells - 1;
+            int outsideSample = gz * job.samplesAcross + cells;
+            byte outsideMaterial = job.sampleMaterials[outsideSample];
+            int outsideY = exactColumnHeight(
+                    job,
+                    outsideSample,
+                    outsideMaterial,
+                    seaLevel
+            );
+            int outsideColor = exactSampleColor(
+                    job,
+                    outsideSample,
+                    outsideMaterial,
+                    job.originX + cells,
+                    outsideY,
+                    z0
+            );
+            int eastX = job.originX + cells;
+
+            addBlockBoundaryWall(
+                    mesh,
+                    eastX, z0,
+                    eastX, z1,
+                    topY[inside], topMaterial[inside], topColor[inside],
+                    outsideY, outsideMaterial, outsideColor,
+                    0.82F
+            );
+        }
+
+        // Shared north/south faces inside the tile.
+        for (int gx = 0; gx < cells; gx++) {
+            int x0 = job.originX + gx;
+            int x1 = x0 + 1;
+
+            for (int gz = 0; gz < cells - 1; gz++) {
+                int north = gz * cells + gx;
+                int south = north + cells;
+                addBlockBoundaryWall(
+                        mesh,
+                        x0, job.originZ + gz + 1,
+                        x1, job.originZ + gz + 1,
+                        topY[north], topMaterial[north], topColor[north],
+                        topY[south], topMaterial[south], topColor[south],
+                        0.72F
+                );
+            }
+
+            // Same ownership rule for the south tile edge.
+            int inside = (cells - 1) * cells + gx;
+            int outsideSample = cells * job.samplesAcross + gx;
+            byte outsideMaterial = job.sampleMaterials[outsideSample];
+            int outsideY = exactColumnHeight(
+                    job,
+                    outsideSample,
+                    outsideMaterial,
+                    seaLevel
+            );
+            int outsideColor = exactSampleColor(
+                    job,
+                    outsideSample,
+                    outsideMaterial,
+                    x0,
+                    outsideY,
+                    job.originZ + cells
+            );
+            int southZ = job.originZ + cells;
+
+            addBlockBoundaryWall(
+                    mesh,
+                    x0, southZ,
+                    x1, southZ,
+                    topY[inside], topMaterial[inside], topColor[inside],
+                    outsideY, outsideMaterial, outsideColor,
+                    0.72F
+            );
+        }
+
+        return mesh.finish();
+    }
+
+    private static int exactColumnHeight(
+            GenerationJob job,
+            int sample,
+            byte material,
+            int seaLevel
+    ) {
+        return material == MinecraftSurfacePalette.MATERIAL_WATER
+                ? seaLevel
+                : job.heights[sample];
+    }
+
+    private static int exactSampleColor(
+            GenerationJob job,
+            int sample,
+            byte material,
+            int x,
+            int y,
+            int z
+    ) {
+        return MaterialTerrainShading.apply(
+                MinecraftSurfacePalette.applyLighting(
+                        job.sampleColors[sample],
+                        material == MinecraftSurfacePalette.MATERIAL_WATER
+                                ? 0.97F
+                                : 1.00F
+                ),
+                material,
+                x,
+                y,
+                z,
+                L1_EXACT_SPACING
+        );
+    }
+
+    private static void addBlockBoundaryWall(
+            MeshBuilder mesh,
+            int x0,
+            int z0,
+            int x1,
+            int z1,
+            int aY,
+            byte aMaterial,
+            int aColor,
+            int bY,
+            byte bMaterial,
+            int bColor,
+            float directionalShade
+    ) {
+        if (aY == bY) {
+            return;
+        }
+
+        boolean aHigh = aY > bY;
+        int highY = Math.max(aY, bY);
+        int lowY = Math.min(aY, bY);
+        byte highMaterial = aHigh ? aMaterial : bMaterial;
+        int highColor = aHigh ? aColor : bColor;
+
+        addLayeredColumnWall(
+                mesh,
+                x0,
+                z0,
+                x1,
+                z1,
+                lowY,
+                highY,
+                highMaterial,
+                highColor,
+                directionalShade
+        );
+    }
+
+    private static void addLayeredColumnWall(
+            MeshBuilder mesh,
+            int x0,
+            int z0,
+            int x1,
+            int z1,
+            int lowY,
+            int highY,
+            byte topMaterial,
+            int topColor,
+            float directionalShade
+    ) {
+        int height = highY - lowY;
+        if (height <= 0) {
+            return;
+        }
+
+        int worldX = (x0 + x1) / 2;
+        int worldZ = (z0 + z1) / 2;
+
+        if (topMaterial == MinecraftSurfacePalette.MATERIAL_GRASS) {
+            int soilBottom = Math.max(lowY, highY - Math.min(3, height));
+
+            if (soilBottom > lowY) {
+                int stone = MaterialTerrainShading.apply(
+                        MinecraftSurfacePalette.applyLighting(
+                                MinecraftSurfacePalette.stoneColor(),
+                                directionalShade
+                        ),
+                        MinecraftSurfacePalette.MATERIAL_STONE,
+                        worldX,
+                        lowY,
+                        worldZ,
+                        L1_EXACT_SPACING
+                );
+                mesh.addQuad(
+                        x0, lowY, z0,
+                        x1, lowY, z1,
+                        x1, soilBottom, z1,
+                        x0, soilBottom, z0,
+                        stone,
+                        MinecraftSurfacePalette.MATERIAL_STONE
+                );
+            }
+
+            int dirt = MaterialTerrainShading.apply(
+                    MinecraftSurfacePalette.applyLighting(
+                            MinecraftSurfacePalette.dirtColor(),
+                            directionalShade
+                    ),
+                    MinecraftSurfacePalette.MATERIAL_DIRT,
+                    worldX,
+                    soilBottom,
+                    worldZ,
+                    L1_EXACT_SPACING
+            );
+            mesh.addQuad(
+                    x0, soilBottom, z0,
+                    x1, soilBottom, z1,
+                    x1, highY, z1,
+                    x0, highY, z0,
+                    dirt,
+                    MinecraftSurfacePalette.MATERIAL_DIRT
+            );
+            return;
+        }
+
+        if (topMaterial == MinecraftSurfacePalette.MATERIAL_SNOW) {
+            int snowBottom = Math.max(lowY, highY - 1);
+
+            if (snowBottom > lowY) {
+                int stone = MaterialTerrainShading.apply(
+                        MinecraftSurfacePalette.applyLighting(
+                                MinecraftSurfacePalette.stoneColor(),
+                                directionalShade
+                        ),
+                        MinecraftSurfacePalette.MATERIAL_STONE,
+                        worldX,
+                        lowY,
+                        worldZ,
+                        L1_EXACT_SPACING
+                );
+                mesh.addQuad(
+                        x0, lowY, z0,
+                        x1, lowY, z1,
+                        x1, snowBottom, z1,
+                        x0, snowBottom, z0,
+                        stone,
+                        MinecraftSurfacePalette.MATERIAL_STONE
+                );
+            }
+
+            int snow = MinecraftSurfacePalette.applyLighting(
+                    topColor,
+                    directionalShade
+            );
+            mesh.addQuad(
+                    x0, snowBottom, z0,
+                    x1, snowBottom, z1,
+                    x1, highY, z1,
+                    x0, highY, z0,
+                    snow,
+                    MinecraftSurfacePalette.MATERIAL_SNOW
+            );
+            return;
+        }
+
+        byte wallMaterial = topMaterial == MinecraftSurfacePalette.MATERIAL_WATER
+                ? MinecraftSurfacePalette.MATERIAL_WATER
+                : topMaterial;
+
+        int wallColor = topMaterial == MinecraftSurfacePalette.MATERIAL_STONE
+                ? MinecraftSurfacePalette.stoneColor()
+                : topColor;
+        wallColor = MinecraftSurfacePalette.applyLighting(
+                wallColor,
+                directionalShade
+        );
+
+        mesh.addQuad(
+                x0, lowY, z0,
+                x1, lowY, z1,
+                x1, highY, z1,
+                x0, highY, z0,
+                wallColor,
+                wallMaterial
+        );
     }
 
     private static MeshData buildSmoothMesh(GenerationJob job) {
@@ -1173,11 +1545,9 @@ public final class WorldgenSurfaceSampler {
     }
 
     /**
-     * Near Everview rings use deliberately blockier coarse-voxel surfaces.
-     * M3.6 uses 1x1 cells for exact L1 and 8x8 cells for L2, each
-     * as a flat plateau with vertical faces between neighboring plateaus and dark
-     * skirts around tile edges. This sacrifices smooth triangles close to the
-     * vanilla handoff in favor of silhouettes that read much more like Minecraft.
+     * Bootstrap/intermediate near rings retain the coarse terraced surface.
+     * Exact 1-block L1 is handled separately by buildBlockColumnMesh(), while
+     * 2/4/8-block tiles continue using representative plateaus and skirts.
      */
     private static MeshData buildTerracedMesh(GenerationJob job, int seaLevel) {
         int cells = job.cellsAcross;
@@ -1386,7 +1756,7 @@ public final class WorldgenSurfaceSampler {
             int i01,
             int i11
     ) {
-        int[] counts = new int[6];
+        int[] counts = new int[7];
         int[] indices = {i00, i10, i01, i11};
 
         for (int index : indices) {
