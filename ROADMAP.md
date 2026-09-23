@@ -193,3 +193,11 @@
 - [x] convert detached exact generation from two workers on one tile to two independent tile jobs
 - [x] cancel detached exact work immediately when high-speed coverage mode takes priority
 - [x] keep sample-cache entries pinned while either exact worker owns them
+
+
+## M5.1 chunk-split surface ownership
+- [x] classify sloped smooth terrain tops as vanilla-sensitive surfaces
+- [x] split sloped L3 surfaces on every 16x16 vanilla chunk boundary
+- [x] bilinearly preserve height and color across split smooth-surface pieces
+- [x] scan the whole vertical chunk column at the handoff fringe instead of only +/-2 LOD sections
+- [x] eliminate the BatchKey.ALWAYS escape path for normal sloped terrain tops

@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M5.0 DEV | HARD COLUMN OWNERSHIP");
+        lines.add("Everview M5.1 DEV | CHUNK-SPLIT SURFACE OWNERSHIP");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Render: merged handoff ranges | uploads yield only after same-column vanilla is visible");
-        lines.add("Ownership: loaded vanilla columns > L1 > L2 > L3 | fringe keeps fallback");
+        lines.add("Ownership: all terrain tops chunk-split | vanilla columns > L1 > L2 > L3");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),

@@ -572,9 +572,7 @@ public final class EverviewRenderer {
             int chunkZ,
             Map<SectionKey, Boolean> visibility
     ) {
-        // LOD/worldgen surface height and the vanilla rendered surface can land
-        // on opposite sides of a 16-block section boundary. Renderer-visible
-        // terrain remains the authoritative ownership signal.
+        // Fast local test around the LOD surface first.
         for (int offset = -2; offset <= 2; offset++) {
             if (vanillaSectionVisible(
                     client,
@@ -587,32 +585,11 @@ public final class EverviewRenderer {
             }
         }
 
-        boolean recentlyUploaded = false;
-
-        for (int offset = -2; offset <= 2; offset++) {
-            if (recentlyCompiledSection(
-                    chunkX,
-                    sectionY + offset,
-                    chunkZ
-            )) {
-                recentlyUploaded = true;
-                break;
-            }
-        }
-
-        if (!recentlyUploaded) {
-            return false;
-        }
-
-        // M3.8.3: an upload alone is not enough to suppress the persistent LOD.
-        // That was able to create a white gap while vanilla had a mesh uploaded
-        // but had not actually started drawing the chunk column. Permit the
-        // early hint only after nearby terrain in THIS SAME chunk column is
-        // already renderer-visible. The +/-1 region was checked above, so this
-        // effectively looks only at the next neighboring vertical sections.
-        for (int offset = -EARLY_HANDOFF_VISIBLE_NEIGHBOR_SECTIONS;
-                offset <= EARLY_HANDOFF_VISIBLE_NEIGHBOR_SECTIONS;
-                offset++) {
+        // M5.1: ownership belongs to the chunk column, not to the guessed LOD
+        // surface section. Scan the rest of a generous vertical column so
+        // oceans, cliffs, overhangs and large height mismatches cannot leave
+        // an already-rendered vanilla column exposed to Everview.
+        for (int offset = -24; offset <= 24; offset++) {
             if (offset >= -2 && offset <= 2) {
                 continue;
             }
@@ -628,8 +605,36 @@ public final class EverviewRenderer {
             }
         }
 
-        // Keep Everview underneath until vanilla proves that this chunk column
-        // is actually rendering. A brief green overlap is preferable to a hole.
+        // Recent compile hints are only a fallback signal; they never override
+        // the requirement that some section in this column is renderer-ready.
+        boolean recentlyUploaded = false;
+        for (int offset = -24; offset <= 24; offset++) {
+            if (recentlyCompiledSection(
+                    chunkX,
+                    sectionY + offset,
+                    chunkZ
+            )) {
+                recentlyUploaded = true;
+                break;
+            }
+        }
+
+        if (!recentlyUploaded) {
+            return false;
+        }
+
+        for (int offset = -24; offset <= 24; offset++) {
+            if (vanillaSectionVisible(
+                    client,
+                    chunkX,
+                    sectionY + offset,
+                    chunkZ,
+                    visibility
+            )) {
+                return true;
+            }
+        }
+
         return false;
     }
 

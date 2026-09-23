@@ -290,9 +290,10 @@ public final class EverviewGpuTileCache {
             maxZ = Math.max(maxZ, vertices[i + 2]);
         }
 
-        boolean horizontal = minY == maxY
-                && minX < maxX
-                && minZ < maxZ;
+        // A terrain top is identified by spanning both horizontal axes.
+        // Its four corner heights are allowed to differ. M4 treated those
+        // sloped tops as "unexpected" and they escaped vanilla ownership.
+        boolean surface = minX < maxX && minZ < maxZ;
         boolean xWall = minX == maxX
                 && minY < maxY
                 && minZ < maxZ;
@@ -300,13 +301,13 @@ public final class EverviewGpuTileCache {
                 && minY < maxY
                 && minX < maxX;
 
-        if (!horizontal && !xWall && !zWall) {
+        if (!surface && !xWall && !zWall) {
             return List.of(piece);
         }
 
         List<QuadPiece> result = new ArrayList<>();
 
-        if (horizontal) {
+        if (surface) {
             int x0 = minX;
             while (x0 < maxX) {
                 int x1 = Math.min(maxX, nextChunkBoundary(x0));
@@ -314,14 +315,16 @@ public final class EverviewGpuTileCache {
 
                 while (z0 < maxZ) {
                     int z1 = Math.min(maxZ, nextChunkBoundary(z0));
-                    result.add(remapAxisAlignedPiece(
+                    result.add(splitSurfacePiece(
                             piece,
-                            minX, maxX,
-                            minY, maxY,
-                            minZ, maxZ,
-                            x0, x1,
-                            minY, maxY,
-                            z0, z1
+                            minX,
+                            maxX,
+                            minZ,
+                            maxZ,
+                            x0,
+                            x1,
+                            z0,
+                            z1
                     ));
                     z0 = z1;
                 }
@@ -366,6 +369,136 @@ public final class EverviewGpuTileCache {
         }
 
         return result;
+    }
+
+    private static QuadPiece splitSurfacePiece(
+            QuadPiece source,
+            int minX,
+            int maxX,
+            int minZ,
+            int maxZ,
+            int x0,
+            int x1,
+            int z0,
+            int z1
+    ) {
+        int[] vertices = source.vertices();
+        int[] colors = source.colors();
+
+        int y00 = surfaceCornerY(vertices, minX, minZ);
+        int y01 = surfaceCornerY(vertices, minX, maxZ);
+        int y11 = surfaceCornerY(vertices, maxX, maxZ);
+        int y10 = surfaceCornerY(vertices, maxX, minZ);
+
+        int c00 = surfaceCornerColor(vertices, colors, minX, minZ);
+        int c01 = surfaceCornerColor(vertices, colors, minX, maxZ);
+        int c11 = surfaceCornerColor(vertices, colors, maxX, maxZ);
+        int c10 = surfaceCornerColor(vertices, colors, maxX, minZ);
+
+        double tx0 = (x0 - minX) / (double) Math.max(1, maxX - minX);
+        double tx1 = (x1 - minX) / (double) Math.max(1, maxX - minX);
+        double tz0 = (z0 - minZ) / (double) Math.max(1, maxZ - minZ);
+        double tz1 = (z1 - minZ) / (double) Math.max(1, maxZ - minZ);
+
+        int[] outVertices = new int[] {
+                x0, bilerpInt(y00, y10, y01, y11, tx0, tz0), z0,
+                x0, bilerpInt(y00, y10, y01, y11, tx0, tz1), z1,
+                x1, bilerpInt(y00, y10, y01, y11, tx1, tz1), z1,
+                x1, bilerpInt(y00, y10, y01, y11, tx1, tz0), z0
+        };
+
+        int[] outColors = new int[] {
+                bilerpColor(c00, c10, c01, c11, tx0, tz0),
+                bilerpColor(c00, c10, c01, c11, tx0, tz1),
+                bilerpColor(c00, c10, c01, c11, tx1, tz1),
+                bilerpColor(c00, c10, c01, c11, tx1, tz0)
+        };
+
+        return new QuadPiece(outVertices, outColors);
+    }
+
+    private static int surfaceCornerY(
+            int[] vertices,
+            int x,
+            int z
+    ) {
+        for (int v = 0; v < 4; v++) {
+            int i = v * 3;
+            if (vertices[i] == x && vertices[i + 2] == z) {
+                return vertices[i + 1];
+            }
+        }
+
+        throw new IllegalStateException(
+                "Everview surface quad missing expected corner"
+        );
+    }
+
+    private static int surfaceCornerColor(
+            int[] vertices,
+            int[] colors,
+            int x,
+            int z
+    ) {
+        for (int v = 0; v < 4; v++) {
+            int i = v * 3;
+            if (vertices[i] == x && vertices[i + 2] == z) {
+                return colors[v];
+            }
+        }
+
+        throw new IllegalStateException(
+                "Everview surface quad missing expected color corner"
+        );
+    }
+
+    private static int bilerpInt(
+            int c00,
+            int c10,
+            int c01,
+            int c11,
+            double tx,
+            double tz
+    ) {
+        double north = c00 + (c10 - c00) * tx;
+        double south = c01 + (c11 - c01) * tx;
+        return (int) Math.round(north + (south - north) * tz);
+    }
+
+    private static int bilerpColor(
+            int c00,
+            int c10,
+            int c01,
+            int c11,
+            double tx,
+            double tz
+    ) {
+        int r = bilerpInt(
+                (c00 >> 16) & 0xFF,
+                (c10 >> 16) & 0xFF,
+                (c01 >> 16) & 0xFF,
+                (c11 >> 16) & 0xFF,
+                tx,
+                tz
+        );
+        int g = bilerpInt(
+                (c00 >> 8) & 0xFF,
+                (c10 >> 8) & 0xFF,
+                (c01 >> 8) & 0xFF,
+                (c11 >> 8) & 0xFF,
+                tx,
+                tz
+        );
+        int b = bilerpInt(
+                c00 & 0xFF,
+                c10 & 0xFF,
+                c01 & 0xFF,
+                c11 & 0xFF,
+                tx,
+                tz
+        );
+
+        return (r << 16) | (g << 8) | b;
     }
 
     private static int nextChunkBoundary(int coordinate) {
@@ -516,14 +649,19 @@ public final class EverviewGpuTileCache {
             maxZ = Math.max(maxZ, vertices[i + 2]);
         }
 
-        // Horizontal surface face. Near-ring cell sizes all divide 16, so a
-        // surface cell belongs cleanly to one vanilla chunk column.
-        if (minY == maxY && minX < maxX && minZ < maxZ) {
+        // Terrain top face. Heights may differ at all four corners for smooth
+        // distant terrain. Ownership depends on the X/Z footprint, not flat Y.
+        // splitQuadForOwnership() already constrains the footprint to one
+        // vanilla chunk column before this classifier runs.
+        if (minX < maxX && minZ < maxZ) {
             int sampleX = minX + Math.max(0, (maxX - minX - 1) / 2);
             int sampleZ = minZ + Math.max(0, (maxZ - minZ - 1) / 2);
             int chunkX = Math.floorDiv(sampleX, 16);
             int chunkZ = Math.floorDiv(sampleZ, 16);
-            int sectionY = Math.floorDiv(minY - 1, 16);
+            int sectionY = Math.floorDiv(
+                    (minY + maxY) / 2 - 1,
+                    16
+            );
 
             return BatchKey.surface(chunkX, chunkZ, sectionY);
         }
