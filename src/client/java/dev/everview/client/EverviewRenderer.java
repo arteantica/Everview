@@ -153,20 +153,12 @@ public final class EverviewRenderer {
         double centerZ = (tile.minZ() + tile.maxZ()) * 0.5;
         double centerDistance = Math.hypot(centerX - cameraX, centerZ - cameraZ);
 
-        if (ring.lodLevel() == 1) {
-            // Never let a whole persistent L1 tile leak across the intended
-            // inner handoff. The nearest point of the tile must be outside the
-            // 32-block overlap boundary. With 32-block L1 tiles, this keeps the
-            // visible transition tight without falling back to per-quad CPU
-            // clipping every frame.
-            double nearestX = Math.max(tile.minX(), Math.min(cameraX, tile.maxX()));
-            double nearestZ = Math.max(tile.minZ(), Math.min(cameraZ, tile.maxZ()));
-            double nearestDistance = Math.hypot(nearestX - cameraX, nearestZ - cameraZ);
-
-            return nearestDistance >= ring.innerRadiusBlocks()
-                    && centerDistance <= ring.outerRadiusBlocks();
-        }
-
+        // M3.3.1 over-corrected the handoff by requiring the entire
+        // 32-block L1 tile to sit outside the inner radius. That creates an
+        // extra camera-centered dead zone, making the LOD appear to "run away"
+        // as the player moves. Center ownership keeps the boundary stable while
+        // the small 32-block L1 tiles limit inward spill to roughly half a tile.
+        // Vanilla depth still wins where the two representations overlap.
         return centerDistance >= ring.innerRadiusBlocks()
                 && centerDistance <= ring.outerRadiusBlocks();
     }
