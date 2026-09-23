@@ -27,11 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.7 begins block-faithful visual geometry. Exact 1-block L1 tiles no longer
- * average four corner samples into broad plateaus: each 1x1 cell now represents
- * one sampled Minecraft column, with deterministic shared-edge walls and simple
- * soil/stone layering. Coarser bootstrap/intermediate tiles keep the proven
- * M3.6.6 streaming path.
+ * M3.7.1 keeps the block-column exact L1 geometry and lets it appear much
+ * sooner. Front refinement now interleaves two 4b->2b upgrades with one
+ * eligible 2b->1b exact upgrade, instead of finishing the whole 2b queue first.
+ * Coverage priority and the M3.6.6 8:1 coverage/refine balance stay unchanged.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -46,6 +45,7 @@ public final class WorldgenSurfaceSampler {
     private static final int CACHE_LIMIT = 3_072;
     private static final int NEAR_RING_MAX_LEVEL = 2;
     private static final int REMAINING_COVERAGE_BURST = 8;
+    private static final int INTERMEDIATE_BEFORE_EXACT = 2;
     private static final int L1_PREFETCH_BLOCKS = 64;
     private static final int L2_PREFETCH_BLOCKS = 128;
     private static final int L1_BOOTSTRAP_SPACING = 4;
@@ -98,6 +98,7 @@ public final class WorldgenSurfaceSampler {
     private static long initialFillStartedNanos;
     private static long initialFillCompletedNanos;
     private static int balancedCoverageStep;
+    private static int frontRefineMixStep;
 
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
@@ -451,6 +452,7 @@ public final class WorldgenSurfaceSampler {
         initialFillStartedNanos = 0L;
         initialFillCompletedNanos = 0L;
         balancedCoverageStep = 0;
+        frontRefineMixStep = 0;
         adaptiveSliceBudgetNanos = BASE_SLICE_BUDGET_NANOS;
         serverTickMs = 0.0;
         clientFrameMs = 0.0;
@@ -753,24 +755,22 @@ public final class WorldgenSurfaceSampler {
 
         WantedTile remainingCoverage = firstMissingCoverage(pending);
 
-        // Front L1 quality is deliberately isolated from L2 exact refinement:
-        // finish eligible 4b -> 2b front tiles before beginning 2b -> 1b.
-        WantedTile frontQuality = firstIntermediateNearRefinement(pending);
-        if (frontQuality == null) {
-            frontQuality = firstExactL1Refinement(pending);
-        }
+        // M3.7.1: do not drain the entire 4b -> 2b queue before showing the
+        // new block-column geometry. As soon as exact-band 2b tiles exist,
+        // interleave two intermediate upgrades with one 1b exact upgrade.
+        WantedTile intermediate = firstIntermediateNearRefinement(pending);
+        WantedTile exact = firstExactL1Refinement(pending);
+        boolean hasFrontQuality = intermediate != null || exact != null;
 
-        // M3.6.6: keep front quality progressing without materially delaying
-        // total coverage. Eight remaining coverage selections earn one front
-        // refinement selection while both queues contain work.
-        if (remainingCoverage != null && frontQuality != null) {
+        // Keep the M3.6.6 8:1 coverage/refinement balance unchanged.
+        if (remainingCoverage != null && hasFrontQuality) {
             if (balancedCoverageStep < REMAINING_COVERAGE_BURST) {
                 balancedCoverageStep++;
                 return remainingCoverage;
             }
 
             balancedCoverageStep = 0;
-            return frontQuality;
+            return selectFrontQuality(intermediate, exact);
         }
 
         if (remainingCoverage != null) {
@@ -778,9 +778,9 @@ public final class WorldgenSurfaceSampler {
             return remainingCoverage;
         }
 
-        if (frontQuality != null) {
+        if (hasFrontQuality) {
             balancedCoverageStep = 0;
-            return frontQuality;
+            return selectFrontQuality(intermediate, exact);
         }
 
         // Exact L2 and other low-value refinement only happen after coverage
@@ -868,6 +868,32 @@ public final class WorldgenSurfaceSampler {
         }
 
         return null;
+    }
+
+    private static WantedTile selectFrontQuality(
+            WantedTile intermediate,
+            WantedTile exact
+    ) {
+        if (intermediate == null) {
+            frontRefineMixStep = 0;
+            return exact;
+        }
+
+        if (exact == null) {
+            frontRefineMixStep = Math.min(
+                    INTERMEDIATE_BEFORE_EXACT,
+                    frontRefineMixStep + 1
+            );
+            return intermediate;
+        }
+
+        if (frontRefineMixStep >= INTERMEDIATE_BEFORE_EXACT) {
+            frontRefineMixStep = 0;
+            return exact;
+        }
+
+        frontRefineMixStep++;
+        return intermediate;
     }
 
     private static WantedTile firstIntermediateNearRefinement(

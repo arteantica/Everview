@@ -89,6 +89,7 @@
 - [x] exact L1 one-column-per-block geometry (no four-corner height averaging)
 - [x] deterministic east/south exact-tile edge walls without deep skirts
 - [x] layered grass-column side walls: shallow dirt over stone
+- [x] early exact-L1 refinement: interleave 2 intermediate upgrades per 1 exact upgrade
 - [ ] block-faithful 2-block intermediate geometry
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] screen-space error driven detail selection
