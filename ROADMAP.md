@@ -83,6 +83,8 @@
 - [x] isolate M3.6.3 scheduler with fresh v15 disk cache benchmark
 - [x] camera-facing L1 generation priority with rear-half L2 fallback
 - [x] rebuild L1 priority on 22.5-degree view sectors
+- [x] interleave deferred coverage and front L1 refinement at 3:1
+- [x] defer exact L2 refinement until coverage/front L1 quality are complete
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] screen-space error driven detail selection
 - [ ] texture-atlas / UV material rendering

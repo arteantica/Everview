@@ -27,10 +27,11 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.6.4 makes L1 view-prioritized. The full L2 safety net still establishes
- * 360-degree coarse coverage first, but only the camera-facing half of L1 is
- * treated as urgent. Front L1 coverage and detail can finish before rear L1
- * tiles, which remain safely represented by L2 until spare generation time.
+ * M3.6.5 keeps view-priority but removes the long post-front stall. After the
+ * 360-degree L2 safety net, front L1 coverage, and front guard are ready, the
+ * scheduler mixes three remaining coverage tiles for every one front L1
+ * refinement tile. Exact L2 refinement is deferred until coverage/front detail
+ * work is done.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -44,7 +45,7 @@ public final class WorldgenSurfaceSampler {
 
     private static final int CACHE_LIMIT = 3_072;
     private static final int NEAR_RING_MAX_LEVEL = 2;
-    private static final int NEAR_REFINE_BURST = 2;
+    private static final int REMAINING_COVERAGE_BURST = 3;
     private static final int L1_PREFETCH_BLOCKS = 64;
     private static final int L2_PREFETCH_BLOCKS = 128;
     private static final int L1_BOOTSTRAP_SPACING = 4;
@@ -52,7 +53,6 @@ public final class WorldgenSurfaceSampler {
     private static final int L1_EXACT_SPACING = 1;
     private static final int L1_EXACT_BAND_BLOCKS = 64;
     private static final int L1_INTERMEDIATE_BAND_BLOCKS = 128;
-    private static final int EXACT_REFINE_COVERAGE_STEPS = 2;
     private static final int VIEW_SECTOR_COUNT = 16;
     private static final double VIEW_SECTOR_DEGREES = 360.0 / VIEW_SECTOR_COUNT;
 
@@ -97,8 +97,7 @@ public final class WorldgenSurfaceSampler {
     private static int generatedTileCount;
     private static long initialFillStartedNanos;
     private static long initialFillCompletedNanos;
-    private static int nearRefineScheduleStep;
-    private static int exactRefineCoverageStep;
+    private static int balancedCoverageStep;
 
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
@@ -451,8 +450,7 @@ public final class WorldgenSurfaceSampler {
         generatedTileCount = 0;
         initialFillStartedNanos = 0L;
         initialFillCompletedNanos = 0L;
-        nearRefineScheduleStep = 0;
-        exactRefineCoverageStep = 0;
+        balancedCoverageStep = 0;
         adaptiveSliceBudgetNanos = BASE_SLICE_BUDGET_NANOS;
         serverTickMs = 0.0;
         clientFrameMs = 0.0;
@@ -741,42 +739,52 @@ public final class WorldgenSurfaceSampler {
             return fallback;
         }
 
-        // M3.6.4: after the 360-degree L2 fallback exists, only camera-facing
-        // L1 counts as urgent visible coverage. Rear L1 can remain represented
-        // by L2 until foreground coverage/detail is established.
+        // Camera-facing L1 coarse coverage is still the first high-detail goal.
         WantedTile visibleCoverage = firstMissingForegroundVisibleCoverage(pending);
         if (visibleCoverage != null) {
             return visibleCoverage;
         }
 
-        // Warm only camera-facing L1 guard plus the full L2 guard before
-        // spending generation time on high detail.
+        // Keep the foreground roaming guard warm before quality refinement.
         WantedTile nearGuard = firstMissingForegroundNearGuardCoverage(pending);
         if (nearGuard != null) {
             return nearGuard;
         }
 
-        // Stage 2: distance-tiered 4b -> 2b near refinement.
-        WantedTile intermediate = firstIntermediateNearRefinement(pending);
-        if (intermediate != null) {
-            nearRefineScheduleStep = 0;
-            return intermediate;
-        }
-
-        // Stage 3: true 1-block detail only in the inner distance band.
-        WantedTile exactL1 = firstExactL1Refinement(pending);
-        if (exactL1 != null) {
-            exactRefineCoverageStep = 0;
-            return exactL1;
-        }
-
-        // Spare guard/speculative coverage and any remaining outer refinement
-        // happen only after the visible world and near detail are established.
         WantedTile remainingCoverage = firstMissingCoverage(pending);
+
+        // Front L1 quality is deliberately isolated from L2 exact refinement:
+        // finish eligible 4b -> 2b front tiles before beginning 2b -> 1b.
+        WantedTile frontQuality = firstIntermediateNearRefinement(pending);
+        if (frontQuality == null) {
+            frontQuality = firstExactL1Refinement(pending);
+        }
+
+        // M3.6.5: keep total coverage visibly moving instead of appearing
+        // frozen at ~79%. Three remaining coverage selections earn one front
+        // refinement selection while both queues contain work.
+        if (remainingCoverage != null && frontQuality != null) {
+            if (balancedCoverageStep < REMAINING_COVERAGE_BURST) {
+                balancedCoverageStep++;
+                return remainingCoverage;
+            }
+
+            balancedCoverageStep = 0;
+            return frontQuality;
+        }
+
         if (remainingCoverage != null) {
+            balancedCoverageStep = 0;
             return remainingCoverage;
         }
 
+        if (frontQuality != null) {
+            balancedCoverageStep = 0;
+            return frontQuality;
+        }
+
+        // Exact L2 and other low-value refinement only happen after coverage
+        // and camera-facing L1 quality no longer need generation time.
         return firstRefinement(pending, false);
     }
 
@@ -866,28 +874,17 @@ public final class WorldgenSurfaceSampler {
             LodTileKey pending
     ) {
         for (WantedTile wanted : wantedTiles) {
-            if (wanted.key().equals(pending) || wanted.prefetch()) {
-                continue;
-            }
-            if (wanted.ring().lodLevel() == 1 && !wanted.foreground()) {
+            if (wanted.key().equals(pending)
+                    || wanted.prefetch()
+                    || wanted.ring().lodLevel() != 1
+                    || !wanted.foreground()) {
                 continue;
             }
 
-            int level = wanted.ring().lodLevel();
             WorldgenSurfaceTile tile = CACHE.get(wanted.key());
-
-            if (tile == null) {
-                continue;
-            }
-
-            if (level == 1
+            if (tile != null
                     && wanted.targetSpacing() <= L1_INTERMEDIATE_SPACING
                     && tile.sampleSpacing() > L1_INTERMEDIATE_SPACING) {
-                return wanted;
-            }
-
-            if (level == 2
-                    && tile.sampleSpacing() > wanted.ring().sampleSpacing()) {
                 return wanted;
             }
         }
