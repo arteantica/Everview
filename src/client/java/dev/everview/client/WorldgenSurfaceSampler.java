@@ -66,6 +66,7 @@ public final class WorldgenSurfaceSampler {
     private static final int MAX_PREDICTIVE_LEAD_BLOCKS = 1_536;
     private static final int PREDICTIVE_ANCHOR_QUANTUM = 64;
     private static final int REMAINING_COVERAGE_BURST = 8;
+    private static final int INITIAL_NEAR_HORIZON_BURST = 4;
     private static final int EXACT_GEOMETRY_BURST = 2;
     private static final int MAX_PROVISIONAL_EXACT_TILES = 8;
     private static final int L1_PREFETCH_BLOCKS = 64;
@@ -158,6 +159,7 @@ public final class WorldgenSurfaceSampler {
     private static long initialFillStartedNanos;
     private static long initialFillCompletedNanos;
     private static int balancedCoverageStep;
+    private static int initialNearHorizonBurstStep;
     private static int exactGeometryBurstStep;
 
     private static List<WorldgenLodRing> activeRings = List.of();
@@ -849,6 +851,7 @@ public final class WorldgenSurfaceSampler {
         initialFillStartedNanos = 0L;
         initialFillCompletedNanos = 0L;
         balancedCoverageStep = 0;
+        initialNearHorizonBurstStep = 0;
         exactGeometryBurstStep = 0;
         adaptiveSliceBudgetNanos = BASE_SLICE_BUDGET_NANOS;
         serverTickMs = 0.0;
@@ -1279,36 +1282,53 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        // -2) Normal loading starts with the inspectable near field. L1 sorts
-        // before L2 here, and completed L1 bootstrap tiles immediately become
-        // eligible for the detached exact 1-block workers.
-        if (!highSpeedCoverageMode) {
-            WantedTile nearFirst =
-                    firstMissingCurrentNearCoverage(pending);
-            if (nearFirst != null) {
+        // -2) Build exact-capable near coverage and the 16K horizon together.
+        // Four near tiles are streamed for every one L6 safety-floor tile, so
+        // 1-block L1 can begin almost immediately without leaving a blue/sky
+        // horizon for a minute while ~1,000 near tiles finish first.
+        WantedTile nearFirst = !highSpeedCoverageMode
+                ? firstMissingCurrentNearCoverage(pending)
+                : null;
+        WantedTile globalFloor =
+                firstMissingGlobalSafetyFloorCoverage(pending);
+
+        if (nearFirst != null && globalFloor != null) {
+            if (initialNearHorizonBurstStep
+                    < INITIAL_NEAR_HORIZON_BURST) {
+                initialNearHorizonBurstStep++;
                 balancedCoverageStep = 0;
                 return nearFirst;
             }
+
+            initialNearHorizonBurstStep = 0;
+            balancedCoverageStep = 0;
+            return globalFloor;
         }
 
-        // -1) High-speed travel still keeps local L3 first. At normal speed we
-        // fill the global L6 horizon before middle-distance polish so there is
-        // no blue/sky wall while the detailed cascade is still streaming.
+        if (nearFirst != null) {
+            initialNearHorizonBurstStep = 0;
+            balancedCoverageStep = 0;
+            return nearFirst;
+        }
+
+        // -1) High-speed travel still keeps local L3 first. Normal mode reaches
+        // this point after the current near field has no missing tile.
         WantedTile emergencyUnderlay =
                 firstMissingEmergencyUnderlayCoverage(pending);
         if (highSpeedCoverageMode && emergencyUnderlay != null) {
+            initialNearHorizonBurstStep = 0;
             balancedCoverageStep = 0;
             return emergencyUnderlay;
         }
 
-        WantedTile globalFloor =
-                firstMissingGlobalSafetyFloorCoverage(pending);
         if (globalFloor != null) {
+            initialNearHorizonBurstStep = 0;
             balancedCoverageStep = 0;
             return globalFloor;
         }
 
         if (emergencyUnderlay != null) {
+            initialNearHorizonBurstStep = 0;
             balancedCoverageStep = 0;
             return emergencyUnderlay;
         }
