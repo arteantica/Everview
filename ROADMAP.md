@@ -158,6 +158,6 @@
 - [ ] unified hierarchical ownership: vanilla > L1 > L2 > L3
 - [x] stage-priority scheduler: coverage > exact geometry > exact appearance
 - [x] cap provisional exact-geometry backlog so borrowed appearance cannot spread indefinitely
-- [ ] high-throughput exact L1 generation
+- [x] high-throughput exact L1 generation via two-worker height pipeline
 - [ ] remove coarse/green fallback slabs during finer ownership
 - [ ] integrated stress pass before first M4 test jar

@@ -21,6 +21,8 @@ import java.util.Map;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Budgeted progressive distant-worldgen sampler.
@@ -42,6 +44,7 @@ public final class WorldgenSurfaceSampler {
     public static final long BASE_SLICE_BUDGET_NANOS = 6_000_000L;
     public static final long MAX_SLICE_BUDGET_NANOS = 12_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 128;
+    private static final int EXACT_HEIGHT_WORKERS = 2;
 
     private static final int CACHE_LIMIT = 6_144;
     private static final int NEAR_RING_MAX_LEVEL = 2;
@@ -75,6 +78,18 @@ public final class WorldgenSurfaceSampler {
             new LinkedHashMap<>(512, 0.75F, true);
     private static final ConcurrentLinkedQueue<CompletedTile> COMPLETED =
             new ConcurrentLinkedQueue<>();
+    private static final ExecutorService EXACT_HEIGHT_EXECUTOR =
+            Executors.newFixedThreadPool(
+                    EXACT_HEIGHT_WORKERS,
+                    runnable -> {
+                        Thread thread = new Thread(
+                                runnable,
+                                "Everview-ExactHeight"
+                        );
+                        thread.setDaemon(true);
+                        return thread;
+                    }
+            );
 
     private static volatile WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSnapshot.EMPTY;
     private static volatile long activeSliceId;
@@ -373,7 +388,7 @@ public final class WorldgenSurfaceSampler {
         if (currentJob != null
                 && activeSliceId == 0L
                 && !containsWantedKey(currentJob.key)) {
-            currentJob = null;
+            cancelCurrentJob();
             staleJobsCancelled++;
         }
 
@@ -381,12 +396,12 @@ public final class WorldgenSurfaceSampler {
                 && activeSliceId == 0L
                 && highSpeedCoverageMode
                 && currentJob.refinement) {
-            currentJob = null;
+            cancelCurrentJob();
             staleJobsCancelled++;
         }
 
         if (currentJob != null && currentJob.failed && activeSliceId == 0L) {
-            currentJob = null;
+            cancelCurrentJob();
         }
 
         if (currentJob == null && activeSliceId == 0L) {
@@ -425,7 +440,10 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
-        if (currentJob != null && activeSliceId == 0L) {
+        if (currentJob != null
+                && activeSliceId == 0L
+                && (currentJob.asyncHeightFuture == null
+                        || currentJob.asyncHeightFuture.isDone())) {
             scheduleSlice(server, clientLevel.dimension(), currentJob);
         }
 
@@ -702,6 +720,13 @@ public final class WorldgenSurfaceSampler {
         return List.copyOf(rings);
     }
 
+    private static void cancelCurrentJob() {
+        if (currentJob != null && currentJob.asyncHeightFuture != null) {
+            currentJob.asyncHeightFuture.cancel(true);
+        }
+        currentJob = null;
+    }
+
     private static void reset() {
         scheduleDetachedSaveIfDirty();
         epoch++;
@@ -758,7 +783,7 @@ public final class WorldgenSurfaceSampler {
         diskSaveMs = 0.0;
         diskFileMiB = 0.0;
         diskCacheStatus = "OFF";
-        currentJob = null;
+        cancelCurrentJob();
         activeSliceId = 0L;
     }
 
@@ -1713,6 +1738,20 @@ public final class WorldgenSurfaceSampler {
         var generator = chunks.getGenerator();
         var randomState = chunks.randomState();
 
+        if (job.exactGeometryOnly
+                && job.sampleGrid != null
+                && job.sampleGrid.hasAnyAppearance()) {
+            runAsyncExactGeometry(
+                    level,
+                    generator,
+                    randomState,
+                    job,
+                    taskEpoch,
+                    sliceStart
+            );
+            return;
+        }
+
         int processed = 0;
         long sliceBudgetNanos = adaptiveSliceBudgetNanos;
 
@@ -1886,6 +1925,260 @@ public final class WorldgenSurfaceSampler {
 
         lastSliceSamples = processed;
         lastSliceMs = sliceElapsed / 1_000_000.0;
+    }
+
+    private static void runAsyncExactGeometry(
+            ServerLevel level,
+            net.minecraft.world.level.chunk.ChunkGenerator generator,
+            net.minecraft.world.level.levelgen.RandomState randomState,
+            GenerationJob job,
+            long taskEpoch,
+            long sliceStart
+    ) {
+        if (job.asyncHeightFuture == null) {
+            List<Integer> missing = new ArrayList<>();
+
+            for (int sampleIndex = 0;
+                    sampleIndex < job.totalSamples;
+                    sampleIndex++) {
+                int gx = sampleIndex % job.samplesAcross;
+                int gz = sampleIndex / job.samplesAcross;
+                int fineIndex = job.fineGridIndex(gx, gz);
+
+                if (fineIndex >= 0
+                        && job.sampleGrid.heightSampled[fineIndex]) {
+                    int y = job.sampleGrid.heights[fineIndex];
+                    job.heights[sampleIndex] = y;
+                    job.minY = Math.min(job.minY, y);
+                    job.maxY = Math.max(job.maxY, y);
+                    job.reusedSamples++;
+                } else {
+                    missing.add(sampleIndex);
+                }
+            }
+
+            int[] missingIndices = missing.stream()
+                    .mapToInt(Integer::intValue)
+                    .toArray();
+            job.asyncMissingSampleIndices = missingIndices;
+            job.asyncStartedNanos = System.nanoTime();
+
+            int split = (missingIndices.length + 1) / 2;
+            CompletableFuture<HeightPart> first = CompletableFuture.supplyAsync(
+                    () -> computeHeightPart(
+                            level,
+                            generator,
+                            randomState,
+                            job,
+                            missingIndices,
+                            0,
+                            split
+                    ),
+                    EXACT_HEIGHT_EXECUTOR
+            );
+            CompletableFuture<HeightPart> second = CompletableFuture.supplyAsync(
+                    () -> computeHeightPart(
+                            level,
+                            generator,
+                            randomState,
+                            job,
+                            missingIndices,
+                            split,
+                            missingIndices.length
+                    ),
+                    EXACT_HEIGHT_EXECUTOR
+            );
+
+            job.asyncHeightFuture = first.thenCombine(
+                    second,
+                    HeightBatchResult::combine
+            );
+
+            lastSliceSamples = 0;
+            lastSliceMs = (System.nanoTime() - sliceStart) / 1_000_000.0;
+            return;
+        }
+
+        if (!job.asyncHeightFuture.isDone()) {
+            lastSliceSamples = 0;
+            lastSliceMs = 0.0;
+            return;
+        }
+
+        HeightBatchResult result;
+        try {
+            result = job.asyncHeightFuture.join();
+        } catch (RuntimeException exception) {
+            job.failed = true;
+            EverviewClient.LOGGER.warn(
+                    "Everview async exact-height batch failed at {}, {}",
+                    job.key.tileX(),
+                    job.key.tileZ(),
+                    exception
+            );
+            return;
+        }
+
+        if (taskEpoch != epoch || job != currentJob) {
+            return;
+        }
+
+        for (int i = 0; i < result.sampleIndices().length; i++) {
+            int sampleIndex = result.sampleIndices()[i];
+            int y = result.heights()[i];
+            int gx = sampleIndex % job.samplesAcross;
+            int gz = sampleIndex / job.samplesAcross;
+            int fineIndex = job.fineGridIndex(gx, gz);
+
+            job.heights[sampleIndex] = y;
+            if (fineIndex >= 0) {
+                job.sampleGrid.heights[fineIndex] = y;
+                job.sampleGrid.heightSampled[fineIndex] = true;
+            }
+            job.minY = Math.min(job.minY, y);
+            job.maxY = Math.max(job.maxY, y);
+            job.generatedSamples++;
+        }
+
+        // Fill temporary/exact appearance only after all heights are ready.
+        // This loop performs no height worldgen calls.
+        for (int sampleIndex = 0;
+                sampleIndex < job.totalSamples;
+                sampleIndex++) {
+            int gx = sampleIndex % job.samplesAcross;
+            int gz = sampleIndex / job.samplesAcross;
+            int worldX = job.originX + gx;
+            int worldZ = job.originZ + gz;
+            int fineIndex = job.fineGridIndex(gx, gz);
+
+            if (fineIndex >= 0
+                    && job.sampleGrid.appearanceSampled[fineIndex]) {
+                job.sampleColors[sampleIndex] =
+                        job.sampleGrid.colors[fineIndex];
+                job.sampleMaterials[sampleIndex] =
+                        job.sampleGrid.materials[fineIndex];
+                continue;
+            }
+
+            int borrowed = job.sampleGrid.nearestAppearanceIndex(gx, gz);
+            if (borrowed >= 0) {
+                job.sampleColors[sampleIndex] =
+                        job.sampleGrid.colors[borrowed];
+                job.sampleMaterials[sampleIndex] =
+                        job.sampleGrid.materials[borrowed];
+                job.sampleGrid.requiresAppearanceRefinement = true;
+                job.provisionalAppearanceSamples++;
+                continue;
+            }
+
+            int y = job.heights[sampleIndex];
+            var biome = level.getNoiseBiome(
+                    worldX >> 2,
+                    y >> 2,
+                    worldZ >> 2
+            );
+            var appearance = MinecraftSurfacePalette.sample(
+                    biome,
+                    worldX,
+                    y,
+                    worldZ,
+                    level.getSeaLevel()
+            );
+            job.sampleColors[sampleIndex] = appearance.rgb();
+            job.sampleMaterials[sampleIndex] = appearance.material();
+            if (fineIndex >= 0) {
+                job.sampleGrid.colors[fineIndex] = appearance.rgb();
+                job.sampleGrid.materials[fineIndex] =
+                        appearance.material();
+                job.sampleGrid.appearanceSampled[fineIndex] = true;
+            }
+            job.appearanceGeneratedSamples++;
+        }
+
+        job.nextSample = job.totalSamples;
+        job.accumulatedNanos += System.nanoTime() - job.asyncStartedNanos;
+
+        long meshStart = System.nanoTime();
+        MeshData mesh = buildMesh(job, level.getSeaLevel());
+        job.accumulatedNanos += System.nanoTime() - meshStart;
+
+        WorldgenTileStage tileStage =
+                job.sampleGrid.requiresAppearanceRefinement
+                        ? WorldgenTileStage.EXACT_GEOMETRY
+                        : WorldgenTileStage.EXACT_APPEARANCE;
+
+        WorldgenSurfaceTile tile = new WorldgenSurfaceTile(
+                job.ring.lodLevel(),
+                job.key.tileX(),
+                job.key.tileZ(),
+                job.ring.tileSize(),
+                job.sampleSpacing,
+                tileStage,
+                mesh.vertices(),
+                mesh.colors(),
+                mesh.materials(),
+                mesh.quadCount(),
+                job.minY,
+                job.maxY,
+                level.getSeaLevel(),
+                job.accumulatedNanos
+        );
+
+        COMPLETED.add(new CompletedTile(
+                taskEpoch,
+                job.key,
+                tile,
+                job.reusedSamples,
+                job.generatedSamples,
+                job.appearanceGeneratedSamples,
+                job.provisionalAppearanceSamples
+        ));
+
+        lastSliceSamples = result.sampleIndices().length;
+        lastSliceMs = (System.nanoTime() - sliceStart) / 1_000_000.0;
+    }
+
+    private static HeightPart computeHeightPart(
+            ServerLevel level,
+            net.minecraft.world.level.chunk.ChunkGenerator generator,
+            net.minecraft.world.level.levelgen.RandomState randomState,
+            GenerationJob job,
+            int[] sampleIndices,
+            int start,
+            int end
+    ) {
+        int count = Math.max(0, end - start);
+        int[] indices = new int[count];
+        int[] heights = new int[count];
+
+        for (int i = 0; i < count; i++) {
+            if (Thread.currentThread().isInterrupted()) {
+                return new HeightPart(
+                        Arrays.copyOf(indices, i),
+                        Arrays.copyOf(heights, i)
+                );
+            }
+
+            int sampleIndex = sampleIndices[start + i];
+            int gx = sampleIndex % job.samplesAcross;
+            int gz = sampleIndex / job.samplesAcross;
+            int worldX = job.originX + gx;
+            int worldZ = job.originZ + gz;
+
+            int y = generator.getBaseHeight(
+                    worldX,
+                    worldZ,
+                    Heightmap.Types.WORLD_SURFACE_WG,
+                    level,
+                    randomState
+            );
+            y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
+
+            indices[i] = sampleIndex;
+            heights[i] = y;
+        }
+
+        return new HeightPart(indices, heights);
     }
 
     private static MeshData buildMesh(GenerationJob job, int seaLevel) {
@@ -2908,6 +3201,9 @@ public final class WorldgenSurfaceSampler {
         private int generatedSamples;
         private int appearanceGeneratedSamples;
         private int provisionalAppearanceSamples;
+        private CompletableFuture<HeightBatchResult> asyncHeightFuture;
+        private int[] asyncMissingSampleIndices = new int[0];
+        private long asyncStartedNanos;
         private volatile boolean failed;
         private int minY = Integer.MAX_VALUE;
         private int maxY = Integer.MIN_VALUE;
@@ -2994,6 +3290,15 @@ public final class WorldgenSurfaceSampler {
             this.appearanceSampled = new boolean[total];
         }
 
+        private boolean hasAnyAppearance() {
+            for (boolean sampled : appearanceSampled) {
+                if (sampled) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         private int nearestAppearanceIndex(int x, int z) {
             int clampedX = Math.max(0, Math.min(samplesAcross - 1, x));
             int clampedZ = Math.max(0, Math.min(samplesAcross - 1, z));
@@ -3029,6 +3334,50 @@ public final class WorldgenSurfaceSampler {
             }
 
             return -1;
+        }
+    }
+
+    private record HeightPart(
+            int[] sampleIndices,
+            int[] heights
+    ) {
+    }
+
+    private record HeightBatchResult(
+            int[] sampleIndices,
+            int[] heights
+    ) {
+        private static HeightBatchResult combine(
+                HeightPart first,
+                HeightPart second
+        ) {
+            int firstCount = first.sampleIndices().length;
+            int secondCount = second.sampleIndices().length;
+            int[] indices = Arrays.copyOf(
+                    first.sampleIndices(),
+                    firstCount + secondCount
+            );
+            int[] heights = Arrays.copyOf(
+                    first.heights(),
+                    firstCount + secondCount
+            );
+
+            System.arraycopy(
+                    second.sampleIndices(),
+                    0,
+                    indices,
+                    firstCount,
+                    secondCount
+            );
+            System.arraycopy(
+                    second.heights(),
+                    0,
+                    heights,
+                    firstCount,
+                    secondCount
+            );
+
+            return new HeightBatchResult(indices, heights);
         }
     }
 
