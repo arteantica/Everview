@@ -4,6 +4,7 @@ import com.mojang.renderpearl.api.commands.RenderPass;
 import dev.everview.client.EverviewRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
+import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
 import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -33,5 +34,18 @@ public abstract class LevelRendererMixin {
             CallbackInfo ci
     ) {
         EverviewRenderer.drawPersistentTerrain(renderPass);
+    }
+
+    @Inject(
+            method = "addRecentlyCompiledSection",
+            at = @At("HEAD")
+    )
+    private void everview$noteRecentlyCompiledSection(
+            SectionRenderDispatcher.RenderSection section,
+            CallbackInfo ci
+    ) {
+        EverviewRenderer.noteRecentlyCompiledSection(
+                section.getRenderOrigin()
+        );
     }
 }

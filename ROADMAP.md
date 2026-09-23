@@ -96,6 +96,7 @@
 - [x] suppress handoff boundary walls when either adjacent vanilla section is renderer-visible
 - [x] split tall near-LOD vertical faces at vanilla 16-block section boundaries
 - [x] surface-column handoff ownership with +/-1 renderer-visible Y-section tolerance
+- [x] early top-face handoff from recently compiled vanilla render sections with expiring fallback-safe hints
 - [ ] block-faithful 2-block intermediate geometry
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] screen-space error driven detail selection

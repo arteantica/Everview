@@ -8,6 +8,7 @@ import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4f;
@@ -20,10 +21,10 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * M3.7.4.5 persistent-GPU distant terrain renderer. Near LOD geometry stays
- * permanently resident; horizontal surface batches use renderer-visible
- * chunk-column ownership with +/-1 section tolerance while section-split walls
- * retain strict ownership.
+ * M3.7.4.6 persistent-GPU distant terrain renderer. Near LOD geometry stays
+ * permanently resident. Horizontal surface batches still use renderer-visible
+ * chunk-column ownership, but freshly compiled vanilla sections now provide a
+ * short early-handoff hint before the visibility list catches up.
  *
  * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
  * Minecraft's opaque terrain RenderPass is still open. Everview therefore
@@ -39,6 +40,11 @@ public final class EverviewRenderer {
     // distant terrain visibly sink at ring boundaries.
     private static final double BASE_TERRAIN_BIAS = 0.22D;
     private static final double RING_LAYER_BIAS = 0.06D;
+    private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
+
+    private static final Map<SectionKey, Long> RECENTLY_COMPILED_SECTIONS =
+            new HashMap<>();
+    private static ClientLevel compileHintLevel;
 
     private EverviewRenderer() {
     }
@@ -70,6 +76,12 @@ public final class EverviewRenderer {
         if (client.level == null || client.player == null || !camera.isInitialized()) {
             return;
         }
+
+        if (client.level != compileHintLevel) {
+            RECENTLY_COMPILED_SECTIONS.clear();
+            compileHintLevel = client.level;
+        }
+        pruneCompileHints();
 
         WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
         if (snapshot.tiles().isEmpty()) {
@@ -215,6 +227,41 @@ public final class EverviewRenderer {
         }
     }
 
+    public static void noteRecentlyCompiledSection(BlockPos origin) {
+        int chunkX = Math.floorDiv(origin.getX(), 16);
+        int sectionY = Math.floorDiv(origin.getY(), 16);
+        int chunkZ = Math.floorDiv(origin.getZ(), 16);
+
+        RECENTLY_COMPILED_SECTIONS.put(
+                new SectionKey(chunkX, sectionY, chunkZ),
+                System.nanoTime()
+        );
+    }
+
+    private static void pruneCompileHints() {
+        if (RECENTLY_COMPILED_SECTIONS.isEmpty()) {
+            return;
+        }
+
+        long now = System.nanoTime();
+        RECENTLY_COMPILED_SECTIONS.entrySet().removeIf(
+                entry -> now - entry.getValue() > RECENT_COMPILE_HINT_NANOS
+        );
+    }
+
+    private static boolean recentlyCompiledSection(
+            int chunkX,
+            int sectionY,
+            int chunkZ
+    ) {
+        Long compiledAt = RECENTLY_COMPILED_SECTIONS.get(
+                new SectionKey(chunkX, sectionY, chunkZ)
+        );
+
+        return compiledAt != null
+                && System.nanoTime() - compiledAt <= RECENT_COMPILE_HINT_NANOS;
+    }
+
     private static boolean vanillaOwnsBatch(
             Minecraft client,
             EverviewGpuTileCache.DrawBatch batch,
@@ -264,10 +311,8 @@ public final class EverviewRenderer {
             Map<SectionKey, Boolean> visibility
     ) {
         // LOD/worldgen surface height and the vanilla rendered surface can land
-        // on opposite sides of a 16-block section boundary. Treat the same
-        // chunk column as vanilla-owned when terrain is renderer-visible in
-        // the target section or one section above/below. This removes bright
-        // LOD top patches without using a broad distance/loaded-chunk guess.
+        // on opposite sides of a 16-block section boundary. Keep the proven
+        // +/-1 visible-section rule first.
         for (int offset = -1; offset <= 1; offset++) {
             if (vanillaSectionVisible(
                     client,
@@ -275,6 +320,22 @@ public final class EverviewRenderer {
                     sectionY + offset,
                     chunkZ,
                     visibility
+            )) {
+                return true;
+            }
+        }
+
+        // M3.7.4.6: LevelRenderer reports a section to
+        // addRecentlyCompiledSection() slightly before its visibility list
+        // necessarily reflects it. Use that exact renderer compile event as a
+        // short-lived early-ownership hint for TOP faces only. The hint expires
+        // automatically, so if vanilla never becomes visible the persistent
+        // Everview fallback returns instead of leaving a stale hole.
+        for (int offset = -1; offset <= 1; offset++) {
+            if (recentlyCompiledSection(
+                    chunkX,
+                    sectionY + offset,
+                    chunkZ
             )) {
                 return true;
             }
