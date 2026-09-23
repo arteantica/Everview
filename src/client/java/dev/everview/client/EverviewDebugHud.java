@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M6.0 DEV | MINECRAFT SURFACE FIDELITY");
+        lines.add("Everview M6.1 DEV | PROGRESSIVE FIDELITY CASCADE");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Visual: corrected world-space heights | flat Minecraft-material facets");
-        lines.add("Targets: L3 16b | L4 32b | L5 64b | L6 128b | M5.6 handoff retained");
+        lines.add("Visual: L3 -> L4 -> L5 -> L6 cascade | vanilla world fog OFF");
+        lines.add("Settled targets: L3 8b | L4 16b | L5 32b | L6 64b");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),

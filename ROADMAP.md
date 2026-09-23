@@ -266,3 +266,16 @@
 - [ ] add true block-atlas texturing / surface-rule reconstruction for near LODs
 - [ ] add vegetation/trees as a separate distant feature layer
 - [ ] validate L3-L6 visual distinction, shorelines, mountains, badlands and frozen biomes
+
+
+## M6.1 progressive fidelity cascade
+- [x] make L4 and L5 real normal-speed streaming stages instead of starving at 0 while L3/L6 dominate
+- [x] settle far detail at L3 8b / L4 16b / L5 32b / L6 64b
+- [x] keep first-fill bootstrap at 16b / 32b / 64b / 128b for coverage speed
+- [x] add an explicit far-fidelity refinement lane before exact L1 appearance monopolizes idle work
+- [x] preserve M5.6 high-speed safety scheduling
+- [x] disable vanilla WORLD distance fog by routing the terrain fog uniform to FogMode.NONE
+- [x] invalidate M6.0 disk tiles with cache v22
+- [ ] validate that L4/L5 populate during initial load and green L3 islands no longer jump directly over L6
+- [ ] validate clear 16K horizon with world fog disabled
+- [ ] begin block-atlas/UV surface texturing after hierarchy quality is stable

@@ -789,14 +789,13 @@ public final class WorldgenSurfaceSampler {
                 emergencyInnerRadius,
                 2_048,
                 256,
-                16
+                8
         ));
-        // M6.0 gives every distant level a visibly different target density.
-        // L4-L6 still bootstrap at 2x spacing for coverage speed, then refine
-        // to these targets after the world is solid.
-        rings.add(new WorldgenLodRing(4, 0, 4_096, 512, 32));
-        rings.add(new WorldgenLodRing(5, 0, 8_192, 1_024, 64));
-        rings.add(new WorldgenLodRing(6, 0, 16_384, 2_048, 128));
+        // M6.1: coverage still starts at 2x these targets, but the settled
+        // distance ladder now has visibly different detail at every level.
+        rings.add(new WorldgenLodRing(4, 0, 4_096, 512, 16));
+        rings.add(new WorldgenLodRing(5, 0, 8_192, 1_024, 32));
+        rings.add(new WorldgenLodRing(6, 0, 16_384, 2_048, 64));
 
         return List.copyOf(rings);
     }
@@ -1269,14 +1268,6 @@ public final class WorldgenSurfaceSampler {
             return target;
         }
 
-        if (existing == null
-                && ring.lodLevel() == EMERGENCY_UNDERLAY_LEVEL) {
-            // The emergency floor is actually visible during movement. A 64b
-            // bootstrap looked like a giant square "hole" even though geometry
-            // was present. Generate L3 directly at its 32b target spacing.
-            return ring.sampleSpacing();
-        }
-
         return existing == null
                 ? Math.min(ring.tileSize(), ring.sampleSpacing() * 2)
                 : ring.sampleSpacing();
@@ -1285,9 +1276,9 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        // -1) Keep the local/predictive L3 safety floor solid before chasing
-        // newly exposed far-edge L6 tiles. M5.5 rebuilt the giant coarse patch
-        // under the camera whenever movement outran local fallback streaming.
+        // -1) Keep the local/predictive L3 safety floor available for the
+        // vanilla handoff. At normal speed it is only the first coarse stage;
+        // later refinement is deliberately deferred until L4/L5 exist.
         WantedTile emergencyUnderlay =
                 firstMissingEmergencyUnderlayCoverage(pending);
         if (emergencyUnderlay != null) {
@@ -1295,9 +1286,22 @@ public final class WorldgenSurfaceSampler {
             return emergencyUnderlay;
         }
 
-        // 0) Once the local 0-2K floor is safe, extend/repair the 0-16K L6
-        // world-scale floor. This retains global continuity without sacrificing
-        // the area the player is actually flying over.
+        // 0) M6.0's HUD exposed the real visual problem: L3 and L6 could be
+        // complete while L4/L5 remained at 0. That made finer green L3 islands
+        // appear directly on top of a very coarse L6 world. Normal-speed
+        // loading now fills the missing visual cascade before near-detail work.
+        if (!highSpeedCoverageMode) {
+            WantedTile progressiveFar =
+                    firstMissingProgressiveFarCoverage(pending);
+            if (progressiveFar != null) {
+                balancedCoverageStep = 0;
+                return progressiveFar;
+            }
+        }
+
+        // 1) The full L6 world floor remains the high-speed/no-hole guarantee.
+        // During normal loading it follows the L4/L5 cascade so nearby terrain
+        // reaches useful quality before the full 16K disk consumes the queue.
         WantedTile globalFloor =
                 firstMissingGlobalSafetyFloorCoverage(pending);
         if (globalFloor != null) {
@@ -1305,7 +1309,7 @@ public final class WorldgenSurfaceSampler {
             return globalFloor;
         }
 
-        // 1) Detached exact geometry is allowed to run beside coverage, but
+        // 2) Detached exact geometry is allowed to run beside coverage, but
         // once its provisional backlog reaches the cap the server lane spends
         // enough time on appearance to stop temporary green exact tiles from
         // spreading indefinitely.
@@ -1319,7 +1323,7 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
-        // 2) Near detail is useful only after continuity exists. In high-speed
+        // 3) Near detail is useful only after continuity exists. In high-speed
         // coverage mode both L1 and L2 are deferred: L3-L6 bootstrap coverage
         // gets the world solid first, then near detail catches up after slowing.
         WantedTile nearCoverage =
@@ -1329,7 +1333,7 @@ public final class WorldgenSurfaceSampler {
             return nearCoverage;
         }
 
-        // 2) Once the immediate near field is continuous, warm the travel
+        // 4) Once the immediate near field is continuous, warm the travel
         // corridor. L2 safety tiles sort before L1 bootstrap within each band.
         WantedTile predictiveCoverage =
                 firstMissingPredictiveCoverage(pending);
@@ -1338,7 +1342,7 @@ public final class WorldgenSurfaceSampler {
             return predictiveCoverage;
         }
 
-        // 3) At extreme speed, keep the next near guard warm before caring
+        // 5) At extreme speed, keep the next near guard warm before caring
         // about distant horizon coverage or any refinement.
         WantedTile nearGuard =
                 firstMissingNearGuardCoverage(pending);
@@ -1347,7 +1351,7 @@ public final class WorldgenSurfaceSampler {
             return nearGuard;
         }
 
-        // 4) Remaining visible coverage now expands strictly outward through
+        // 6) Remaining visible coverage now expands strictly outward through
         // L3/L4/L5/L6 instead of being interleaved inward/outward.
         WantedTile remainingVisible =
                 firstMissingCurrentFarCoverage(pending);
@@ -1364,7 +1368,7 @@ public final class WorldgenSurfaceSampler {
                     : firstMissingOtherGuardCoverage(pending);
         }
 
-        // 5) Normal-speed quality work is an explicit staged pipeline:
+        // 7) Normal-speed quality work is an explicit staged pipeline:
         // exact geometry is allowed to lead, but never by more than a small
         // bounded backlog before exact appearance is forced to catch up.
         WantedTile qualityWork = selectQualityWork(pending);
@@ -1394,6 +1398,28 @@ public final class WorldgenSurfaceSampler {
         if (qualityWork != null) {
             balancedCoverageStep = 0;
             return qualityWork;
+        }
+
+        return null;
+    }
+
+    private static WantedTile firstMissingProgressiveFarCoverage(
+            LodTileKey pending
+    ) {
+        // Fill L4 first (0-4K), then L5 (0-8K). L3 already exists as the
+        // immediate safety surface and L6 remains the global emergency floor.
+        for (int level = 4; level <= 5; level++) {
+            for (WantedTile wanted : wantedTiles) {
+                if (wanted.key().equals(pending)
+                        || wanted.prefetch()
+                        || wanted.ring().lodLevel() != level) {
+                    continue;
+                }
+
+                if (!CACHE.containsKey(wanted.key())) {
+                    return wanted;
+                }
+            }
         }
 
         return null;
@@ -1677,6 +1703,15 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile selectQualityWork(
             LodTileKey pending
     ) {
+        // M6.1 gives distant fidelity a real refinement lane. Refine L3 -> L6
+        // to their settled targets before spending the whole idle budget on
+        // exact L1 appearance. This is what makes "beyond L1/L2" actually
+        // become progressively different instead of staying bootstrap-quality.
+        WantedTile farRefinement = firstFarFidelityRefinement(pending);
+        if (farRefinement != null) {
+            return farRefinement;
+        }
+
         WantedTile exactGeometry = firstExactBandRefinement(pending);
         WantedTile exactAppearance =
                 firstExactAppearanceRefinement(pending);
@@ -1719,6 +1754,29 @@ public final class WorldgenSurfaceSampler {
         }
 
         return firstRefinement(pending, false);
+    }
+
+    private static WantedTile firstFarFidelityRefinement(
+            LodTileKey pending
+    ) {
+        for (int level = 3; level <= 6; level++) {
+            for (WantedTile wanted : wantedTiles) {
+                if (wanted.key().equals(pending)
+                        || wanted.prefetch()
+                        || wanted.ring().lodLevel() != level) {
+                    continue;
+                }
+
+                WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+                if (tile != null
+                        && tile.sampleSpacing()
+                                > wanted.ring().sampleSpacing()) {
+                    return wanted;
+                }
+            }
+        }
+
+        return null;
     }
 
     private static int provisionalExactTileCount() {

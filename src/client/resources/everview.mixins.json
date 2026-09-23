@@ -3,6 +3,7 @@
   "package": "dev.everview.mixin.client",
   "client": [
     "CameraFarPlaneMixin",
+    "GameRendererMixin",
     "LevelRendererMixin",
     "RenderSectionMixin"
   ],
