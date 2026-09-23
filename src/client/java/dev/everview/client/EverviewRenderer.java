@@ -23,9 +23,11 @@ import java.util.Set;
 /**
  * M4 unified hierarchical ownership renderer.
  *
- * M5 hard column ownership: vanilla owns complete loaded chunk columns deep
- * inside its render radius, while the outer fringe still requires renderer
- * visibility before handoff. L1/L2/L3 all use the same ownership mask. L2 no longer disappears as an all-or-nothing
+ * M5.2 render-ready column ownership: vanilla owns a chunk column only after
+ * Minecraft's renderer reports actual compiled-and-visible terrain in that
+ * column. A merely loaded client chunk is not enough to retire Everview, so
+ * LOD remains underneath while vanilla catches up during high-speed travel.
+ * L1/L2/L3 all use the same ownership mask. L2 no longer disappears as an all-or-nothing
  * 128-block tile; each section batch retires as its corresponding 32-block L1
  * tile becomes GPU-resident. L3 keeps its per-L2-region fallback. All masks
  * coalesce adjacent visible ranges before submission.
@@ -46,13 +48,11 @@ public final class EverviewRenderer {
     private static final double RING_LAYER_BIAS = 0.06D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
     private static final double VANILLA_OWNERSHIP_MARGIN_BLOCKS = 64.0D;
-    private static final double DEEP_VANILLA_GUARD_BLOCKS = 96.0D;
-    private static final int EARLY_HANDOFF_VISIBLE_NEIGHBOR_SECTIONS = 2;
 
     private static int lastVanillaOwnedBatches;
     private static int lastFinerOwnedBatches;
     private static int lastVisibleLodBatches;
-    private static int lastDeepLoadedClaims;
+    private static int lastLoadedWaitingBatches;
 
     private static final Map<SectionKey, Long> RECENTLY_COMPILED_SECTIONS =
             new HashMap<>();
@@ -121,11 +121,11 @@ public final class EverviewRenderer {
         Set<Long> residentL1Tiles = new HashSet<>();
         Set<Long> residentL2Tiles = new HashSet<>();
         Map<SectionKey, Boolean> vanillaVisibility = new HashMap<>();
-        Map<ChunkKey, Boolean> vanillaColumns = new HashMap<>();
+        Map<ChunkKey, ColumnOwnershipResult> vanillaColumns = new HashMap<>();
         int vanillaOwnedBatches = 0;
         int finerOwnedBatches = 0;
         int visibleLodBatches = 0;
-        int deepLoadedClaims = 0;
+        int loadedWaitingBatches = 0;
         double vanillaRadius =
                 client.options.getEffectiveRenderDistance() * 16.0D;
 
@@ -286,10 +286,7 @@ public final class EverviewRenderer {
                                             client,
                                             batch,
                                             vanillaVisibility,
-                                            vanillaColumns,
-                                            cameraX,
-                                            cameraZ,
-                                            vanillaRadius
+                                            vanillaColumns
                                     )
                                     : ColumnOwnershipResult.NOT_OWNED;
                     boolean ownedByVanilla = vanillaResult.owned();
@@ -299,9 +296,9 @@ public final class EverviewRenderer {
                     }
                     if (ownedByVanilla) {
                         vanillaOwnedBatches++;
-                        if (vanillaResult.deepLoaded()) {
-                            deepLoadedClaims++;
-                        }
+                    }
+                    if (vanillaResult.loadedWaiting()) {
+                        loadedWaitingBatches++;
                     }
 
                     if (ownedByFinerLod || ownedByVanilla) {
@@ -402,7 +399,7 @@ public final class EverviewRenderer {
         lastVanillaOwnedBatches = vanillaOwnedBatches;
         lastFinerOwnedBatches = finerOwnedBatches;
         lastVisibleLodBatches = visibleLodBatches;
-        lastDeepLoadedClaims = deepLoadedClaims;
+        lastLoadedWaitingBatches = loadedWaitingBatches;
     }
 
     public static OwnershipStats ownershipStats() {
@@ -410,7 +407,7 @@ public final class EverviewRenderer {
                 lastVanillaOwnedBatches,
                 lastFinerOwnedBatches,
                 lastVisibleLodBatches,
-                lastDeepLoadedClaims
+                lastLoadedWaitingBatches
         );
     }
 
@@ -478,10 +475,7 @@ public final class EverviewRenderer {
             Minecraft client,
             EverviewGpuTileCache.DrawBatch batch,
             Map<SectionKey, Boolean> visibility,
-            Map<ChunkKey, Boolean> columns,
-            double cameraX,
-            double cameraZ,
-            double vanillaRadius
+            Map<ChunkKey, ColumnOwnershipResult> columns
     ) {
         ColumnOwnershipResult aOwned = vanillaChunkColumnOwned(
                 client,
@@ -489,10 +483,7 @@ public final class EverviewRenderer {
                 batch.sectionY(),
                 batch.chunkAZ(),
                 visibility,
-                columns,
-                cameraX,
-                cameraZ,
-                vanillaRadius
+                columns
         );
 
         if (!batch.boundary()) {
@@ -505,15 +496,12 @@ public final class EverviewRenderer {
                 batch.sectionY(),
                 batch.chunkBZ(),
                 visibility,
-                columns,
-                cameraX,
-                cameraZ,
-                vanillaRadius
+                columns
         );
 
         return new ColumnOwnershipResult(
                 aOwned.owned() || bOwned.owned(),
-                aOwned.deepLoaded() || bOwned.deepLoaded()
+                aOwned.loadedWaiting() || bOwned.loadedWaiting()
         );
     }
 
@@ -523,37 +511,18 @@ public final class EverviewRenderer {
             int hintSectionY,
             int chunkZ,
             Map<SectionKey, Boolean> visibility,
-            Map<ChunkKey, Boolean> columns,
-            double cameraX,
-            double cameraZ,
-            double vanillaRadius
+            Map<ChunkKey, ColumnOwnershipResult> columns
     ) {
         ChunkKey key = new ChunkKey(chunkX, chunkZ);
-        Boolean cached = columns.get(key);
+        ColumnOwnershipResult cached = columns.get(key);
         if (cached != null) {
-            return new ColumnOwnershipResult(cached, false);
+            return cached;
         }
 
-        double chunkCenterX = chunkX * 16.0D + 8.0D;
-        double chunkCenterZ = chunkZ * 16.0D + 8.0D;
-        double distance = Math.hypot(
-                chunkCenterX - cameraX,
-                chunkCenterZ - cameraZ
-        );
-
-        boolean deepInsideVanilla = distance
-                <= Math.max(
-                        0.0D,
-                        vanillaRadius - DEEP_VANILLA_GUARD_BLOCKS
-                );
-
-        if (deepInsideVanilla
-                && client.level != null
-                && client.level.hasChunk(chunkX, chunkZ)) {
-            columns.put(key, true);
-            return new ColumnOwnershipResult(true, true);
-        }
-
+        // M5.2: client chunk presence is not a handoff signal. At high travel
+        // speed Minecraft can have the chunk loaded before its terrain is
+        // actually compiled, uploaded and visible. Retiring Everview at that
+        // point exposes a sky/white hole inside the nominal vanilla radius.
         boolean visible = vanillaSurfaceColumnVisible(
                 client,
                 chunkX,
@@ -561,8 +530,14 @@ public final class EverviewRenderer {
                 chunkZ,
                 visibility
         );
-        columns.put(key, visible);
-        return new ColumnOwnershipResult(visible, false);
+        boolean loaded = client.level != null
+                && client.level.hasChunk(chunkX, chunkZ);
+
+        ColumnOwnershipResult result = visible
+                ? new ColumnOwnershipResult(true, false)
+                : new ColumnOwnershipResult(false, loaded);
+        columns.put(key, result);
+        return result;
     }
 
     private static boolean vanillaSurfaceColumnVisible(
@@ -585,7 +560,7 @@ public final class EverviewRenderer {
             }
         }
 
-        // M5.1: ownership belongs to the chunk column, not to the guessed LOD
+        // M5.1/M5.2: ownership belongs to the chunk column, not to the guessed LOD
         // surface section. Scan the rest of a generous vertical column so
         // oceans, cliffs, overhangs and large height mismatches cannot leave
         // an already-rendered vanilla column exposed to Everview.
@@ -668,13 +643,13 @@ public final class EverviewRenderer {
             int vanillaOwnedBatches,
             int finerOwnedBatches,
             int visibleLodBatches,
-            int deepLoadedClaims
+            int loadedWaitingBatches
     ) {
     }
 
     private record ColumnOwnershipResult(
             boolean owned,
-            boolean deepLoaded
+            boolean loadedWaiting
     ) {
         private static final ColumnOwnershipResult NOT_OWNED =
                 new ColumnOwnershipResult(false, false);

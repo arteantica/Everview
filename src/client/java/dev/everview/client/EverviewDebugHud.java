@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M5.1 DEV | CHUNK-SPLIT SURFACE OWNERSHIP");
+        lines.add("Everview M5.2 DEV | RENDER-READY COLUMN HANDOFF");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Render: merged handoff ranges | uploads yield only after same-column vanilla is visible");
-        lines.add("Ownership: all terrain tops chunk-split | vanilla columns > L1 > L2 > L3");
+        lines.add("Render: merged handoff ranges | loaded vanilla keeps LOD until renderer-ready");
+        lines.add("Ownership: renderer-ready vanilla columns > L1 > L2 > L3 | chunk-split surfaces");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
@@ -260,11 +260,11 @@ public final class EverviewDebugHud {
         EverviewRenderer.OwnershipStats ownership =
                 EverviewRenderer.ownershipStats();
         lines.add(String.format(
-                "Ownership mask: vanilla %d | finer %d | LOD visible %d | deep claims %d",
+                "Ownership mask: vanilla %d | finer %d | LOD visible %d | loaded waiting %d",
                 ownership.vanillaOwnedBatches(),
                 ownership.finerOwnedBatches(),
                 ownership.visibleLodBatches(),
-                ownership.deepLoadedClaims()
+                ownership.loadedWaitingBatches()
         ));
 
         EverviewGpuTileCache.Stats gpu = EverviewGpuTileCache.stats();

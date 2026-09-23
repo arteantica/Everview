@@ -201,3 +201,12 @@
 - [x] bilinearly preserve height and color across split smooth-surface pieces
 - [x] scan the whole vertical chunk column at the handoff fringe instead of only +/-2 LOD sections
 - [x] eliminate the BatchKey.ALWAYS escape path for normal sloped terrain tops
+
+
+## M5.2 render-ready column handoff
+- [x] remove the deep-radius "loaded chunk wins" ownership shortcut
+- [x] require actual renderer-visible vanilla terrain before retiring Everview in every chunk column
+- [x] keep Everview underneath loaded-but-not-rendered vanilla during high-speed travel
+- [x] cache full per-frame column ownership state instead of only a boolean claim
+- [x] expose loaded-but-waiting fallback batches in the debug HUD
+- [ ] stress-test x12 FlySpeed handoff, land/ocean transitions, and rapid direction reversal
