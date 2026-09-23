@@ -91,6 +91,7 @@
 - [x] layered grass-column side walls: shallow dirt over stone
 - [x] early exact-L1 refinement: interleave 2 intermediate upgrades per 1 exact upgrade
 - [x] exact-band-first refinement: complete nearest inner-64b tiles to 1b before wider 2b work
+- [x] contiguous radial L1 ownership: tile intersection promotes the full inner belt to 1b
 - [ ] block-faithful 2-block intermediate geometry
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] screen-space error driven detail selection

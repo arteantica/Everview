@@ -27,10 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.7.2 concentrates exact detail into a continuous inner belt. After front
- * coverage/guard, the nearest exact-band tile is driven all the way 4b->2b->1b
- * before moving outward. Only after that 64-block exact band is complete does
- * the scheduler spend quality work on the wider 2-block intermediate band.
+ * M3.7.3 makes the inner exact belt spatially contiguous instead of assigning
+ * quality from 32x32 tile centers. Any visible L1 tile intersecting the inner
+ * 64-block annulus now targets 1b; tiles intersecting the next 64 blocks target
+ * 2b. This prevents coarse 2b/4b islands from appearing closer than exact L1.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -613,22 +613,40 @@ public final class WorldgenSurfaceSampler {
                         if (!visibleNow) {
                             targetSpacing = L1_BOOTSTRAP_SPACING;
                         } else {
-                            double centerDistance = Math.sqrt(
-                                    tileCenterDistanceSq(
-                                            key,
-                                            ring,
-                                            centerX,
-                                            centerZ
-                                    )
+                            int exactOuter = Math.min(
+                                    ring.outerRadiusBlocks(),
+                                    ring.innerRadiusBlocks() + L1_EXACT_BAND_BLOCKS
                             );
-                            double intoL1 = Math.max(
-                                    0.0,
-                                    centerDistance - ring.innerRadiusBlocks()
+                            int intermediateOuter = Math.min(
+                                    ring.outerRadiusBlocks(),
+                                    ring.innerRadiusBlocks() + L1_INTERMEDIATE_BAND_BLOCKS
                             );
 
-                            if (intoL1 <= L1_EXACT_BAND_BLOCKS) {
+                            // Use tile/annulus intersection, not tile-center
+                            // distance. If any part of a visible 32x32 tile
+                            // touches the exact belt, refine the whole tile to
+                            // 1b. This deliberately adds up to one tile of
+                            // overlap so a coarser island cannot sit between
+                            // vanilla and already-exact terrain.
+                            if (tileIntersectsAnnulus(
+                                    tileX,
+                                    tileZ,
+                                    centerX,
+                                    centerZ,
+                                    ring.innerRadiusBlocks(),
+                                    exactOuter,
+                                    tileSize
+                            )) {
                                 targetSpacing = L1_EXACT_SPACING;
-                            } else if (intoL1 <= L1_INTERMEDIATE_BAND_BLOCKS) {
+                            } else if (tileIntersectsAnnulus(
+                                    tileX,
+                                    tileZ,
+                                    centerX,
+                                    centerZ,
+                                    exactOuter,
+                                    intermediateOuter,
+                                    tileSize
+                            )) {
                                 targetSpacing = L1_INTERMEDIATE_SPACING;
                             } else {
                                 targetSpacing = L1_BOOTSTRAP_SPACING;
