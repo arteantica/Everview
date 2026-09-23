@@ -27,10 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.6.2 localizes expensive L1 fidelity by distance. Visible L1 tiles within
- * 64 blocks of the vanilla handoff target 1-block detail, the next 64 blocks
- * target 2-block detail, and the rest stay at 4-block. The conditional L2
- * underlay remains available underneath so detail never blocks coverage.
+ * M3.6.3 makes coverage absolute priority. Everview now finishes every
+ * currently visible coarse tile first, then the L1/L2 roaming guard band,
+ * before spending any generation time on 2-block or 1-block refinement.
+ * Distance-tiered L1 targets remain unchanged.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -44,7 +44,6 @@ public final class WorldgenSurfaceSampler {
 
     private static final int CACHE_LIMIT = 3_072;
     private static final int NEAR_RING_MAX_LEVEL = 2;
-    private static final double NEAR_REFINE_TRIGGER = 0.70;
     private static final int NEAR_REFINE_BURST = 2;
     private static final int L1_PREFETCH_BLOCKS = 64;
     private static final int L2_PREFETCH_BLOCKS = 128;
@@ -664,52 +663,40 @@ public final class WorldgenSurfaceSampler {
             return fallback;
         }
 
-        WantedTile coverage = firstMissingCoverage(pending);
-
-        // Any currently visible hole, in any ring, beats quality refinement.
-        if (coverage != null && !coverage.prefetch()) {
-            return coverage;
+        // M3.6.3: do not begin quality refinement while any visible coarse
+        // terrain is still missing. This removes the 70%-coverage slowdown
+        // where 4b -> 2b work used to compete with unfinished coverage.
+        WantedTile visibleCoverage = firstMissingVisibleCoverage(pending);
+        if (visibleCoverage != null) {
+            return visibleCoverage;
         }
 
-        if (nearCoverageRatio() < NEAR_REFINE_TRIGGER) {
-            return coverage;
+        // Once the complete visible field exists, warm only the L1/L2 guard
+        // band needed for normal roaming before touching expensive detail.
+        WantedTile nearGuard = firstMissingNearGuardCoverage(pending);
+        if (nearGuard != null) {
+            return nearGuard;
         }
 
-        // Stage 2: upgrade visible L1 from 4b -> 2b and visible L2 from
-        // bootstrap -> exact. This is still "coverage quality", not final L1.
+        // Stage 2: distance-tiered 4b -> 2b near refinement.
         WantedTile intermediate = firstIntermediateNearRefinement(pending);
         if (intermediate != null) {
-            if (coverage == null || nearRefineScheduleStep < NEAR_REFINE_BURST) {
-                nearRefineScheduleStep++;
-                return intermediate;
-            }
-
             nearRefineScheduleStep = 0;
-            return coverage;
+            return intermediate;
         }
 
-        // Stage 3: true 1-block L1 is intentionally low priority while guard
-        // coverage is still outstanding. Do two guard-coverage selections for
-        // every exact L1 refinement. Once guard coverage is done, refine L1
-        // continuously nearest-first.
+        // Stage 3: true 1-block detail only in the inner distance band.
         WantedTile exactL1 = firstExactL1Refinement(pending);
         if (exactL1 != null) {
-            if (coverage == null) {
-                exactRefineCoverageStep = 0;
-                return exactL1;
-            }
-
-            if (exactRefineCoverageStep >= EXACT_REFINE_COVERAGE_STEPS) {
-                exactRefineCoverageStep = 0;
-                return exactL1;
-            }
-
-            exactRefineCoverageStep++;
-            return coverage;
+            exactRefineCoverageStep = 0;
+            return exactL1;
         }
 
-        if (coverage != null) {
-            return coverage;
+        // Spare guard/speculative coverage and any remaining outer refinement
+        // happen only after the visible world and near detail are established.
+        WantedTile remainingCoverage = firstMissingCoverage(pending);
+        if (remainingCoverage != null) {
+            return remainingCoverage;
         }
 
         return firstRefinement(pending, false);
@@ -720,6 +707,36 @@ public final class WorldgenSurfaceSampler {
             if (wanted.key().equals(pending)
                     || wanted.ring().lodLevel() != 2
                     || wanted.prefetch()) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
+    private static WantedTile firstMissingVisibleCoverage(LodTileKey pending) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending) || wanted.prefetch()) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
+    private static WantedTile firstMissingNearGuardCoverage(LodTileKey pending) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || !wanted.prefetch()
+                    || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
                 continue;
             }
 
@@ -831,25 +848,6 @@ public final class WorldgenSurfaceSampler {
         }
 
         return null;
-    }
-
-    private static double nearCoverageRatio() {
-        int desired = 0;
-        int covered = 0;
-
-        for (WantedTile wanted : wantedTiles) {
-            if (wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL
-                    || wanted.prefetch()) {
-                continue;
-            }
-
-            desired++;
-            if (CACHE.containsKey(wanted.key())) {
-                covered++;
-            }
-        }
-
-        return desired == 0 ? 0.0 : covered / (double) desired;
     }
 
     private static void scheduleSlice(

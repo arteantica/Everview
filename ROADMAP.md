@@ -78,7 +78,8 @@
 - [x] exact 1-block horizontal L1 refinement
 - [x] staged L1 streaming: 4b bootstrap -> 2b intermediate -> 1b low-priority exact
 - [x] distance-tiered L1 targets: inner 64b at 1-block, next 64b at 2-block, outer L1 at 4-block
-- [ ] benchmark distance-tiered L1 generation / VRAM / roaming refinement cost
+- [x] coverage-first scheduler: visible coarse field + near guard before any detail refinement
+- [ ] benchmark coverage-first distance-tiered L1 generation / VRAM / roaming cost
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] view-direction / screen-space generation priority
 - [ ] texture-atlas / UV material rendering
