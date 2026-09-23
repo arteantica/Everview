@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.9 | OUTWARD COVERAGE FRONTIER");
+        lines.add("Everview M3.9.1 | EMERGENCY UNDERLAY");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Render: merged handoff ranges | uploads yield only after same-column vanilla is visible");
-        lines.add("Stream: nearest visible gaps -> predictive near -> outward rings -> refinement");
+        lines.add("Stream: 64b L3 safety floor -> L2 -> L1 -> outward rings -> refinement");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
@@ -171,11 +171,13 @@ public final class EverviewDebugHud {
                     : stream.outwardFrontierBlocks() + "b";
 
             lines.add(String.format(
-                    "Motion: %.1f b/s | lead %db | ahead %d/%d | %s | frontier %s | near %s | stale %d",
+                    "Motion: %.1f b/s | lead %db | ahead %d/%d | underlay %d/%d | %s | frontier %s | near %s | stale %d",
                     stream.speedBlocksPerSecond(),
                     stream.predictiveLeadBlocks(),
                     stream.predictiveCovered(),
                     stream.predictiveDesired(),
+                    stream.emergencyCovered(),
+                    stream.emergencyDesired(),
                     stream.highSpeedCoverageMode() ? "COVERAGE" : "NORMAL",
                     frontier,
                     stream.nearCoverageComplete() ? "SOLID" : "GAP",

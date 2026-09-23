@@ -21,10 +21,10 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * M3.8.3 persistent-GPU distant terrain renderer. Coalesced handoff ranges stay
- * intact, but upload-time early ownership is now fallback-safe: a fresh upload
- * can only hide an LOD top face when the same vanilla chunk column is already
- * visibly rendering nearby terrain.
+ * M3.9.1 persistent-GPU distant terrain renderer. Coalesced handoff ranges stay
+ * intact. L3 now acts as an emergency underlay beneath L1/L2 and is skipped as
+ * soon as every overlapping L2 tile is resident, mirroring the existing L2
+ * beneath L1 behavior.
  *
  * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
  * Minecraft's opaque terrain RenderPass is still open. Everview therefore
@@ -105,16 +105,23 @@ public final class EverviewRenderer {
                 RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
 
         WorldgenLodRing l1Ring = snapshot.ringForLevel(1);
+        WorldgenLodRing l2Ring = snapshot.ringForLevel(2);
         Set<Long> residentL1Tiles = new HashSet<>();
+        Set<Long> residentL2Tiles = new HashSet<>();
         Map<SectionKey, Boolean> vanillaVisibility = new HashMap<>();
         double vanillaRadius =
                 client.options.getEffectiveRenderDistance() * 16.0D;
 
-        if (l1Ring != null) {
+        if (l1Ring != null || l2Ring != null) {
             for (WorldgenSurfaceTile tile : snapshot.tiles()) {
-                if (tile.lodLevel() == 1
-                        && EverviewGpuTileCache.getResident(tile) != null) {
+                if (EverviewGpuTileCache.getResident(tile) == null) {
+                    continue;
+                }
+
+                if (tile.lodLevel() == 1) {
                     residentL1Tiles.add(packTile(tile.tileX(), tile.tileZ()));
+                } else if (tile.lodLevel() == 2) {
+                    residentL2Tiles.add(packTile(tile.tileX(), tile.tileZ()));
                 }
             }
         }
@@ -131,10 +138,22 @@ public final class EverviewRenderer {
             // still draw because they own terrain outside the L1 annulus.
             if (tile.lodLevel() == 2
                     && l1Ring != null
-                    && fullyCoveredByResidentL1(
+                    && fullyCoveredByResidentFinerRing(
                             tile,
                             l1Ring,
                             residentL1Tiles,
+                            cameraX,
+                            cameraZ
+                    )) {
+                continue;
+            }
+
+            if (tile.lodLevel() == 3
+                    && l2Ring != null
+                    && fullyCoveredByResidentFinerRing(
+                            tile,
+                            l2Ring,
+                            residentL2Tiles,
                             cameraX,
                             cameraZ
                     )) {
@@ -513,27 +532,27 @@ public final class EverviewRenderer {
     ) {
     }
 
-    private static boolean fullyCoveredByResidentL1(
+    private static boolean fullyCoveredByResidentFinerRing(
             WorldgenSurfaceTile coarseTile,
-            WorldgenLodRing l1Ring,
-            Set<Long> residentL1Tiles,
+            WorldgenLodRing finerRing,
+            Set<Long> residentFinerTiles,
             double cameraX,
             double cameraZ
     ) {
-        int l1TileSize = l1Ring.tileSize();
-        int minTileX = Math.floorDiv(coarseTile.minX(), l1TileSize);
-        int maxTileX = Math.floorDiv(coarseTile.maxX() - 1, l1TileSize);
-        int minTileZ = Math.floorDiv(coarseTile.minZ(), l1TileSize);
-        int maxTileZ = Math.floorDiv(coarseTile.maxZ() - 1, l1TileSize);
+        int finerTileSize = finerRing.tileSize();
+        int minTileX = Math.floorDiv(coarseTile.minX(), finerTileSize);
+        int maxTileX = Math.floorDiv(coarseTile.maxX() - 1, finerTileSize);
+        int minTileZ = Math.floorDiv(coarseTile.minZ(), finerTileSize);
+        int maxTileZ = Math.floorDiv(coarseTile.maxZ() - 1, finerTileSize);
 
         boolean checkedAny = false;
 
         for (int tileZ = minTileZ; tileZ <= maxTileZ; tileZ++) {
             for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
-                if (!virtualL1TileBelongsToRing(
+                if (!virtualFinerTileBelongsToRing(
                         tileX,
                         tileZ,
-                        l1Ring,
+                        finerRing,
                         cameraX,
                         cameraZ
                 )) {
@@ -543,7 +562,7 @@ public final class EverviewRenderer {
                 }
 
                 checkedAny = true;
-                if (!residentL1Tiles.contains(packTile(tileX, tileZ))) {
+                if (!residentFinerTiles.contains(packTile(tileX, tileZ))) {
                     return false;
                 }
             }
@@ -552,7 +571,7 @@ public final class EverviewRenderer {
         return checkedAny;
     }
 
-    private static boolean virtualL1TileBelongsToRing(
+    private static boolean virtualFinerTileBelongsToRing(
             int tileX,
             int tileZ,
             WorldgenLodRing ring,

@@ -109,7 +109,10 @@
 - [x] replace interleaved ring coverage with a nearest-to-farthest outward frontier
 - [x] make visible L1/L2 holes absolute priority over prediction, far rings, and refinement
 - [x] expose outward-frontier distance and near-field continuity telemetry
-- [ ] benchmark outward-frontier streaming at x7 FlySpeed and normal elytra speeds
+- [x] overlap L3 beneath the full near field as a 64b-bootstrap emergency safety floor
+- [x] suppress emergency L3 tiles once the overlapping L2 region is fully resident
+- [x] prioritize current/predictive emergency underlay before L2/L1 detail coverage
+- [ ] benchmark emergency-underlay continuity at x7 FlySpeed and normal elytra speeds
 - [ ] benchmark fallback-safe handoff CPU cost at full 1b residency
 - [ ] benchmark velocity prefetch at elytra and FlySpeed travel rates
 - [ ] block-faithful 2-block intermediate geometry

@@ -27,10 +27,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.9 makes coverage a true outward frontier. Missing L1/L2 terrain nearest
- * the vanilla edge is always filled before farther visible rings; movement only
- * biases the direction inside that frontier. Predictive/guard coverage follows,
- * and quality refinement cannot jump ahead of a nearer visible hole.
+ * M3.9.1 adds a persistent emergency underlay beneath the near field. L3 now
+ * overlaps L1/L2 and bootstraps at 64-block sampling, giving the outward
+ * scheduler a very cheap safety floor before 16b/8b L2 and 4b/2b/1b L1 arrive.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -42,8 +41,10 @@ public final class WorldgenSurfaceSampler {
     public static final long MAX_SLICE_BUDGET_NANOS = 12_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 128;
 
-    private static final int CACHE_LIMIT = 4_096;
+    private static final int CACHE_LIMIT = 6_144;
     private static final int NEAR_RING_MAX_LEVEL = 2;
+    private static final int EMERGENCY_UNDERLAY_LEVEL = 3;
+    private static final int EMERGENCY_UNDERLAY_OUTER_BLOCKS = 1_152;
     private static final double PREDICTION_START_BLOCKS_PER_SECOND = 12.0;
     private static final double HIGH_SPEED_BLOCKS_PER_SECOND = 64.0;
     private static final double VELOCITY_SMOOTHING = 0.35;
@@ -131,6 +132,8 @@ public final class WorldgenSurfaceSampler {
     public static StreamingStatus streamingStatus() {
         int predictiveDesired = 0;
         int predictiveCovered = 0;
+        int emergencyDesired = 0;
+        int emergencyCovered = 0;
         int outwardFrontierBlocks = -1;
         boolean nearCoverageComplete = true;
 
@@ -141,6 +144,13 @@ public final class WorldgenSurfaceSampler {
                 predictiveDesired++;
                 if (covered) {
                     predictiveCovered++;
+                }
+            }
+
+            if (isEmergencyUnderlayWanted(wanted)) {
+                emergencyDesired++;
+                if (covered) {
+                    emergencyCovered++;
                 }
             }
 
@@ -160,6 +170,8 @@ public final class WorldgenSurfaceSampler {
                 highSpeedCoverageMode,
                 predictiveDesired,
                 predictiveCovered,
+                emergencyDesired,
+                emergencyCovered,
                 outwardFrontierBlocks,
                 nearCoverageComplete,
                 staleJobsCancelled
@@ -602,7 +614,11 @@ public final class WorldgenSurfaceSampler {
                 8
         ));
 
-        rings.add(new WorldgenLodRing(3, 1_024, 2_048, 256, 32));
+        // L3 is the emergency safety floor. New L3 tiles bootstrap at 64b
+        // because nextGenerationSpacing() starts non-L1 rings at 2x target
+        // spacing. L2/L1 later cover it and the renderer suppresses it once the
+        // finer ring is fully resident.
+        rings.add(new WorldgenLodRing(3, innerRadius, 2_048, 256, 32));
         rings.add(new WorldgenLodRing(4, 2_048, 4_096, 512, 64));
         rings.add(new WorldgenLodRing(5, 4_096, 8_192, 1_024, 128));
         rings.add(new WorldgenLodRing(6, 8_192, 16_384, 2_048, 256));
@@ -777,7 +793,14 @@ public final class WorldgenSurfaceSampler {
         int streamOuterRadius = ring.outerRadiusBlocks() + prefetchBlocks;
 
         boolean predictiveRing = predictionActive
-                && ring.lodLevel() <= NEAR_RING_MAX_LEVEL;
+                && ring.lodLevel() <= EMERGENCY_UNDERLAY_LEVEL;
+        int predictiveStreamOuterRadius =
+                ring.lodLevel() == EMERGENCY_UNDERLAY_LEVEL
+                        ? Math.min(
+                                streamOuterRadius,
+                                EMERGENCY_UNDERLAY_OUTER_BLOCKS
+                        )
+                        : streamOuterRadius;
 
         int minX = centerX - streamOuterRadius;
         int maxX = centerX + streamOuterRadius;
@@ -785,10 +808,22 @@ public final class WorldgenSurfaceSampler {
         int maxZ = centerZ + streamOuterRadius;
 
         if (predictiveRing) {
-            minX = Math.min(minX, predictiveCenterX - streamOuterRadius);
-            maxX = Math.max(maxX, predictiveCenterX + streamOuterRadius);
-            minZ = Math.min(minZ, predictiveCenterZ - streamOuterRadius);
-            maxZ = Math.max(maxZ, predictiveCenterZ + streamOuterRadius);
+            minX = Math.min(
+                    minX,
+                    predictiveCenterX - predictiveStreamOuterRadius
+            );
+            maxX = Math.max(
+                    maxX,
+                    predictiveCenterX + predictiveStreamOuterRadius
+            );
+            minZ = Math.min(
+                    minZ,
+                    predictiveCenterZ - predictiveStreamOuterRadius
+            );
+            maxZ = Math.max(
+                    maxZ,
+                    predictiveCenterZ + predictiveStreamOuterRadius
+            );
         }
 
         int minTileX = Math.floorDiv(minX, tileSize);
@@ -829,7 +864,7 @@ public final class WorldgenSurfaceSampler {
                             predictiveCenterX,
                             predictiveCenterZ,
                             streamInnerRadius,
-                            streamOuterRadius,
+                            predictiveStreamOuterRadius,
                             tileSize
                     );
 
@@ -1032,6 +1067,16 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
+        // 0) Establish the cheap L3 safety floor first. Current underlay grows
+        // outward to 1152 blocks; at speed we also keep the capped predictive
+        // L3 underlay warm ahead of the player.
+        WantedTile emergencyUnderlay =
+                firstMissingEmergencyUnderlayCoverage(pending);
+        if (emergencyUnderlay != null) {
+            balancedCoverageStep = 0;
+            return emergencyUnderlay;
+        }
+
         // 1) Never allow a farther ring, prediction, or refinement to jump over
         // a currently visible L1/L2 hole. This is the true outward frontier.
         WantedTile nearCoverage =
@@ -1112,6 +1157,39 @@ public final class WorldgenSurfaceSampler {
         }
 
         return firstRefinement(pending, false);
+    }
+
+    private static boolean isEmergencyUnderlayWanted(
+            WantedTile wanted
+    ) {
+        if (wanted.ring().lodLevel() != EMERGENCY_UNDERLAY_LEVEL) {
+            return false;
+        }
+
+        if (wanted.predictive()) {
+            return true;
+        }
+
+        return !wanted.prefetch()
+                && wanted.frontierDistanceBlocks()
+                <= EMERGENCY_UNDERLAY_OUTER_BLOCKS;
+    }
+
+    private static WantedTile firstMissingEmergencyUnderlayCoverage(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || !isEmergencyUnderlayWanted(wanted)) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
     }
 
     private static WantedTile firstMissingCurrentNearCoverage(
@@ -2648,6 +2726,8 @@ public final class WorldgenSurfaceSampler {
             boolean highSpeedCoverageMode,
             int predictiveDesired,
             int predictiveCovered,
+            int emergencyDesired,
+            int emergencyCovered,
             int outwardFrontierBlocks,
             boolean nearCoverageComplete,
             int staleJobsCancelled
