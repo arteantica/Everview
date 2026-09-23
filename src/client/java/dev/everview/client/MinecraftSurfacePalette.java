@@ -4,6 +4,8 @@ import net.minecraft.core.Holder;
 import net.minecraft.world.level.biome.Biome;
 
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * First visual-fidelity palette for distant Everview terrain.
@@ -31,6 +33,12 @@ public final class MinecraftSurfacePalette {
     private static final int DIRT = 0x866043;
     private static final int FALLBACK_GRASS = 0x6F9D50;
 
+    // Biome identity/classification is invariant for the lifetime of a holder.
+    // The old path re-ran unwrapKey/lowercase/string contains checks for every
+    // worldgen sample, which became measurable during high-speed coverage.
+    private static final Map<Holder<Biome>, BiomeProfile> BIOME_PROFILES =
+            new ConcurrentHashMap<>();
+
     private MinecraftSurfacePalette() {
     }
 
@@ -41,49 +49,38 @@ public final class MinecraftSurfacePalette {
             int worldZ,
             int seaLevel
     ) {
-        String path = biomeHolder.unwrapKey()
-                .map(key -> key.identifier().getPath().toLowerCase(Locale.ROOT))
-                .orElse("");
+        BiomeProfile profile = BIOME_PROFILES.computeIfAbsent(
+                biomeHolder,
+                MinecraftSurfacePalette::classifyBiome
+        );
 
-        boolean frozen = containsAny(path,
-                "frozen", "snowy", "ice_spikes", "grove");
-        boolean highSnowPeak = containsAny(path,
-                "frozen_peaks", "jagged_peaks");
-        boolean waterBiome = containsAny(path,
-                "ocean", "river");
-        boolean swamp = path.contains("swamp");
-        boolean desert = containsAny(path,
-                "desert", "beach");
-        boolean badlands = path.contains("badlands");
-        boolean stony = containsAny(path,
-                "stony", "windswept_gravelly", "jagged_peaks", "frozen_peaks");
-
-        if (worldY < seaLevel || (worldY <= seaLevel + 1 && waterBiome)) {
-            if (frozen) {
+        if (worldY < seaLevel
+                || (worldY <= seaLevel + 1 && profile.waterBiome())) {
+            if (profile.frozen()) {
                 return new SampleAppearance(FROZEN_WATER, MATERIAL_WATER);
             }
-            if (swamp) {
+            if (profile.swamp()) {
                 return new SampleAppearance(SWAMP_WATER, MATERIAL_WATER);
             }
             return new SampleAppearance(WATER, MATERIAL_WATER);
         }
 
-        if (badlands) {
+        if (profile.badlands()) {
             return new SampleAppearance(TERRACOTTA, MATERIAL_TERRACOTTA);
         }
 
-        if (desert) {
+        if (profile.desert()) {
             return new SampleAppearance(SAND, MATERIAL_SAND);
         }
 
         // M3.0.1 keeps snow tied to cold / peak biomes instead of globally
         // whitening every sufficiently tall mountain.
-        if ((frozen && worldY >= seaLevel + 18)
-                || (highSnowPeak && worldY >= seaLevel + 78)) {
+        if ((profile.frozen() && worldY >= seaLevel + 18)
+                || (profile.highSnowPeak() && worldY >= seaLevel + 78)) {
             return new SampleAppearance(SNOW, MATERIAL_SNOW);
         }
 
-        if (stony && worldY >= seaLevel + 35) {
+        if (profile.stony() && worldY >= seaLevel + 35) {
             return new SampleAppearance(STONE, MATERIAL_STONE);
         }
 
@@ -132,6 +129,30 @@ public final class MinecraftSurfacePalette {
         return (clamp(red) << 16) | (clamp(green) << 8) | clamp(blue);
     }
 
+    private static BiomeProfile classifyBiome(
+            Holder<Biome> biomeHolder
+    ) {
+        String path = biomeHolder.unwrapKey()
+                .map(key -> key.identifier().getPath().toLowerCase(Locale.ROOT))
+                .orElse("");
+
+        return new BiomeProfile(
+                containsAny(path, "frozen", "snowy", "ice_spikes", "grove"),
+                containsAny(path, "frozen_peaks", "jagged_peaks"),
+                containsAny(path, "ocean", "river"),
+                path.contains("swamp"),
+                containsAny(path, "desert", "beach"),
+                path.contains("badlands"),
+                containsAny(
+                        path,
+                        "stony",
+                        "windswept_gravelly",
+                        "jagged_peaks",
+                        "frozen_peaks"
+                )
+        );
+    }
+
     private static boolean containsAny(String value, String... needles) {
         for (String needle : needles) {
             if (value.contains(needle)) {
@@ -143,6 +164,17 @@ public final class MinecraftSurfacePalette {
 
     private static int clamp(int value) {
         return Math.max(0, Math.min(255, value));
+    }
+
+    private record BiomeProfile(
+            boolean frozen,
+            boolean highSnowPeak,
+            boolean waterBiome,
+            boolean swamp,
+            boolean desert,
+            boolean badlands,
+            boolean stony
+    ) {
     }
 
     public record SampleAppearance(int rgb, byte material) {

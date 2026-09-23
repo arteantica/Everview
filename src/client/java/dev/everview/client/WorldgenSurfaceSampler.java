@@ -56,8 +56,8 @@ public final class WorldgenSurfaceSampler {
     private static final int CACHE_LIMIT = 6_144;
     private static final int NEAR_RING_MAX_LEVEL = 2;
     private static final int EMERGENCY_UNDERLAY_LEVEL = 3;
-    private static final int EMERGENCY_FALLBACK_INNER_BLOCKS = 64;
-    private static final int EMERGENCY_UNDERLAY_OUTER_BLOCKS = 1_152;
+    private static final int EMERGENCY_FALLBACK_INNER_BLOCKS = 0;
+    private static final int EMERGENCY_UNDERLAY_OUTER_BLOCKS = 2_048;
     private static final double PREDICTION_START_BLOCKS_PER_SECOND = 12.0;
     private static final double HIGH_SPEED_BLOCKS_PER_SECOND = 64.0;
     private static final double VELOCITY_SMOOTHING = 0.35;
@@ -763,11 +763,11 @@ public final class WorldgenSurfaceSampler {
                 8
         ));
 
-        // L3 is now a true continuous fallback floor, not just an outer-ring
-        // underlay. It reaches well inside the nominal vanilla radius so any
-        // chunk that is absent or not renderer-ready can immediately reveal L3
-        // underneath. Chunk-column ownership hides it the moment vanilla is
-        // actually visible. New L3 tiles bootstrap at 64b.
+        // M5.4: L3 is a true full-disk fallback floor from the camera column
+        // all the way to 2K. This closes the last high-altitude hole directly
+        // below the player and gives every missing/not-ready vanilla column a
+        // terrain surface to reveal. Chunk-column ownership hides it the moment
+        // vanilla is actually visible. New L3 tiles still bootstrap at 64b.
         int emergencyInnerRadius = Math.min(
                 innerRadius,
                 EMERGENCY_FALLBACK_INNER_BLOCKS
@@ -1262,9 +1262,9 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        // 0) Establish the cheap L3 safety floor first. Current underlay grows
-        // outward to 1152 blocks; at speed we also keep the capped predictive
-        // L3 underlay warm ahead of the player.
+        // 0) Establish the full 0-2K L3 safety floor first. It is the hard
+        // no-sky guarantee for unloaded/not-ready vanilla and for high-altitude
+        // downward views. At speed the same cheap floor is also kept warm ahead.
         WantedTile emergencyUnderlay =
                 firstMissingEmergencyUnderlayCoverage(pending);
         if (emergencyUnderlay != null) {
@@ -1286,10 +1286,9 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
-        // 2) Never allow a farther ring or prediction to jump over current
-        // near coverage. At high speed this intentionally means L2 only: L3 is
-        // the continuity floor and 32x32 L1 bootstrap is deferred until motion
-        // slows instead of consuming generation bandwidth while roaming.
+        // 2) Near detail is useful only after continuity exists. In high-speed
+        // coverage mode both L1 and L2 are deferred: L3-L6 bootstrap coverage
+        // gets the world solid first, then near detail catches up after slowing.
         WantedTile nearCoverage =
                 firstMissingCurrentNearCoverage(pending);
         if (nearCoverage != null) {
@@ -1405,7 +1404,7 @@ public final class WorldgenSurfaceSampler {
     ) {
         for (WantedTile wanted : wantedTiles) {
             if ((highSpeedCoverageMode
-                            && wanted.ring().lodLevel() == 1)
+                            && wanted.ring().lodLevel() <= NEAR_RING_MAX_LEVEL)
                     || wanted.key().equals(pending)
                     || wanted.prefetch()
                     || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
@@ -1425,7 +1424,7 @@ public final class WorldgenSurfaceSampler {
     ) {
         for (WantedTile wanted : wantedTiles) {
             if ((highSpeedCoverageMode
-                            && wanted.ring().lodLevel() == 1)
+                            && wanted.ring().lodLevel() <= NEAR_RING_MAX_LEVEL)
                     || wanted.key().equals(pending)
                     || !wanted.predictive()
                     || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
@@ -1445,7 +1444,7 @@ public final class WorldgenSurfaceSampler {
     ) {
         for (WantedTile wanted : wantedTiles) {
             if ((highSpeedCoverageMode
-                            && wanted.ring().lodLevel() == 1)
+                            && wanted.ring().lodLevel() <= NEAR_RING_MAX_LEVEL)
                     || wanted.key().equals(pending)
                     || !wanted.prefetch()
                     || wanted.predictive()
@@ -1484,7 +1483,7 @@ public final class WorldgenSurfaceSampler {
     ) {
         for (WantedTile wanted : wantedTiles) {
             if ((highSpeedCoverageMode
-                            && wanted.ring().lodLevel() == 1)
+                            && wanted.ring().lodLevel() <= NEAR_RING_MAX_LEVEL)
                     || wanted.key().equals(pending)
                     || !wanted.prefetch()
                     || wanted.predictive()) {
@@ -2096,6 +2095,26 @@ public final class WorldgenSurfaceSampler {
         var generator = chunks.getGenerator();
         var randomState = chunks.randomState();
 
+        // M5.4 reuses the otherwise-idle height workers for coarse flight
+        // coverage. At high travel speed L3-L6 bootstrap tiles get their height
+        // samples in parallel, while biome/material appearance and mesh assembly
+        // stay on the server lane. This attacks the actual getBaseHeight
+        // bottleneck without moving palette/mesh logic off-thread.
+        if ((highSpeedCoverageMode
+                        && job.ring.lodLevel() >= EMERGENCY_UNDERLAY_LEVEL
+                        && job.sampleGrid == null)
+                || job.asyncCoverageStarted) {
+            runAsyncCoverageGeometry(
+                    level,
+                    generator,
+                    randomState,
+                    job,
+                    taskEpoch,
+                    sliceStart
+            );
+            return;
+        }
+
         if (job.exactGeometryOnly
                 && !job.asyncExactDisabled
                 && job.sampleGrid != null
@@ -2286,6 +2305,172 @@ public final class WorldgenSurfaceSampler {
         lastSliceMs = sliceElapsed / 1_000_000.0;
     }
 
+    private static void runAsyncCoverageGeometry(
+            ServerLevel level,
+            net.minecraft.world.level.chunk.ChunkGenerator generator,
+            net.minecraft.world.level.levelgen.RandomState randomState,
+            GenerationJob job,
+            long taskEpoch,
+            long sliceStart
+    ) {
+        if (job.asyncHeightFuture == null) {
+            int[] sampleIndices = new int[job.totalSamples];
+            for (int i = 0; i < sampleIndices.length; i++) {
+                sampleIndices[i] = i;
+            }
+
+            job.asyncCoverageStarted = true;
+            job.asyncMissingSampleIndices = sampleIndices;
+            job.asyncStartedNanos = System.nanoTime();
+
+            int split = (sampleIndices.length + 1) / 2;
+            CompletableFuture<HeightPart> first = CompletableFuture.supplyAsync(
+                    () -> computeHeightPart(
+                            level,
+                            generator,
+                            randomState,
+                            job,
+                            sampleIndices,
+                            0,
+                            split
+                    ),
+                    EXACT_HEIGHT_EXECUTOR
+            );
+            CompletableFuture<HeightPart> second = CompletableFuture.supplyAsync(
+                    () -> computeHeightPart(
+                            level,
+                            generator,
+                            randomState,
+                            job,
+                            sampleIndices,
+                            split,
+                            sampleIndices.length
+                    ),
+                    EXACT_HEIGHT_EXECUTOR
+            );
+
+            job.asyncHeightFuture = first.thenCombine(
+                    second,
+                    HeightBatchResult::combine
+            );
+
+            lastSliceSamples = 0;
+            lastSliceMs = (System.nanoTime() - sliceStart) / 1_000_000.0;
+            return;
+        }
+
+        if (!job.asyncHeightFuture.isDone()) {
+            lastSliceSamples = 0;
+            lastSliceMs = 0.0;
+            return;
+        }
+
+        HeightBatchResult result;
+        try {
+            result = job.asyncHeightFuture.join();
+        } catch (RuntimeException exception) {
+            // Fall back to the proven server-thread path if a world generator
+            // rejects asynchronous height access.
+            job.asyncCoverageStarted = false;
+            job.asyncHeightFuture = null;
+            job.asyncMissingSampleIndices = new int[0];
+            job.nextSample = 0;
+            EverviewClient.LOGGER.warn(
+                    "Everview async coverage heights failed at L{} {}, {}; "
+                            + "falling back to server-thread coverage",
+                    job.ring.lodLevel(),
+                    job.key.tileX(),
+                    job.key.tileZ(),
+                    exception
+            );
+            return;
+        }
+
+        if (result.sampleIndices().length != job.totalSamples) {
+            job.asyncCoverageStarted = false;
+            job.asyncHeightFuture = null;
+            job.asyncMissingSampleIndices = new int[0];
+            job.nextSample = 0;
+            return;
+        }
+
+        for (int i = 0; i < result.sampleIndices().length; i++) {
+            int sampleIndex = result.sampleIndices()[i];
+            int y = result.heights()[i];
+            job.heights[sampleIndex] = y;
+            job.minY = Math.min(job.minY, y);
+            job.maxY = Math.max(job.maxY, y);
+            job.generatedSamples++;
+        }
+
+        // Appearance stays on the server lane. With cached biome classification
+        // this is much cheaper than height generation and keeps thread-sensitive
+        // biome color/material work out of the worker pool.
+        for (int sampleIndex = 0;
+                sampleIndex < job.totalSamples;
+                sampleIndex++) {
+            int gx = sampleIndex % job.samplesAcross;
+            int gz = sampleIndex / job.samplesAcross;
+            int worldX = job.originX + gx * job.sampleSpacing;
+            int worldZ = job.originZ + gz * job.sampleSpacing;
+            int y = job.heights[sampleIndex];
+
+            var biome = level.getNoiseBiome(
+                    worldX >> 2,
+                    y >> 2,
+                    worldZ >> 2
+            );
+            var appearance = MinecraftSurfacePalette.sample(
+                    biome,
+                    worldX,
+                    y,
+                    worldZ,
+                    level.getSeaLevel()
+            );
+
+            job.sampleColors[sampleIndex] = appearance.rgb();
+            job.sampleMaterials[sampleIndex] = appearance.material();
+            job.appearanceGeneratedSamples++;
+        }
+
+        job.nextSample = job.totalSamples;
+        job.accumulatedNanos += System.nanoTime() - job.asyncStartedNanos;
+
+        long meshStart = System.nanoTime();
+        MeshData mesh = buildMesh(job, level.getSeaLevel());
+        job.accumulatedNanos += System.nanoTime() - meshStart;
+
+        WorldgenSurfaceTile tile = new WorldgenSurfaceTile(
+                job.ring.lodLevel(),
+                job.key.tileX(),
+                job.key.tileZ(),
+                job.ring.tileSize(),
+                job.sampleSpacing,
+                WorldgenTileStage.COVERAGE,
+                mesh.vertices(),
+                mesh.colors(),
+                mesh.materials(),
+                mesh.quadCount(),
+                job.minY,
+                job.maxY,
+                level.getSeaLevel(),
+                job.accumulatedNanos
+        );
+
+        COMPLETED.add(new CompletedTile(
+                taskEpoch,
+                job.key,
+                tile,
+                job.reusedSamples,
+                job.generatedSamples,
+                job.appearanceGeneratedSamples,
+                job.provisionalAppearanceSamples
+        ));
+
+        lastSliceSamples = result.sampleIndices().length;
+        lastSliceMs = (System.nanoTime() - sliceStart) / 1_000_000.0;
+    }
+
     private static void runAsyncExactGeometry(
             ServerLevel level,
             net.minecraft.world.level.chunk.ChunkGenerator generator,
@@ -2423,8 +2608,8 @@ public final class WorldgenSurfaceSampler {
                 sampleIndex++) {
             int gx = sampleIndex % job.samplesAcross;
             int gz = sampleIndex / job.samplesAcross;
-            int worldX = job.originX + gx;
-            int worldZ = job.originZ + gz;
+            int worldX = job.originX + gx * job.sampleSpacing;
+            int worldZ = job.originZ + gz * job.sampleSpacing;
             int fineIndex = job.fineGridIndex(gx, gz);
 
             if (fineIndex >= 0
@@ -3586,6 +3771,7 @@ public final class WorldgenSurfaceSampler {
         private int[] asyncMissingSampleIndices = new int[0];
         private long asyncStartedNanos;
         private boolean asyncExactDisabled;
+        private boolean asyncCoverageStarted;
         private volatile boolean failed;
         private int minY = Integer.MAX_VALUE;
         private int maxY = Integer.MIN_VALUE;

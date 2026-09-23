@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M5.3 DEV | CONTINUOUS FALLBACK FLOOR");
+        lines.add("Everview M5.4 DEV | FLIGHT COVERAGE LANE");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Render: absent/waiting vanilla reveals L3 floor | switch only when renderer-ready");
-        lines.add("Ownership: renderer-ready vanilla > L1 > L2 > L3 | cheap surface probes");
+        lines.add("Render: 0-2K fallback floor | vanilla switches only when renderer-ready");
+        lines.add("Streaming: fast flight = L3-L6 coverage first | L1/L2 resume after slowdown");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),

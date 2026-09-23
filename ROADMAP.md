@@ -220,3 +220,14 @@
 - [x] defer L1 bootstrap generation at high travel speed and spend coverage bandwidth on L3/L2
 - [x] raise high-speed coverage generation headroom to 16 ms only while server/frame timing is healthy
 - [ ] stress-test stationary handoff, x7, x12, land/ocean transitions, and rapid reversal
+
+
+## M5.4 flight coverage lane
+- [x] extend the emergency L3 floor from the camera column to the full 2K radius
+- [x] close the high-altitude downward-view center hole
+- [x] treat high-speed L1/L2 as deferred detail instead of blocking coarse continuity
+- [x] prioritize L3-L6 bootstrap coverage during high-speed travel
+- [x] reuse the two height workers for parallel coarse coverage generation
+- [x] keep biome/material appearance and mesh assembly on the server lane
+- [x] cache immutable biome classification used by the surface palette
+- [ ] benchmark x15 coverage continuity, far-ring holes, generation tiles/s, and geometry CPU
