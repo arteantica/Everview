@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.7.3 | CONTIGUOUS EXACT L1");
+        lines.add("Everview M3.7.4.2 | RENDERER-VISIBLE OWNERSHIP");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("LOD bands: intersect inner64 -> 1b | next64 -> 2b | no coarse islands");
-        lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
+        lines.add("Handoff: clip L1/L2 only where vanilla sections are compiled + visible");
+        lines.add("LOD bands: inner64 -> 1b | next64 -> 2b | renderer-not-ready keeps fallback");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
