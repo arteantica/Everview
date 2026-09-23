@@ -210,3 +210,13 @@
 - [x] cache full per-frame column ownership state instead of only a boolean claim
 - [x] expose loaded-but-waiting fallback batches in the debug HUD
 - [ ] stress-test x12 FlySpeed handoff, land/ocean transitions, and rapid direction reversal
+
+
+## M5.3 continuous fallback floor
+- [x] extend the cheap L3 emergency surface inward beneath the vanilla radius
+- [x] make unloaded vanilla columns an immediate zero-probe LOD fallback path
+- [x] replace per-column +/-24 renderer scans with loaded-chunk surface-height probes
+- [x] retain upload hints only as a cheap unusual-cliff/overhang fallback
+- [x] defer L1 bootstrap generation at high travel speed and spend coverage bandwidth on L3/L2
+- [x] raise high-speed coverage generation headroom to 16 ms only while server/frame timing is healthy
+- [ ] stress-test stationary handoff, x7, x12, land/ocean transitions, and rapid reversal

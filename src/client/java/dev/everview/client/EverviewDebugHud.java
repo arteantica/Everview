@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M5.2 DEV | RENDER-READY COLUMN HANDOFF");
+        lines.add("Everview M5.3 DEV | CONTINUOUS FALLBACK FLOOR");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Render: merged handoff ranges | loaded vanilla keeps LOD until renderer-ready");
-        lines.add("Ownership: renderer-ready vanilla columns > L1 > L2 > L3 | chunk-split surfaces");
+        lines.add("Render: absent/waiting vanilla reveals L3 floor | switch only when renderer-ready");
+        lines.add("Ownership: renderer-ready vanilla > L1 > L2 > L3 | cheap surface probes");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
@@ -177,7 +177,7 @@ public final class EverviewDebugHud {
                     : stream.outwardFrontierBlocks() + "b";
 
             lines.add(String.format(
-                    "Motion: %.1f b/s | lead %db | ahead %d/%d | underlay %d/%d | %s | frontier %s | near %s | stale %d",
+                    "Motion: %.1f b/s | lead %db | ahead %d/%d | floor %d/%d | %s | frontier %s | detail %s | stale %d",
                     stream.speedBlocksPerSecond(),
                     stream.predictiveLeadBlocks(),
                     stream.predictiveCovered(),

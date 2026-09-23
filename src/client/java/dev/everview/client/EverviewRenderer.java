@@ -10,6 +10,8 @@ import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
@@ -23,10 +25,10 @@ import java.util.Set;
 /**
  * M4 unified hierarchical ownership renderer.
  *
- * M5.2 render-ready column ownership: vanilla owns a chunk column only after
- * Minecraft's renderer reports actual compiled-and-visible terrain in that
- * column. A merely loaded client chunk is not enough to retire Everview, so
- * LOD remains underneath while vanilla catches up during high-speed travel.
+ * M5.3 continuous fallback floor: Everview remains the terrain owner whenever
+ * the client chunk is absent or present-but-not-render-ready. Vanilla takes a
+ * chunk column only after its real surface sections are compiled and visible.
+ * This makes handoff a direct LOD -> vanilla switch instead of an empty gap.
  * L1/L2/L3 all use the same ownership mask. L2 no longer disappears as an all-or-nothing
  * 128-block tile; each section batch retires as its corresponding 32-block L1
  * tile becomes GPU-resident. L3 keeps its per-L2-region fallback. All masks
@@ -48,6 +50,8 @@ public final class EverviewRenderer {
     private static final double RING_LAYER_BIAS = 0.06D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
     private static final double VANILLA_OWNERSHIP_MARGIN_BLOCKS = 64.0D;
+    private static final int[] SURFACE_PROBE_X = {8, 2, 13, 2, 13};
+    private static final int[] SURFACE_PROBE_Z = {8, 2, 2, 13, 13};
 
     private static int lastVanillaOwnedBatches;
     private static int lastFinerOwnedBatches;
@@ -519,40 +523,49 @@ public final class EverviewRenderer {
             return cached;
         }
 
-        // M5.2: client chunk presence is not a handoff signal. At high travel
-        // speed Minecraft can have the chunk loaded before its terrain is
-        // actually compiled, uploaded and visible. Retiring Everview at that
-        // point exposes a sky/white hole inside the nominal vanilla radius.
+        // M5.3: absence is the cheapest and strongest fallback signal. Never
+        // probe renderer sections for a chunk the client does not even have.
+        // Everview simply remains visible until vanilla arrives.
+        LevelChunk chunk = client.level == null
+                ? null
+                : client.level.getChunkSource().getChunkNow(chunkX, chunkZ);
+
+        if (chunk == null) {
+            columns.put(key, ColumnOwnershipResult.NOT_OWNED);
+            return ColumnOwnershipResult.NOT_OWNED;
+        }
+
         boolean visible = vanillaSurfaceColumnVisible(
                 client,
+                chunk,
                 chunkX,
                 hintSectionY,
                 chunkZ,
                 visibility
         );
-        boolean loaded = client.level != null
-                && client.level.hasChunk(chunkX, chunkZ);
 
         ColumnOwnershipResult result = visible
                 ? new ColumnOwnershipResult(true, false)
-                : new ColumnOwnershipResult(false, loaded);
+                : new ColumnOwnershipResult(false, true);
         columns.put(key, result);
         return result;
     }
 
     private static boolean vanillaSurfaceColumnVisible(
             Minecraft client,
+            LevelChunk chunk,
             int chunkX,
-            int sectionY,
+            int hintSectionY,
             int chunkZ,
             Map<SectionKey, Boolean> visibility
     ) {
-        // Fast local test around the LOD surface first.
-        for (int offset = -2; offset <= 2; offset++) {
+        // First check the LOD surface neighborhood. This is the cheapest common
+        // path when worldgen and the loaded chunk agree on surface height.
+        for (int offset = -1; offset <= 1; offset++) {
             if (vanillaSectionVisible(
                     client,
                     chunkX,
-                    sectionY + offset,
+                    hintSectionY + offset,
                     chunkZ,
                     visibility
             )) {
@@ -560,49 +573,50 @@ public final class EverviewRenderer {
             }
         }
 
-        // M5.1/M5.2: ownership belongs to the chunk column, not to the guessed LOD
-        // surface section. Scan the rest of a generous vertical column so
-        // oceans, cliffs, overhangs and large height mismatches cannot leave
-        // an already-rendered vanilla column exposed to Everview.
-        for (int offset = -24; offset <= 24; offset++) {
-            if (offset >= -2 && offset <= 2) {
+        // M5.1 used a +/-24 section sweep for every candidate column. That was
+        // robust but far too expensive once thousands of chunk-split batches
+        // were active. M5.3 asks the loaded chunk's own heightmap where its
+        // actual surface is, then probes only those renderer sections.
+        for (int probe = 0; probe < SURFACE_PROBE_X.length; probe++) {
+            int surfaceY = chunk.getHeight(
+                    Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                    SURFACE_PROBE_X[probe],
+                    SURFACE_PROBE_Z[probe]
+            );
+            int surfaceSectionY = Math.floorDiv(surfaceY - 1, 16);
+
+            for (int offset = -1; offset <= 1; offset++) {
+                if (vanillaSectionVisible(
+                        client,
+                        chunkX,
+                        surfaceSectionY + offset,
+                        chunkZ,
+                        visibility
+                )) {
+                    return true;
+                }
+            }
+        }
+
+        // Upload hints cover unusual cliffs/overhangs that the five surface
+        // probes may miss. Iterating the tiny hint map is cheap; ownership still
+        // requires the hinted section to be actually visible this frame.
+        for (Map.Entry<SectionKey, Long> entry
+                : RECENTLY_COMPILED_SECTIONS.entrySet()) {
+            SectionKey section = entry.getKey();
+            if (section.chunkX() != chunkX || section.chunkZ() != chunkZ) {
+                continue;
+            }
+
+            if (System.nanoTime() - entry.getValue()
+                    > RECENT_COMPILE_HINT_NANOS) {
                 continue;
             }
 
             if (vanillaSectionVisible(
                     client,
                     chunkX,
-                    sectionY + offset,
-                    chunkZ,
-                    visibility
-            )) {
-                return true;
-            }
-        }
-
-        // Recent compile hints are only a fallback signal; they never override
-        // the requirement that some section in this column is renderer-ready.
-        boolean recentlyUploaded = false;
-        for (int offset = -24; offset <= 24; offset++) {
-            if (recentlyCompiledSection(
-                    chunkX,
-                    sectionY + offset,
-                    chunkZ
-            )) {
-                recentlyUploaded = true;
-                break;
-            }
-        }
-
-        if (!recentlyUploaded) {
-            return false;
-        }
-
-        for (int offset = -24; offset <= 24; offset++) {
-            if (vanillaSectionVisible(
-                    client,
-                    chunkX,
-                    sectionY + offset,
+                    section.sectionY(),
                     chunkZ,
                     visibility
             )) {

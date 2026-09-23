@@ -47,7 +47,8 @@ public final class WorldgenSurfaceSampler {
 
     public static final long MIN_SLICE_BUDGET_NANOS = 1_000_000L;
     public static final long BASE_SLICE_BUDGET_NANOS = 6_000_000L;
-    public static final long MAX_SLICE_BUDGET_NANOS = 12_000_000L;
+    public static final long NORMAL_MAX_SLICE_BUDGET_NANOS = 12_000_000L;
+    public static final long MAX_SLICE_BUDGET_NANOS = 16_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 128;
     private static final int EXACT_HEIGHT_WORKERS = 2;
     private static final int MAX_DETACHED_EXACT_JOBS = EXACT_HEIGHT_WORKERS;
@@ -55,6 +56,7 @@ public final class WorldgenSurfaceSampler {
     private static final int CACHE_LIMIT = 6_144;
     private static final int NEAR_RING_MAX_LEVEL = 2;
     private static final int EMERGENCY_UNDERLAY_LEVEL = 3;
+    private static final int EMERGENCY_FALLBACK_INNER_BLOCKS = 64;
     private static final int EMERGENCY_UNDERLAY_OUTER_BLOCKS = 1_152;
     private static final double PREDICTION_START_BLOCKS_PER_SECOND = 12.0;
     private static final double HIGH_SPEED_BLOCKS_PER_SECOND = 64.0;
@@ -700,8 +702,13 @@ public final class WorldgenSurfaceSampler {
         // M3.5 uses the large amount of singleplayer tick headroom during
         // initial streaming, then backs off automatically as either the server
         // tick or client frame becomes busy.
-        if (serverTickMs < 15.0 && (clientFrameMs <= 0.0 || clientFrameMs < 10.0)) {
+        if (highSpeedCoverageMode
+                && serverTickMs < 20.0
+                && (clientFrameMs <= 0.0 || clientFrameMs < 12.0)) {
             target = MAX_SLICE_BUDGET_NANOS;
+        } else if (serverTickMs < 15.0
+                && (clientFrameMs <= 0.0 || clientFrameMs < 10.0)) {
+            target = NORMAL_MAX_SLICE_BUDGET_NANOS;
         } else if (serverTickMs < 22.0 && (clientFrameMs <= 0.0 || clientFrameMs < 13.0)) {
             target = 10_000_000L;
         } else if (serverTickMs < 30.0 && (clientFrameMs <= 0.0 || clientFrameMs < 18.0)) {
@@ -756,11 +763,22 @@ public final class WorldgenSurfaceSampler {
                 8
         ));
 
-        // L3 is the emergency safety floor. New L3 tiles bootstrap at 64b
-        // because nextGenerationSpacing() starts non-L1 rings at 2x target
-        // spacing. L2/L1 later cover it and the renderer suppresses it once the
-        // finer ring is fully resident.
-        rings.add(new WorldgenLodRing(3, innerRadius, 2_048, 256, 32));
+        // L3 is now a true continuous fallback floor, not just an outer-ring
+        // underlay. It reaches well inside the nominal vanilla radius so any
+        // chunk that is absent or not renderer-ready can immediately reveal L3
+        // underneath. Chunk-column ownership hides it the moment vanilla is
+        // actually visible. New L3 tiles bootstrap at 64b.
+        int emergencyInnerRadius = Math.min(
+                innerRadius,
+                EMERGENCY_FALLBACK_INNER_BLOCKS
+        );
+        rings.add(new WorldgenLodRing(
+                3,
+                emergencyInnerRadius,
+                2_048,
+                256,
+                32
+        ));
         rings.add(new WorldgenLodRing(4, 2_048, 4_096, 512, 64));
         rings.add(new WorldgenLodRing(5, 4_096, 8_192, 1_024, 128));
         rings.add(new WorldgenLodRing(6, 8_192, 16_384, 2_048, 256));
@@ -1268,8 +1286,10 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
-        // 2) Never allow a farther ring or prediction to jump over a currently
-        // visible L1/L2 hole. This remains the outward coverage frontier.
+        // 2) Never allow a farther ring or prediction to jump over current
+        // near coverage. At high speed this intentionally means L2 only: L3 is
+        // the continuity floor and 32x32 L1 bootstrap is deferred until motion
+        // slows instead of consuming generation bandwidth while roaming.
         WantedTile nearCoverage =
                 firstMissingCurrentNearCoverage(pending);
         if (nearCoverage != null) {
@@ -1384,7 +1404,9 @@ public final class WorldgenSurfaceSampler {
             LodTileKey pending
     ) {
         for (WantedTile wanted : wantedTiles) {
-            if (wanted.key().equals(pending)
+            if ((highSpeedCoverageMode
+                            && wanted.ring().lodLevel() == 1)
+                    || wanted.key().equals(pending)
                     || wanted.prefetch()
                     || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
                 continue;
@@ -1402,7 +1424,9 @@ public final class WorldgenSurfaceSampler {
             LodTileKey pending
     ) {
         for (WantedTile wanted : wantedTiles) {
-            if (wanted.key().equals(pending)
+            if ((highSpeedCoverageMode
+                            && wanted.ring().lodLevel() == 1)
+                    || wanted.key().equals(pending)
                     || !wanted.predictive()
                     || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
                 continue;
@@ -1420,7 +1444,9 @@ public final class WorldgenSurfaceSampler {
             LodTileKey pending
     ) {
         for (WantedTile wanted : wantedTiles) {
-            if (wanted.key().equals(pending)
+            if ((highSpeedCoverageMode
+                            && wanted.ring().lodLevel() == 1)
+                    || wanted.key().equals(pending)
                     || !wanted.prefetch()
                     || wanted.predictive()
                     || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
@@ -1457,7 +1483,9 @@ public final class WorldgenSurfaceSampler {
             LodTileKey pending
     ) {
         for (WantedTile wanted : wantedTiles) {
-            if (wanted.key().equals(pending)
+            if ((highSpeedCoverageMode
+                            && wanted.ring().lodLevel() == 1)
+                    || wanted.key().equals(pending)
                     || !wanted.prefetch()
                     || wanted.predictive()) {
                 continue;
