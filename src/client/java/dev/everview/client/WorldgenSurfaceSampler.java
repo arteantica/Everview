@@ -27,10 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.5.4 adds a persistent coarse underlay beneath the entire L1 band.
- * L2 now begins at the vanilla handoff radius instead of only after L1 ends,
- * so moving the camera can reveal coarse terrain immediately while 2-block L1
- * catches up. Missing visible L2 fallback tiles outrank all other generation.
+ * M3.6 keeps the conditional L2 roaming underlay but pushes exact L1 surface
+ * fidelity to one block horizontally. Progressive coverage still starts at
+ * 2-block L1, then near-first refinement replaces those tiles with true
+ * 1-block terraced surface geometry.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -342,10 +342,10 @@ public final class WorldgenSurfaceSampler {
     private static List<WorldgenLodRing> createRings(int innerRadius) {
         List<WorldgenLodRing> rings = new ArrayList<>(6);
 
-        // M3.4 pushes the stable ultra-near ring from 4-block to 2-block
-        // sampling now that persistent GPU buffers recovered the per-frame CPU
-        // headroom. Keep the 32-block tiles from M3.3.2 so the vanilla handoff
-        // remains tight and does not retreat from the camera.
+        // M3.6 pushes exact ultra-near sampling from 2 blocks to 1 block.
+        // Progressive streaming still bootstraps these 32-block tiles at
+        // 2-block spacing first, so coverage stays fast while exact detail
+        // catches up behind the L2 safety layer.
         int ultraNearOuter = Math.min(
                 1_024,
                 Math.max(544, innerRadius + 192)
@@ -356,12 +356,12 @@ public final class WorldgenSurfaceSampler {
                 innerRadius,
                 ultraNearOuter,
                 32,
-                2
+                1
         ));
 
-        // M3.5.4: L2 deliberately overlaps the entire L1 annulus. It acts as
-        // a persistent 8-block fallback surface underneath 2-block L1 so
-        // roaming never depends on L1 finishing before terrain can be shown.
+        // L2 deliberately overlaps the entire L1 annulus. It remains the
+        // persistent 8-block fallback surface underneath 1-block exact L1 so
+        // roaming never depends on high-detail refinement finishing first.
         rings.add(new WorldgenLodRing(
                 2,
                 innerRadius,
@@ -959,7 +959,7 @@ public final class WorldgenSurfaceSampler {
 
     /**
      * Near Everview rings use deliberately blockier coarse-voxel surfaces.
-     * M3.4 uses 2x2 cells closest to vanilla and 8x8 cells farther out, each
+     * M3.6 uses 1x1 cells for exact L1 and 8x8 cells for L2, each
      * as a flat plateau with vertical faces between neighboring plateaus and dark
      * skirts around tile edges. This sacrifices smooth triangles close to the
      * vanilla handoff in favor of silhouettes that read much more like Minecraft.
@@ -1233,8 +1233,8 @@ public final class WorldgenSurfaceSampler {
         int average = Math.round(sum / (float) count);
 
         // At near-ring sampling (8 blocks or finer), keep full one-block
-        // vertical steps. The new 2-block L1 therefore gains horizontal detail
-        // without smoothing away Minecraft's stepped silhouette.
+        // vertical steps. Exact 1-block L1 now preserves the horizontal surface
+        // footprint without smoothing away Minecraft's stepped silhouette.
         return job.sampleSpacing <= 8
                 ? average
                 : Math.round(average / 2.0F) * 2;
