@@ -231,3 +231,14 @@
 - [x] keep biome/material appearance and mesh assembly on the server lane
 - [x] cache immutable biome classification used by the surface palette
 - [ ] benchmark x15 coverage continuity, far-ring holes, generation tiles/s, and geometry CPU
+
+
+## M5.5 global safety floor
+- [x] gate vanilla ownership by camera-to-surface 3D reach, not stale renderer visibility alone
+- [x] stop high-altitude compiled vanilla sections from punching a circular hole below the camera
+- [x] convert L4/L5/L6 from disjoint annuli into nested fallback disks
+- [x] make L6 a 0-16K coarse safety floor generated before all finer coverage
+- [x] attach immediate-finer ownership regions to L4/L5/L6 GPU batches
+- [x] retire coarse regions only when their immediate finer disk is actually resident
+- [x] expose global L6 safety-floor readiness in the HUD
+- [ ] validate straight-down high-altitude flight, x15 horizontal flight, and 16K far coverage

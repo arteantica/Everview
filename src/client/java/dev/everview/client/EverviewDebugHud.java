@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M5.4 DEV | FLIGHT COVERAGE LANE");
+        lines.add("Everview M5.5 DEV | GLOBAL SAFETY FLOOR");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Render: 0-2K fallback floor | vanilla switches only when renderer-ready");
-        lines.add("Streaming: fast flight = L3-L6 coverage first | L1/L2 resume after slowdown");
+        lines.add("Render: 3D-safe vanilla handoff | nested L3/L4/L5/L6 fallback disks");
+        lines.add("Streaming: global L6 floor first | finer disks replace it as they become resident");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
@@ -177,13 +177,15 @@ public final class EverviewDebugHud {
                     : stream.outwardFrontierBlocks() + "b";
 
             lines.add(String.format(
-                    "Motion: %.1f b/s | lead %db | ahead %d/%d | floor %d/%d | %s | frontier %s | detail %s | stale %d",
+                    "Motion: %.1f b/s | lead %db | ahead %d/%d | L3 %d/%d | L6 floor %d/%d | %s | frontier %s | detail %s | stale %d",
                     stream.speedBlocksPerSecond(),
                     stream.predictiveLeadBlocks(),
                     stream.predictiveCovered(),
                     stream.predictiveDesired(),
                     stream.emergencyCovered(),
                     stream.emergencyDesired(),
+                    stream.globalFloorCovered(),
+                    stream.globalFloorDesired(),
                     stream.highSpeedCoverageMode() ? "COVERAGE" : "NORMAL",
                     frontier,
                     stream.nearCoverageComplete() ? "SOLID" : "GAP",

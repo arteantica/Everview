@@ -29,6 +29,9 @@ public final class EverviewGpuTileCache {
     private static final int MAX_GPU_TILES = 3_072;
     private static final int MAX_UPLOADS_PER_FRAME = 8;
     private static final int L3_UNDERLAY_REGION_SIZE = 128;
+    private static final int L4_UNDERLAY_REGION_SIZE = 256;
+    private static final int L5_UNDERLAY_REGION_SIZE = 512;
+    private static final int L6_UNDERLAY_REGION_SIZE = 1_024;
 
     private static final Map<LodTileKey, GpuTile> TILES =
             new LinkedHashMap<>(256, 0.75F, true);
@@ -164,7 +167,33 @@ public final class EverviewGpuTileCache {
                 if (tile.lodLevel() <= 2) {
                     key = classifyBatch(piece.vertices(), 0);
                 } else if (tile.lodLevel() == 3) {
-                    key = classifyUnderlayBatch(piece.vertices(), 0);
+                    key = classifyUnderlayBatch(
+                            piece.vertices(),
+                            0,
+                            regionSize,
+                            true
+                    );
+                } else if (tile.lodLevel() == 4) {
+                    key = classifyUnderlayBatch(
+                            piece.vertices(),
+                            0,
+                            L4_UNDERLAY_REGION_SIZE,
+                            false
+                    );
+                } else if (tile.lodLevel() == 5) {
+                    key = classifyUnderlayBatch(
+                            piece.vertices(),
+                            0,
+                            L5_UNDERLAY_REGION_SIZE,
+                            false
+                    );
+                } else if (tile.lodLevel() == 6) {
+                    key = classifyUnderlayBatch(
+                            piece.vertices(),
+                            0,
+                            L6_UNDERLAY_REGION_SIZE,
+                            false
+                    );
                 } else {
                     key = BatchKey.ALWAYS;
                 }
@@ -723,9 +752,13 @@ public final class EverviewGpuTileCache {
 
     private static BatchKey classifyUnderlayBatch(
             int[] vertices,
-            int quadOffset
+            int quadOffset,
+            int regionSize,
+            boolean vanillaSensitive
     ) {
-        BatchKey vanillaKey = classifyBatch(vertices, quadOffset);
+        BatchKey vanillaKey = vanillaSensitive
+                ? classifyBatch(vertices, quadOffset)
+                : BatchKey.ALWAYS;
 
         int minX = Integer.MAX_VALUE;
         int maxX = Integer.MIN_VALUE;
@@ -741,17 +774,17 @@ public final class EverviewGpuTileCache {
         }
 
         int sampleX = minX == maxX
-                ? minX - (Math.floorMod(minX, L3_UNDERLAY_REGION_SIZE) == 0
+                ? minX - (Math.floorMod(minX, regionSize) == 0
                         ? 1 : 0)
                 : minX + Math.max(0, (maxX - minX - 1) / 2);
         int sampleZ = minZ == maxZ
-                ? minZ - (Math.floorMod(minZ, L3_UNDERLAY_REGION_SIZE) == 0
+                ? minZ - (Math.floorMod(minZ, regionSize) == 0
                         ? 1 : 0)
                 : minZ + Math.max(0, (maxZ - minZ - 1) / 2);
 
         return vanillaKey.withUnderlayRegion(
-                Math.floorDiv(sampleX, L3_UNDERLAY_REGION_SIZE),
-                Math.floorDiv(sampleZ, L3_UNDERLAY_REGION_SIZE)
+                Math.floorDiv(sampleX, regionSize),
+                Math.floorDiv(sampleZ, regionSize)
         );
     }
 

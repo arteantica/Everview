@@ -56,6 +56,7 @@ public final class WorldgenSurfaceSampler {
     private static final int CACHE_LIMIT = 6_144;
     private static final int NEAR_RING_MAX_LEVEL = 2;
     private static final int EMERGENCY_UNDERLAY_LEVEL = 3;
+    private static final int GLOBAL_SAFETY_FLOOR_LEVEL = 6;
     private static final int EMERGENCY_FALLBACK_INNER_BLOCKS = 0;
     private static final int EMERGENCY_UNDERLAY_OUTER_BLOCKS = 2_048;
     private static final double PREDICTION_START_BLOCKS_PER_SECOND = 12.0;
@@ -175,6 +176,8 @@ public final class WorldgenSurfaceSampler {
         int predictiveCovered = 0;
         int emergencyDesired = 0;
         int emergencyCovered = 0;
+        int globalFloorDesired = 0;
+        int globalFloorCovered = 0;
         int outwardFrontierBlocks = -1;
         boolean nearCoverageComplete = true;
 
@@ -192,6 +195,13 @@ public final class WorldgenSurfaceSampler {
                 emergencyDesired++;
                 if (covered) {
                     emergencyCovered++;
+                }
+            }
+
+            if (isGlobalSafetyFloorWanted(wanted)) {
+                globalFloorDesired++;
+                if (covered) {
+                    globalFloorCovered++;
                 }
             }
 
@@ -213,6 +223,8 @@ public final class WorldgenSurfaceSampler {
                 predictiveCovered,
                 emergencyDesired,
                 emergencyCovered,
+                globalFloorDesired,
+                globalFloorCovered,
                 outwardFrontierBlocks,
                 nearCoverageComplete,
                 staleJobsCancelled
@@ -779,9 +791,13 @@ public final class WorldgenSurfaceSampler {
                 256,
                 32
         ));
-        rings.add(new WorldgenLodRing(4, 2_048, 4_096, 512, 64));
-        rings.add(new WorldgenLodRing(5, 4_096, 8_192, 1_024, 128));
-        rings.add(new WorldgenLodRing(6, 8_192, 16_384, 2_048, 256));
+        // M5.5 turns the far stack into nested fallback disks. L6 is the
+        // world-scale safety floor; L5/L4/L3 progressively replace it inward.
+        // No ring boundary can expose sky simply because the finer ring has not
+        // finished generating yet.
+        rings.add(new WorldgenLodRing(4, 0, 4_096, 512, 64));
+        rings.add(new WorldgenLodRing(5, 0, 8_192, 1_024, 128));
+        rings.add(new WorldgenLodRing(6, 0, 16_384, 2_048, 256));
 
         return List.copyOf(rings);
     }
@@ -1262,6 +1278,16 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
+        // -1) Establish the global L6 safety floor first. This is intentionally
+        // extremely coarse and cheap, but once present every point out to 16K
+        // has something underneath it while finer disks stream/refine.
+        WantedTile globalFloor =
+                firstMissingGlobalSafetyFloorCoverage(pending);
+        if (globalFloor != null) {
+            balancedCoverageStep = 0;
+            return globalFloor;
+        }
+
         // 0) Establish the full 0-2K L3 safety floor first. It is the hard
         // no-sky guarantee for unloaded/not-ready vanilla and for high-altitude
         // downward views. At speed the same cheap floor is also kept warm ahead.
@@ -1361,6 +1387,30 @@ public final class WorldgenSurfaceSampler {
         if (qualityWork != null) {
             balancedCoverageStep = 0;
             return qualityWork;
+        }
+
+        return null;
+    }
+
+    private static boolean isGlobalSafetyFloorWanted(
+            WantedTile wanted
+    ) {
+        return wanted.ring().lodLevel() == GLOBAL_SAFETY_FLOOR_LEVEL
+                && !wanted.prefetch();
+    }
+
+    private static WantedTile firstMissingGlobalSafetyFloorCoverage(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || !isGlobalSafetyFloorWanted(wanted)) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
         }
 
         return null;
@@ -4066,6 +4116,8 @@ public final class WorldgenSurfaceSampler {
             int predictiveCovered,
             int emergencyDesired,
             int emergencyCovered,
+            int globalFloorDesired,
+            int globalFloorCovered,
             int outwardFrontierBlocks,
             boolean nearCoverageComplete,
             int staleJobsCancelled

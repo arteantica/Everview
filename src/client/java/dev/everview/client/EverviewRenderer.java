@@ -25,10 +25,10 @@ import java.util.Set;
 /**
  * M4 unified hierarchical ownership renderer.
  *
- * M5.3 continuous fallback floor: Everview remains the terrain owner whenever
- * the client chunk is absent or present-but-not-render-ready. Vanilla takes a
- * chunk column only after its real surface sections are compiled and visible.
- * This makes handoff a direct LOD -> vanilla switch instead of an empty gap.
+ * M5.5 global safety floor: vanilla handoff is gated by actual renderer
+ * readiness AND camera-to-surface 3D reach. The LOD stack is a nested fallback
+ * hierarchy, so a coarse floor remains available anywhere a finer level is not
+ * resident. This prevents both high-altitude center holes and far-ring gaps.
  * L1/L2/L3 all use the same ownership mask. L2 no longer disappears as an all-or-nothing
  * 128-block tile; each section batch retires as its corresponding 32-block L1
  * tile becomes GPU-resident. L3 keeps its per-L2-region fallback. All masks
@@ -50,6 +50,7 @@ public final class EverviewRenderer {
     private static final double RING_LAYER_BIAS = 0.06D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
     private static final double VANILLA_OWNERSHIP_MARGIN_BLOCKS = 64.0D;
+    private static final double VANILLA_3D_HANDOFF_MARGIN_BLOCKS = 96.0D;
     private static final int[] SURFACE_PROBE_X = {8, 2, 13, 2, 13};
     private static final int[] SURFACE_PROBE_Z = {8, 2, 2, 13, 13};
 
@@ -122,8 +123,14 @@ public final class EverviewRenderer {
 
         WorldgenLodRing l1Ring = snapshot.ringForLevel(1);
         WorldgenLodRing l2Ring = snapshot.ringForLevel(2);
+        WorldgenLodRing l3Ring = snapshot.ringForLevel(3);
+        WorldgenLodRing l4Ring = snapshot.ringForLevel(4);
+        WorldgenLodRing l5Ring = snapshot.ringForLevel(5);
         Set<Long> residentL1Tiles = new HashSet<>();
         Set<Long> residentL2Tiles = new HashSet<>();
+        Set<Long> residentL3Tiles = new HashSet<>();
+        Set<Long> residentL4Tiles = new HashSet<>();
+        Set<Long> residentL5Tiles = new HashSet<>();
         Map<SectionKey, Boolean> vanillaVisibility = new HashMap<>();
         Map<ChunkKey, ColumnOwnershipResult> vanillaColumns = new HashMap<>();
         int vanillaOwnedBatches = 0;
@@ -142,6 +149,12 @@ public final class EverviewRenderer {
                 residentL1Tiles.add(packTile(tile.tileX(), tile.tileZ()));
             } else if (tile.lodLevel() == 2) {
                 residentL2Tiles.add(packTile(tile.tileX(), tile.tileZ()));
+            } else if (tile.lodLevel() == 3) {
+                residentL3Tiles.add(packTile(tile.tileX(), tile.tileZ()));
+            } else if (tile.lodLevel() == 4) {
+                residentL4Tiles.add(packTile(tile.tileX(), tile.tileZ()));
+            } else if (tile.lodLevel() == 5) {
+                residentL5Tiles.add(packTile(tile.tileX(), tile.tileZ()));
             }
         }
 
@@ -237,6 +250,30 @@ public final class EverviewRenderer {
                         cameraX,
                         cameraZ
                 );
+            } else if (tile.lodLevel() == 4 && l3Ring != null) {
+                finerLodMask = hasCoveredUnderlayRegion(
+                        gpuTile,
+                        l3Ring,
+                        residentL3Tiles,
+                        cameraX,
+                        cameraZ
+                );
+            } else if (tile.lodLevel() == 5 && l4Ring != null) {
+                finerLodMask = hasCoveredUnderlayRegion(
+                        gpuTile,
+                        l4Ring,
+                        residentL4Tiles,
+                        cameraX,
+                        cameraZ
+                );
+            } else if (tile.lodLevel() == 6 && l5Ring != null) {
+                finerLodMask = hasCoveredUnderlayRegion(
+                        gpuTile,
+                        l5Ring,
+                        residentL5Tiles,
+                        cameraX,
+                        cameraZ
+                );
             }
 
             boolean drewAny = false;
@@ -271,14 +308,29 @@ public final class EverviewRenderer {
                                 cameraX,
                                 cameraZ
                         );
-                    } else if (tile.lodLevel() == 3
-                            && l2Ring != null) {
-                        ownedByFinerLod = batch.underlayRegion()
+                    } else if (tile.lodLevel() >= 3
+                            && batch.underlayRegion()) {
+                        WorldgenLodRing finerRing = switch (tile.lodLevel()) {
+                            case 3 -> l2Ring;
+                            case 4 -> l3Ring;
+                            case 5 -> l4Ring;
+                            case 6 -> l5Ring;
+                            default -> null;
+                        };
+                        Set<Long> finerTiles = switch (tile.lodLevel()) {
+                            case 3 -> residentL2Tiles;
+                            case 4 -> residentL3Tiles;
+                            case 5 -> residentL4Tiles;
+                            case 6 -> residentL5Tiles;
+                            default -> Set.of();
+                        };
+
+                        ownedByFinerLod = finerRing != null
                                 && finerRingOwnsRegion(
                                         batch.regionTileX(),
                                         batch.regionTileZ(),
-                                        l2Ring,
-                                        residentL2Tiles,
+                                        finerRing,
+                                        finerTiles,
                                         cameraX,
                                         cameraZ
                                 );
@@ -290,7 +342,10 @@ public final class EverviewRenderer {
                                             client,
                                             batch,
                                             vanillaVisibility,
-                                            vanillaColumns
+                                            vanillaColumns,
+                                            cameraX,
+                                            cameraY,
+                                            cameraZ
                                     )
                                     : ColumnOwnershipResult.NOT_OWNED;
                     boolean ownedByVanilla = vanillaResult.owned();
@@ -479,7 +534,10 @@ public final class EverviewRenderer {
             Minecraft client,
             EverviewGpuTileCache.DrawBatch batch,
             Map<SectionKey, Boolean> visibility,
-            Map<ChunkKey, ColumnOwnershipResult> columns
+            Map<ChunkKey, ColumnOwnershipResult> columns,
+            double cameraX,
+            double cameraY,
+            double cameraZ
     ) {
         ColumnOwnershipResult aOwned = vanillaChunkColumnOwned(
                 client,
@@ -487,7 +545,10 @@ public final class EverviewRenderer {
                 batch.sectionY(),
                 batch.chunkAZ(),
                 visibility,
-                columns
+                columns,
+                cameraX,
+                cameraY,
+                cameraZ
         );
 
         if (!batch.boundary()) {
@@ -500,7 +561,10 @@ public final class EverviewRenderer {
                 batch.sectionY(),
                 batch.chunkBZ(),
                 visibility,
-                columns
+                columns,
+                cameraX,
+                cameraY,
+                cameraZ
         );
 
         return new ColumnOwnershipResult(
@@ -515,7 +579,10 @@ public final class EverviewRenderer {
             int hintSectionY,
             int chunkZ,
             Map<SectionKey, Boolean> visibility,
-            Map<ChunkKey, ColumnOwnershipResult> columns
+            Map<ChunkKey, ColumnOwnershipResult> columns,
+            double cameraX,
+            double cameraY,
+            double cameraZ
     ) {
         ChunkKey key = new ChunkKey(chunkX, chunkZ);
         ColumnOwnershipResult cached = columns.get(key);
@@ -533,6 +600,31 @@ public final class EverviewRenderer {
         if (chunk == null) {
             columns.put(key, ColumnOwnershipResult.NOT_OWNED);
             return ColumnOwnershipResult.NOT_OWNED;
+        }
+
+        // Renderer-visible is not sufficient when the camera is far above the
+        // terrain. Minecraft can retain compiled sections that sit beyond the
+        // current camera far plane; yielding LOD to those stale-visible columns
+        // creates the giant circular hole seen in straight-down flight tests.
+        int centerSurfaceY = chunk.getHeight(
+                Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                8,
+                8
+        );
+        double chunkCenterX = chunkX * 16.0D + 8.0D;
+        double chunkCenterZ = chunkZ * 16.0D + 8.0D;
+        double dx = chunkCenterX - cameraX;
+        double dy = centerSurfaceY - cameraY;
+        double dz = chunkCenterZ - cameraZ;
+        double vanillaReach = EverviewFarPlane.vanillaDepthFar()
+                + VANILLA_3D_HANDOFF_MARGIN_BLOCKS;
+
+        if (dx * dx + dy * dy + dz * dz
+                > vanillaReach * vanillaReach) {
+            ColumnOwnershipResult result =
+                    new ColumnOwnershipResult(false, true);
+            columns.put(key, result);
+            return result;
         }
 
         boolean visible = vanillaSurfaceColumnVisible(
