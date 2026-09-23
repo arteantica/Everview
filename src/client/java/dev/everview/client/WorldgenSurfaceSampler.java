@@ -66,8 +66,8 @@ public final class WorldgenSurfaceSampler {
     private static final int MAX_PREDICTIVE_LEAD_BLOCKS = 1_536;
     private static final int PREDICTIVE_ANCHOR_QUANTUM = 64;
     private static final int REMAINING_COVERAGE_BURST = 8;
-    private static final int EXACT_GEOMETRY_BURST = 3;
-    private static final int MAX_PROVISIONAL_EXACT_TILES = 12;
+    private static final int EXACT_GEOMETRY_BURST = 2;
+    private static final int MAX_PROVISIONAL_EXACT_TILES = 8;
     private static final int L1_PREFETCH_BLOCKS = 64;
     private static final int L2_PREFETCH_BLOCKS = 128;
     private static final int L1_BOOTSTRAP_SPACING = 4;
@@ -75,8 +75,10 @@ public final class WorldgenSurfaceSampler {
     private static final int L1_EXACT_SPACING = 1;
     private static final int L1_FINE_GRID_SAMPLES = 33;
     private static final int L1_SAMPLE_CACHE_LIMIT = 2_048;
-    private static final int L1_EXACT_BAND_BLOCKS = 64;
-    private static final int L1_INTERMEDIATE_BAND_BLOCKS = 128;
+    // M6.2: the whole visible L1 annulus is an exact 1-block target.
+    // Bootstrap still appears at 4b, but exact workers immediately replace it.
+    private static final int L1_EXACT_BAND_BLOCKS = 512;
+    private static final int L1_INTERMEDIATE_BAND_BLOCKS = 512;
     private static final int VIEW_SECTOR_COUNT = 16;
     private static final double VIEW_SECTOR_DEGREES = 360.0 / VIEW_SECTOR_COUNT;
     private static final int COVERAGE_FRONTIER_BUCKET_BLOCKS = 64;
@@ -764,15 +766,15 @@ public final class WorldgenSurfaceSampler {
                 1
         ));
 
-        // L2 deliberately overlaps the entire L1 annulus. It remains the
-        // persistent 8-block fallback surface underneath 1-block exact L1 so
-        // roaming never depends on high-detail refinement finishing first.
+        // L2 overlaps the full L1 annulus, but M6.2 raises it from 8b to 2b.
+        // This prevents an immediate cliff from exact 1b terrain to a visibly
+        // coarse carpet the moment L1 ends.
         rings.add(new WorldgenLodRing(
                 2,
                 innerRadius,
                 1_024,
                 128,
-                8
+                2
         ));
 
         // M5.4: L3 is a true full-disk fallback floor from the camera column
@@ -789,13 +791,14 @@ public final class WorldgenSurfaceSampler {
                 emergencyInnerRadius,
                 2_048,
                 256,
-                8
+                4
         ));
-        // M6.1: coverage still starts at 2x these targets, but the settled
-        // distance ladder now has visibly different detail at every level.
-        rings.add(new WorldgenLodRing(4, 0, 4_096, 512, 16));
-        rings.add(new WorldgenLodRing(5, 0, 8_192, 1_024, 32));
-        rings.add(new WorldgenLodRing(6, 0, 16_384, 2_048, 64));
+        // M6.2 uses a strict powers-of-two visual ladder after exact L1:
+        // L2 2b -> L3 4b -> L4 8b -> L5 16b -> L6 32b.
+        // First fill remains 2x coarser for L3-L6, then refinement converges.
+        rings.add(new WorldgenLodRing(4, 0, 4_096, 512, 8));
+        rings.add(new WorldgenLodRing(5, 0, 8_192, 1_024, 16));
+        rings.add(new WorldgenLodRing(6, 0, 16_384, 2_048, 32));
 
         return List.copyOf(rings);
     }
@@ -961,11 +964,11 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static int coverageLevelRank(int lodLevel) {
-        if (lodLevel == 2) {
-            return 0;
-        }
         if (lodLevel == 1) {
-            return 1;
+            return highSpeedCoverageMode ? 1 : 0;
+        }
+        if (lodLevel == 2) {
+            return highSpeedCoverageMode ? 0 : 1;
         }
         return lodLevel + 1;
     }
@@ -1276,20 +1279,41 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        // -1) Keep the local/predictive L3 safety floor available for the
-        // vanilla handoff. At normal speed it is only the first coarse stage;
-        // later refinement is deliberately deferred until L4/L5 exist.
+        // -2) Normal loading starts with the inspectable near field. L1 sorts
+        // before L2 here, and completed L1 bootstrap tiles immediately become
+        // eligible for the detached exact 1-block workers.
+        if (!highSpeedCoverageMode) {
+            WantedTile nearFirst =
+                    firstMissingCurrentNearCoverage(pending);
+            if (nearFirst != null) {
+                balancedCoverageStep = 0;
+                return nearFirst;
+            }
+        }
+
+        // -1) High-speed travel still keeps local L3 first. At normal speed we
+        // fill the global L6 horizon before middle-distance polish so there is
+        // no blue/sky wall while the detailed cascade is still streaming.
         WantedTile emergencyUnderlay =
                 firstMissingEmergencyUnderlayCoverage(pending);
+        if (highSpeedCoverageMode && emergencyUnderlay != null) {
+            balancedCoverageStep = 0;
+            return emergencyUnderlay;
+        }
+
+        WantedTile globalFloor =
+                firstMissingGlobalSafetyFloorCoverage(pending);
+        if (globalFloor != null) {
+            balancedCoverageStep = 0;
+            return globalFloor;
+        }
+
         if (emergencyUnderlay != null) {
             balancedCoverageStep = 0;
             return emergencyUnderlay;
         }
 
-        // 0) M6.0's HUD exposed the real visual problem: L3 and L6 could be
-        // complete while L4/L5 remained at 0. That made finer green L3 islands
-        // appear directly on top of a very coarse L6 world. Normal-speed
-        // loading now fills the missing visual cascade before near-detail work.
+        // 0) Fill L4 then L5 once both the near field and horizon exist.
         if (!highSpeedCoverageMode) {
             WantedTile progressiveFar =
                     firstMissingProgressiveFarCoverage(pending);
@@ -1299,17 +1323,7 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
-        // 1) The full L6 world floor remains the high-speed/no-hole guarantee.
-        // During normal loading it follows the L4/L5 cascade so nearby terrain
-        // reaches useful quality before the full 16K disk consumes the queue.
-        WantedTile globalFloor =
-                firstMissingGlobalSafetyFloorCoverage(pending);
-        if (globalFloor != null) {
-            balancedCoverageStep = 0;
-            return globalFloor;
-        }
-
-        // 2) Detached exact geometry is allowed to run beside coverage, but
+        // 1) Detached exact geometry is allowed to run beside coverage, but
         // once its provisional backlog reaches the cap the server lane spends
         // enough time on appearance to stop temporary green exact tiles from
         // spreading indefinitely.
@@ -1323,11 +1337,11 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
-        // 3) Near detail is useful only after continuity exists. In high-speed
-        // coverage mode both L1 and L2 are deferred: L3-L6 bootstrap coverage
-        // gets the world solid first, then near detail catches up after slowing.
-        WantedTile nearCoverage =
-                firstMissingCurrentNearCoverage(pending);
+        // 2) High-speed mode reaches the near field only after safety coverage.
+        // Normal mode already handled it at the top of the scheduler.
+        WantedTile nearCoverage = highSpeedCoverageMode
+                ? firstMissingCurrentNearCoverage(pending)
+                : null;
         if (nearCoverage != null) {
             balancedCoverageStep = 0;
             return nearCoverage;
@@ -1703,15 +1717,8 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile selectQualityWork(
             LodTileKey pending
     ) {
-        // M6.1 gives distant fidelity a real refinement lane. Refine L3 -> L6
-        // to their settled targets before spending the whole idle budget on
-        // exact L1 appearance. This is what makes "beyond L1/L2" actually
-        // become progressively different instead of staying bootstrap-quality.
-        WantedTile farRefinement = firstFarFidelityRefinement(pending);
-        if (farRefinement != null) {
-            return farRefinement;
-        }
-
+        // M6.2 mirrors mature LOD streaming: visible exact near terrain wins
+        // over far polish. Distant refinement runs after L1 has caught up.
         WantedTile exactGeometry = firstExactBandRefinement(pending);
         WantedTile exactAppearance =
                 firstExactAppearanceRefinement(pending);
@@ -1751,6 +1758,11 @@ public final class WorldgenSurfaceSampler {
 
         if (intermediate != null) {
             return intermediate;
+        }
+
+        WantedTile farRefinement = firstFarFidelityRefinement(pending);
+        if (farRefinement != null) {
+            return farRefinement;
         }
 
         return firstRefinement(pending, false);

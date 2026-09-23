@@ -279,3 +279,18 @@
 - [ ] validate that L4/L5 populate during initial load and green L3 islands no longer jump directly over L6
 - [ ] validate clear 16K horizon with world fog disabled
 - [ ] begin block-atlas/UV surface texturing after hierarchy quality is stable
+
+
+## M6.2 quality-first lighting
+- [x] make the entire visible L1 annulus a 1-block target instead of only the first 64 blocks
+- [x] prioritize L1 coverage before L2 at normal speed while retaining L2-first high-speed safety
+- [x] run exact 1-block L1 quality before far-ring refinement
+- [x] raise settled hierarchy to L1 1b / L2 2b / L3 4b / L4 8b / L5 16b / L6 32b
+- [x] fill the global L6 horizon before normal-speed middle-distance polish
+- [x] apply live sky-light, rain and thunder modulation to persistent LOD colors
+- [x] disable atmospheric fog directly in FogRenderer rather than one renderer call site
+- [x] preserve underwater/lava fog while removing normal world-distance fog
+- [x] invalidate prior far geometry with disk cache v23
+- [ ] validate night / sunrise / rain lighting against adjacent vanilla terrain
+- [ ] benchmark the denser 2/4/8/16/32b hierarchy
+- [ ] begin block-atlas UV surface rendering after this priority/density baseline is stable

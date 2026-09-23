@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M6.1 DEV | PROGRESSIVE FIDELITY CASCADE");
+        lines.add("Everview M6.2 DEV | QUALITY-FIRST LIGHTING");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Visual: L3 -> L4 -> L5 -> L6 cascade | vanilla world fog OFF");
-        lines.add("Settled targets: L3 8b | L4 16b | L5 32b | L6 64b");
+        lines.add("Visual: full L1 exact target | FogRenderer atmospheric fog OFF | live world lighting");
+        lines.add("LOD targets: L1 1b | L2 2b | L3 4b | L4 8b | L5 16b | L6 32b");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
@@ -246,7 +246,7 @@ public final class EverviewDebugHud {
                     reuse.appearanceReadyTiles(),
                     reuse.appearanceDesiredTiles(),
                     reuse.provisionalExactTiles(),
-                    12,
+                    8,
                     reuse.totalAppearanceGeneratedSamples()
             ));
             lines.add("Exact heights: "

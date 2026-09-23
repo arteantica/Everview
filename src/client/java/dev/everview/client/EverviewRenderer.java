@@ -10,6 +10,8 @@ import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
+import net.minecraft.util.ARGB;
+import net.minecraft.world.attribute.EnvironmentAttributes;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.AABB;
@@ -108,6 +110,7 @@ public final class EverviewRenderer {
             return;
         }
 
+        updateEnvironmentColorModulator(client, camera);
         EverviewMetrics.beginRenderFrame();
 
         var cameraPos = camera.position();
@@ -496,6 +499,59 @@ public final class EverviewRenderer {
         // vanilla-sensitive batches against renderer-visible terrain.
         return nearestDistance
                 <= vanillaRadius + VANILLA_OWNERSHIP_MARGIN_BLOCKS;
+    }
+
+    private static void updateEnvironmentColorModulator(
+            Minecraft client,
+            Camera camera
+    ) {
+        if (client.level == null) {
+            COLOR_MODULATOR.set(1.0F, 1.0F, 1.0F, 1.0F);
+            return;
+        }
+
+        float partialTick = client.getDeltaTracker()
+                .getGameTimeDeltaPartialTick(false);
+
+        float skyFactor = camera.attributeProbe().getValue(
+                EnvironmentAttributes.SKY_LIGHT_FACTOR,
+                partialTick
+        );
+        skyFactor = Math.max(0.0F, Math.min(1.0F, skyFactor));
+
+        float rain = Math.max(
+                0.0F,
+                Math.min(1.0F, client.level.getRainLevel(partialTick))
+        );
+        float thunder = Math.max(
+                0.0F,
+                Math.min(1.0F, client.level.getThunderLevel(partialTick))
+        );
+
+        int skyLightColor = camera.attributeProbe().getValue(
+                EnvironmentAttributes.SKY_LIGHT_COLOR,
+                partialTick
+        );
+        float sr = ARGB.redFloat(skyLightColor);
+        float sg = ARGB.greenFloat(skyLightColor);
+        float sb = ARGB.blueFloat(skyLightColor);
+
+        float brightness = 0.24F + skyFactor * 0.76F;
+        brightness *= 1.0F - rain * 0.18F;
+        brightness *= 1.0F - thunder * 0.28F;
+
+        float tintMix = 0.18F;
+        float night = 1.0F - skyFactor;
+        float r = brightness
+                * ((1.0F - tintMix) + sr * tintMix)
+                * (1.0F - night * 0.10F);
+        float g = brightness
+                * ((1.0F - tintMix) + sg * tintMix)
+                * (1.0F - night * 0.06F);
+        float b = brightness
+                * ((1.0F - tintMix) + sb * tintMix);
+
+        COLOR_MODULATOR.set(r, g, b, 1.0F);
     }
 
     public static void noteRecentlyCompiledSection(BlockPos origin) {
