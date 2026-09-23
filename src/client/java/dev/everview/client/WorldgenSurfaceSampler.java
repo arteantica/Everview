@@ -42,7 +42,7 @@ import java.util.concurrent.Executors;
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
-    public static final int HANDOFF_OVERLAP_BLOCKS = 32;
+    public static final int HANDOFF_OVERLAP_BLOCKS = 64;
     public static final int MAX_OUTER_RADIUS = 16_384;
 
     public static final long MIN_SLICE_BUDGET_NANOS = 1_000_000L;
@@ -51,6 +51,13 @@ public final class WorldgenSurfaceSampler {
     public static final long MAX_SLICE_BUDGET_NANOS = 16_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 128;
     private static final int EXACT_HEIGHT_WORKERS = 2;
+    private static final int COVERAGE_HEIGHT_WORKERS = Math.max(
+            2,
+            Math.min(
+                    8,
+                    Runtime.getRuntime().availableProcessors() - 2
+            )
+    );
     private static final int MAX_DETACHED_EXACT_JOBS = EXACT_HEIGHT_WORKERS;
 
     private static final int CACHE_LIMIT = 6_144;
@@ -97,6 +104,18 @@ public final class WorldgenSurfaceSampler {
                         Thread thread = new Thread(
                                 runnable,
                                 "Everview-ExactHeight"
+                        );
+                        thread.setDaemon(true);
+                        return thread;
+                    }
+            );
+    private static final ExecutorService COVERAGE_HEIGHT_EXECUTOR =
+            Executors.newFixedThreadPool(
+                    COVERAGE_HEIGHT_WORKERS,
+                    runnable -> {
+                        Thread thread = new Thread(
+                                runnable,
+                                "Everview-CoverageHeight"
                         );
                         thread.setDaemon(true);
                         return thread;
@@ -173,6 +192,10 @@ public final class WorldgenSurfaceSampler {
 
     public static WorldgenSurfaceSnapshot snapshot() {
         return snapshot;
+    }
+
+    public static int coverageWorkerCount() {
+        return COVERAGE_HEIGHT_WORKERS;
     }
 
     public static StreamingStatus streamingStatus() {
@@ -755,9 +778,12 @@ public final class WorldgenSurfaceSampler {
         // Progressive streaming still bootstraps these 32-block tiles at
         // 2-block spacing first, so coverage stays fast while exact detail
         // catches up behind the L2 safety layer.
+        // M6.4 materially widens the exact-quality band. With the usual
+        // 20-24 chunk vanilla distance this places roughly 500 blocks of
+        // 1-block LOD beyond the vanilla edge instead of ~190.
         int ultraNearOuter = Math.min(
                 1_024,
-                Math.max(544, innerRadius + 192)
+                Math.max(768, innerRadius + 512)
         );
 
         rings.add(new WorldgenLodRing(
@@ -1274,9 +1300,23 @@ public final class WorldgenSurfaceSampler {
             return target;
         }
 
-        return existing == null
-                ? Math.min(ring.tileSize(), ring.sampleSpacing() * 2)
-                : ring.sampleSpacing();
+        if (existing == null) {
+            int bootstrapMultiplier =
+                    ring.lodLevel() >= 4 ? 4 : 2;
+            return Math.min(
+                    ring.tileSize(),
+                    ring.sampleSpacing() * bootstrapMultiplier
+            );
+        }
+
+        if (existing.sampleSpacing() > ring.sampleSpacing()) {
+            return Math.max(
+                    ring.sampleSpacing(),
+                    existing.sampleSpacing() / 2
+            );
+        }
+
+        return existing.sampleSpacing();
     }
 
     private static WantedTile findNextMissing() {
@@ -2253,13 +2293,11 @@ public final class WorldgenSurfaceSampler {
         var generator = chunks.getGenerator();
         var randomState = chunks.randomState();
 
-        // M5.4 reuses the otherwise-idle height workers for coarse flight
-        // coverage. At high travel speed L3-L6 bootstrap tiles get their height
-        // samples in parallel, while biome/material appearance and mesh assembly
-        // stay on the server lane. This attacks the actual getBaseHeight
-        // bottleneck without moving palette/mesh logic off-thread.
-        if ((highSpeedCoverageMode
-                        && job.ring.lodLevel() >= EMERGENCY_UNDERLAY_LEVEL
+        // M6.4: all L2-L6 height coverage uses the dedicated worker pool, not
+        // just emergency high-speed coverage. getBaseHeight was the dominant
+        // reason a settled world could take 10+ minutes. Appearance and mesh
+        // assembly stay on the server lane for now.
+        if ((job.ring.lodLevel() >= 2
                         && job.sampleGrid == null)
                 || job.asyncCoverageStarted) {
             runAsyncCoverageGeometry(
@@ -2481,35 +2519,14 @@ public final class WorldgenSurfaceSampler {
             job.asyncMissingSampleIndices = sampleIndices;
             job.asyncStartedNanos = System.nanoTime();
 
-            int split = (sampleIndices.length + 1) / 2;
-            CompletableFuture<HeightPart> first = CompletableFuture.supplyAsync(
-                    () -> computeHeightPart(
-                            level,
-                            generator,
-                            randomState,
-                            job,
-                            sampleIndices,
-                            0,
-                            split
-                    ),
-                    EXACT_HEIGHT_EXECUTOR
-            );
-            CompletableFuture<HeightPart> second = CompletableFuture.supplyAsync(
-                    () -> computeHeightPart(
-                            level,
-                            generator,
-                            randomState,
-                            job,
-                            sampleIndices,
-                            split,
-                            sampleIndices.length
-                    ),
-                    EXACT_HEIGHT_EXECUTOR
-            );
-
-            job.asyncHeightFuture = first.thenCombine(
-                    second,
-                    HeightBatchResult::combine
+            job.asyncHeightFuture = submitHeightBatch(
+                    level,
+                    generator,
+                    randomState,
+                    job,
+                    sampleIndices,
+                    COVERAGE_HEIGHT_EXECUTOR,
+                    COVERAGE_HEIGHT_WORKERS
             );
 
             lastSliceSamples = 0;
@@ -2855,6 +2872,79 @@ public final class WorldgenSurfaceSampler {
 
         lastSliceSamples = result.sampleIndices().length;
         lastSliceMs = (System.nanoTime() - sliceStart) / 1_000_000.0;
+    }
+
+    private static CompletableFuture<HeightBatchResult> submitHeightBatch(
+            ServerLevel level,
+            net.minecraft.world.level.chunk.ChunkGenerator generator,
+            net.minecraft.world.level.levelgen.RandomState randomState,
+            GenerationJob job,
+            int[] sampleIndices,
+            ExecutorService executor,
+            int requestedWorkers
+    ) {
+        int workers = Math.max(
+                1,
+                Math.min(requestedWorkers, sampleIndices.length)
+        );
+        List<CompletableFuture<HeightPart>> futures =
+                new ArrayList<>(workers);
+
+        for (int worker = 0; worker < workers; worker++) {
+            int start = sampleIndices.length * worker / workers;
+            int end = sampleIndices.length * (worker + 1) / workers;
+
+            futures.add(CompletableFuture.supplyAsync(
+                    () -> computeHeightPart(
+                            level,
+                            generator,
+                            randomState,
+                            job,
+                            sampleIndices,
+                            start,
+                            end
+                    ),
+                    executor
+            ));
+        }
+
+        CompletableFuture<?>[] all =
+                futures.toArray(new CompletableFuture<?>[0]);
+
+        return CompletableFuture.allOf(all).thenApply(ignored -> {
+            int total = 0;
+            HeightPart[] parts = new HeightPart[futures.size()];
+
+            for (int i = 0; i < futures.size(); i++) {
+                parts[i] = futures.get(i).join();
+                total += parts[i].sampleIndices().length;
+            }
+
+            int[] indices = new int[total];
+            int[] heights = new int[total];
+            int offset = 0;
+
+            for (HeightPart part : parts) {
+                int count = part.sampleIndices().length;
+                System.arraycopy(
+                        part.sampleIndices(),
+                        0,
+                        indices,
+                        offset,
+                        count
+                );
+                System.arraycopy(
+                        part.heights(),
+                        0,
+                        heights,
+                        offset,
+                        count
+                );
+                offset += count;
+            }
+
+            return new HeightBatchResult(indices, heights);
+        });
     }
 
     private static HeightPart computeHeightPart(

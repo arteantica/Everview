@@ -1,8 +1,12 @@
 package dev.everview.client;
 
+import com.mojang.blaze3d.platform.InputConstants;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.DeltaTracker;
+import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.resources.Identifier;
@@ -11,35 +15,105 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Always-on development telemetry for alpha builds.
+ * Compact telemetry by default; F8 expands the full development panel.
  */
 public final class EverviewDebugHud {
     private static final Identifier HUD_ID =
             Identifier.fromNamespaceAndPath(EverviewClient.MOD_ID, "debug_hud");
 
+    private static final KeyMapping TOGGLE_KEY = new KeyMapping(
+            "key.everview.debug_hud",
+            InputConstants.Type.KEYBOARD,
+            InputConstants.KEY_F8,
+            KeyMapping.Category.MISC
+    );
+
+    private static boolean expanded;
+
     private EverviewDebugHud() {
     }
 
     public static void register() {
+        KeyMappingHelper.registerKeyMapping(TOGGLE_KEY);
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            while (TOGGLE_KEY.consumeClick()) {
+                expanded = !expanded;
+            }
+        });
         HudElementRegistry.addLast(HUD_ID, EverviewDebugHud::extractRenderState);
     }
 
-    private static void extractRenderState(GuiGraphicsExtractor graphics, DeltaTracker deltaTracker) {
+    private static void extractRenderState(
+            GuiGraphicsExtractor graphics,
+            DeltaTracker deltaTracker
+    ) {
         Minecraft client = Minecraft.getInstance();
-        if (client.font == null || client.level == null || client.gui.hud.isHidden()) {
+        if (client.font == null
+                || client.level == null
+                || client.gui.hud.isHidden()) {
             return;
         }
 
         EverviewMetrics.Snapshot metrics = EverviewMetrics.snapshot();
         WorldgenSurfaceSnapshot far = WorldgenSurfaceSampler.snapshot();
+        List<String> lines = expanded
+                ? expandedLines(metrics, far)
+                : compactLines(metrics, far);
 
+        drawPanel(graphics, client, lines);
+    }
+
+    private static List<String> compactLines(
+            EverviewMetrics.Snapshot metrics,
+            WorldgenSurfaceSnapshot far
+    ) {
+        List<String> lines = new ArrayList<>();
+        lines.add("Everview M6.4 | F8 details");
+
+        if (!far.available()) {
+            lines.add("LOD worldgen unavailable");
+            return lines;
+        }
+
+        WorldgenSurfaceSampler.L1ViewStatus front =
+                WorldgenSurfaceSampler.l1ViewStatus();
+        WorldgenSurfaceSampler.StreamingStatus stream =
+                WorldgenSurfaceSampler.streamingStatus();
+
+        double tilesPerSecond = far.initialFillSeconds() > 0.0
+                ? far.readyTileCount() / far.initialFillSeconds()
+                : 0.0;
+
+        lines.add(String.format(
+                "Cover %.0f%% | L1 1b %d/%d | %.1f tiles/s",
+                far.completionPercent(),
+                front.exact(),
+                front.desired(),
+                tilesPerSecond
+        ));
+        lines.add(String.format(
+                "Gen %.1f ms | geometry %.3f ms | %s",
+                far.sliceBudgetMs(),
+                metrics.drawMs(),
+                stream.highSpeedCoverageMode() ? "FAST COVERAGE" : "NORMAL"
+        ));
+
+        return lines;
+    }
+
+    private static List<String> expandedLines(
+            EverviewMetrics.Snapshot metrics,
+            WorldgenSurfaceSnapshot far
+    ) {
         boolean sodium = FabricLoader.getInstance().isModLoaded("sodium");
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M6.3 DEV | VANILLA SHIELD");
-        lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Visual: L3 shields vanilla from coarse floors | vanilla chunk fade OFF | live lighting");
+        lines.add("Everview M6.4 DEV | STREAMING CORE");
+        lines.add("F8 compact | 26.3 Fabric | Sodium "
+                + yesNo(sodium) + " | Iris " + yesNo(iris));
+        lines.add("Streaming: async L2-L6 height workers | progressive 4x far bootstrap");
+        lines.add("Handoff: 64b overlap | upload grace | chunk fade forced OFF");
         lines.add("LOD targets: L1 1b | L2 2b | L3 4b | L4 8b | L5 16b | L6 32b");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
@@ -51,7 +125,8 @@ public final class EverviewDebugHud {
         if (far.available()) {
             for (WorldgenRingStatus status : far.rings()) {
                 WorldgenLodRing ring = status.ring();
-                EverviewMetrics.RingRenderStats render = metrics.ring(ring.lodLevel());
+                EverviewMetrics.RingRenderStats render =
+                        metrics.ring(ring.lodLevel());
 
                 lines.add(String.format(
                         "L%d %d-%d s%d: gen %d/%d | c/s/d %d/%d/%d | q %d | max %.0f",
@@ -91,9 +166,11 @@ public final class EverviewDebugHud {
             }
 
             for (WorldgenSurfaceTile tile : far.tiles()) {
-                WorldgenLodRing targetRing = far.ringForLevel(tile.lodLevel());
+                WorldgenLodRing targetRing =
+                        far.ringForLevel(tile.lodLevel());
                 if (targetRing != null
-                        && tile.sampleSpacing() <= targetRing.sampleSpacing()) {
+                        && tile.sampleSpacing()
+                                <= targetRing.sampleSpacing()) {
                     refinedTiles++;
                     if (tile.lodLevel() <= 2) {
                         nearRefined++;
@@ -133,7 +210,6 @@ public final class EverviewDebugHud {
                     refinePercent,
                     far.taskInFlight() ? "ON" : "OFF"
             ));
-
             lines.add(String.format(
                     "Near L1/L2: cover %d/%d (%.0f%%) | refine %d/%d (%.0f%%)",
                     nearCovered,
@@ -143,7 +219,6 @@ public final class EverviewDebugHud {
                     nearDesired,
                     nearRefinePercent
             ));
-
             lines.add(String.format(
                     "L1 actual: cover %d/%d | <=2b %d/%d | geom %d/%d | final %d/%d",
                     l1Covered,
@@ -158,7 +233,6 @@ public final class EverviewDebugHud {
 
             WorldgenSurfaceSampler.L1ViewStatus front =
                     WorldgenSurfaceSampler.l1ViewStatus();
-
             lines.add(String.format(
                     "L1 front: cover %d/%d | <=2b %d/%d | 1b %d/%d",
                     front.covered(),
@@ -171,13 +245,12 @@ public final class EverviewDebugHud {
 
             WorldgenSurfaceSampler.StreamingStatus stream =
                     WorldgenSurfaceSampler.streamingStatus();
-
             String frontier = stream.outwardFrontierBlocks() < 0
                     ? "DONE"
                     : stream.outwardFrontierBlocks() + "b";
 
             lines.add(String.format(
-                    "Motion: %.1f b/s | lead %db | ahead %d/%d | L3 %d/%d | L6 floor %d/%d | %s | frontier %s | detail %s | stale %d",
+                    "Motion: %.1f b/s | lead %db | ahead %d/%d | L3 %d/%d | L6 %d/%d | %s | frontier %s | %s | stale %d",
                     stream.speedBlocksPerSecond(),
                     stream.predictiveLeadBlocks(),
                     stream.predictiveCovered(),
@@ -195,14 +268,12 @@ public final class EverviewDebugHud {
             double tilesPerSecond = far.initialFillSeconds() > 0.0
                     ? far.readyTileCount() / far.initialFillSeconds()
                     : 0.0;
-
             lines.add(String.format(
                     "Initial fill: %s %s | %.1f tiles/s",
                     formatDuration(far.initialFillSeconds()),
                     far.initialFillComplete() ? "DONE" : "RUNNING",
                     tilesPerSecond
             ));
-
             lines.add(String.format(
                     "Disk: %s | loaded %d in %.1f ms | saved %d %.2f MiB in %.1f ms%s",
                     far.diskCacheStatus(),
@@ -213,7 +284,6 @@ public final class EverviewDebugHud {
                     far.diskSaveMs(),
                     far.diskIoInFlight() ? " | IO" : ""
             ));
-
             lines.add(String.format(
                     "Adaptive gen %.2f ms | server %.1f ms | frame %.1f ms | last %.3f / %d | L%d %.0f%%",
                     far.sliceBudgetMs(),
@@ -228,12 +298,15 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSampler.RefinementReuseStatus reuse =
                     WorldgenSurfaceSampler.refinementReuseStatus();
             int lastTotalSamples =
-                    reuse.lastReusedSamples() + reuse.lastGeneratedSamples();
+                    reuse.lastReusedSamples()
+                            + reuse.lastGeneratedSamples();
             double reusePercent = lastTotalSamples > 0
-                    ? reuse.lastReusedSamples() * 100.0 / lastTotalSamples
+                    ? reuse.lastReusedSamples()
+                            * 100.0 / lastTotalSamples
                     : 0.0;
+
             lines.add(String.format(
-                    "L1 samples: height reuse %d/%d (%.0f%%) | new appearance %d | borrowed %d | grids %d",
+                    "L1 samples: height reuse %d/%d (%.0f%%) | appearance %d | borrowed %d | grids %d",
                     reuse.lastReusedSamples(),
                     lastTotalSamples,
                     reusePercent,
@@ -242,16 +315,17 @@ public final class EverviewDebugHud {
                     reuse.cachedL1Grids()
             ));
             lines.add(String.format(
-                    "L1 appearance: %d/%d exact tiles | provisional %d/%d | biome samples %d",
+                    "L1 appearance: %d/%d exact | provisional %d/%d | biome samples %d",
                     reuse.appearanceReadyTiles(),
                     reuse.appearanceDesiredTiles(),
                     reuse.provisionalExactTiles(),
                     8,
                     reuse.totalAppearanceGeneratedSamples()
             ));
-            lines.add("Exact heights: "
+            lines.add("Height workers: exact "
                     + reuse.exactJobsActive()
-                    + "/2 tile workers"
+                    + "/2 | coverage "
+                    + WorldgenSurfaceSampler.coverageWorkerCount()
                     + (reuse.serverExactFallback()
                             ? " | SERVER FALLBACK"
                             : ""));
@@ -262,7 +336,7 @@ public final class EverviewDebugHud {
         EverviewRenderer.OwnershipStats ownership =
                 EverviewRenderer.ownershipStats();
         lines.add(String.format(
-                "Ownership mask: vanilla %d | finer %d | LOD visible %d | loaded waiting %d",
+                "Ownership: vanilla %d | finer %d | LOD visible %d | waiting %d",
                 ownership.vanillaOwnedBatches(),
                 ownership.finerOwnedBatches(),
                 ownership.visibleLodBatches(),
@@ -277,8 +351,7 @@ public final class EverviewDebugHud {
                 gpu.uploadsThisFrame(),
                 gpu.uploadMs()
         ));
-
-        lines.add("Frame total c/s/d: " + metrics.tilesCulled() + "/"
+        lines.add("Frame c/s/d: " + metrics.tilesCulled() + "/"
                 + metrics.submissions() + "/" + metrics.tilesDrawn());
         lines.add("Draw calls: " + metrics.drawCalls()
                 + " | handoff " + metrics.handoffDrawCalls()
@@ -286,6 +359,14 @@ public final class EverviewDebugHud {
         lines.add("Geometry CPU: " + formatMs(metrics.drawMs())
                 + " | target: " + EverviewClient.TARGET_DISTANCE_BLOCKS);
 
+        return lines;
+    }
+
+    private static void drawPanel(
+            GuiGraphicsExtractor graphics,
+            Minecraft client,
+            List<String> lines
+    ) {
         int x = 6;
         int y = 6;
         int pad = 4;
@@ -304,7 +385,14 @@ public final class EverviewDebugHud {
         int textY = y + pad;
         for (int i = 0; i < lines.size(); i++) {
             int color = i == 0 ? 0xFF77F59A : 0xFFFFFFFF;
-            graphics.text(client.font, lines.get(i), x + pad, textY, color, true);
+            graphics.text(
+                    client.font,
+                    lines.get(i),
+                    x + pad,
+                    textY,
+                    color,
+                    true
+            );
             textY += lineHeight;
         }
     }
@@ -318,7 +406,11 @@ public final class EverviewDebugHud {
         double remainingSeconds = seconds - wholeMinutes * 60.0;
 
         if (wholeMinutes > 0) {
-            return String.format("%d:%04.1f", wholeMinutes, remainingSeconds);
+            return String.format(
+                    "%d:%04.1f",
+                    wholeMinutes,
+                    remainingSeconds
+            );
         }
 
         return String.format("%.1fs", remainingSeconds);

@@ -303,3 +303,18 @@
 - [x] stop very coarse fallback terrain from bleeding through caves, rivers and vegetation gaps near vanilla
 - [x] force newly compiled vanilla sections to zero fade duration so they appear opaque immediately
 - [ ] validate cave mouths, rivers, trees, newly generated chunks and high-speed handoff
+
+
+## M6.4 streaming core + HUD
+- [x] compact HUD by default with F8 toggle to the full telemetry panel
+- [x] force the vanilla/Sodium chunk fade option to zero while Everview is active
+- [x] force RenderSection.setFadeDuration to zero regardless of caller
+- [x] widen vanilla/LOD overlap from 32b to 64b
+- [x] keep LOD under freshly uploaded vanilla for a 120ms opaque handoff grace window
+- [x] widen the exact L1 band from ~192b to roughly 500b beyond the vanilla edge
+- [x] move all L2-L6 height coverage to a dedicated multi-worker executor
+- [x] scale coverage workers up to 8 logical workers based on available processors
+- [x] make L4-L6 first-fill 4x coarser, then refine 2x -> target instead of blocking on near-final quality
+- [ ] benchmark cold-start tiles/s and time to first complete 16K horizon
+- [ ] add cross-LOD shared height sample cache to eliminate duplicate worldgen calls
+- [ ] move material/mesh finishing off the server lane after thread-safety validation

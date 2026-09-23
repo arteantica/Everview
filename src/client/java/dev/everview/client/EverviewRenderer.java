@@ -53,6 +53,7 @@ public final class EverviewRenderer {
     private static final double BASE_TERRAIN_BIAS = 0.35D;
     private static final double RING_LAYER_BIAS = 0.75D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
+    private static final long VANILLA_HANDOFF_GRACE_NANOS = 120_000_000L;
     private static final double VANILLA_OWNERSHIP_MARGIN_BLOCKS = 64.0D;
     private static final double VANILLA_3D_HANDOFF_MARGIN_BLOCKS = 96.0D;
     private static final double MAX_VANILLA_VERTICAL_HANDOFF_BLOCKS = 512.0D;
@@ -732,11 +733,40 @@ public final class EverviewRenderer {
                 visibility
         );
 
-        ColumnOwnershipResult result = visible
+        // Keep the LOD under a freshly uploaded vanilla column for a tiny
+        // overlap window. Vanilla is already opaque and wins depth, but this
+        // prevents a one-frame sky crack while moving across the handoff edge.
+        boolean grace = visible && recentlyCompiledColumn(
+                chunkX,
+                chunkZ,
+                VANILLA_HANDOFF_GRACE_NANOS
+        );
+
+        ColumnOwnershipResult result = visible && !grace
                 ? new ColumnOwnershipResult(true, false)
                 : new ColumnOwnershipResult(false, true);
         columns.put(key, result);
         return result;
+    }
+
+    private static boolean recentlyCompiledColumn(
+            int chunkX,
+            int chunkZ,
+            long maxAgeNanos
+    ) {
+        long now = System.nanoTime();
+
+        for (Map.Entry<SectionKey, Long> entry
+                : RECENTLY_COMPILED_SECTIONS.entrySet()) {
+            SectionKey section = entry.getKey();
+            if (section.chunkX() == chunkX
+                    && section.chunkZ() == chunkZ
+                    && now - entry.getValue() <= maxAgeNanos) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static boolean vanillaSurfaceColumnVisible(
