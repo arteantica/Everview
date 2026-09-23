@@ -789,15 +789,14 @@ public final class WorldgenSurfaceSampler {
                 emergencyInnerRadius,
                 2_048,
                 256,
-                32
+                16
         ));
-        // M5.5 turns the far stack into nested fallback disks. L6 is the
-        // world-scale safety floor; L5/L4/L3 progressively replace it inward.
-        // No ring boundary can expose sky simply because the finer ring has not
-        // finished generating yet.
-        rings.add(new WorldgenLodRing(4, 0, 4_096, 512, 64));
-        rings.add(new WorldgenLodRing(5, 0, 8_192, 1_024, 128));
-        rings.add(new WorldgenLodRing(6, 0, 16_384, 2_048, 256));
+        // M6.0 gives every distant level a visibly different target density.
+        // L4-L6 still bootstrap at 2x spacing for coverage speed, then refine
+        // to these targets after the world is solid.
+        rings.add(new WorldgenLodRing(4, 0, 4_096, 512, 32));
+        rings.add(new WorldgenLodRing(5, 0, 8_192, 1_024, 64));
+        rings.add(new WorldgenLodRing(6, 0, 16_384, 2_048, 128));
 
         return List.copyOf(rings);
     }
@@ -2781,8 +2780,13 @@ public final class WorldgenSurfaceSampler {
             int sampleIndex = sampleIndices[start + i];
             int gx = sampleIndex % job.samplesAcross;
             int gz = sampleIndex / job.samplesAcross;
-            int worldX = job.originX + gx;
-            int worldZ = job.originZ + gz;
+            // M6.0: coarse async coverage must sample the real world-space
+            // lattice. The old worker forgot sampleSpacing here, so a 2048b L6
+            // tile could read heights from only its first ~8 blocks and then
+            // stretch that tiny patch across the whole tile. That is the main
+            // source of the repeated blobs/squares seen beyond L1/L2.
+            int worldX = job.originX + gx * job.sampleSpacing;
+            int worldZ = job.originZ + gz * job.sampleSpacing;
 
             int y = generator.getBaseHeight(
                     worldX,
@@ -2804,6 +2808,10 @@ public final class WorldgenSurfaceSampler {
         if (job.ring.lodLevel() == 1
                 && job.sampleSpacing == L1_EXACT_SPACING) {
             return buildBlockColumnMesh(job, seaLevel);
+        }
+
+        if (job.ring.lodLevel() >= 3) {
+            return buildMinecraftFacetedMesh(job, seaLevel);
         }
 
         if (job.sampleSpacing <= 8) {
@@ -3179,6 +3187,174 @@ public final class WorldgenSurfaceSampler {
         );
     }
 
+    /**
+     * M6.0 distant terrain renderer.
+     *
+     * L3-L6 keep the real sampled terrain silhouette but stop interpolating
+     * biome colors across giant quads. Each coarse cell gets one Minecraft-like
+     * material/color and an integer-quantized surface. The result reads as
+     * distant Minecraft terrain instead of a continuous watercolor heightfield.
+     */
+    private static MeshData buildMinecraftFacetedMesh(
+            GenerationJob job,
+            int seaLevel
+    ) {
+        int cells = job.cellsAcross;
+        int spacing = job.sampleSpacing;
+        int verticalQuantum = switch (job.ring.lodLevel()) {
+            case 3 -> 1;
+            case 4 -> 2;
+            case 5 -> 4;
+            default -> 8;
+        };
+
+        MeshBuilder mesh = new MeshBuilder(job.cellCount);
+
+        for (int gz = 0; gz < cells; gz++) {
+            int z0 = job.originZ + gz * spacing;
+            int z1 = z0 + spacing;
+
+            for (int gx = 0; gx < cells; gx++) {
+                int x0 = job.originX + gx * spacing;
+                int x1 = x0 + spacing;
+
+                int i00 = gz * job.samplesAcross + gx;
+                int i10 = i00 + 1;
+                int i01 = (gz + 1) * job.samplesAcross + gx;
+                int i11 = i01 + 1;
+
+                int raw00 = displaySampleHeight(job, i00, seaLevel);
+                int raw10 = displaySampleHeight(job, i10, seaLevel);
+                int raw01 = displaySampleHeight(job, i01, seaLevel);
+                int raw11 = displaySampleHeight(job, i11, seaLevel);
+
+                float dx = ((raw10 + raw11) - (raw00 + raw01))
+                        * 0.5F / Math.max(1, spacing);
+                float dz = ((raw01 + raw11) - (raw00 + raw10))
+                        * 0.5F / Math.max(1, spacing);
+                float maxRise = Math.max(
+                        Math.max(Math.abs(raw10 - raw00), Math.abs(raw01 - raw00)),
+                        Math.max(Math.abs(raw11 - raw10), Math.abs(raw11 - raw01))
+                );
+                float steepness = Math.min(
+                        1.0F,
+                        maxRise / Math.max(1.0F, spacing * 0.85F)
+                );
+
+                byte material = dominantMaterial(job, i00, i10, i01, i11);
+                if (material == MinecraftSurfacePalette.MATERIAL_GRASS
+                        && steepness > 0.55F) {
+                    material = MinecraftSurfacePalette.MATERIAL_STONE;
+                }
+
+                int y00;
+                int y10;
+                int y01;
+                int y11;
+
+                if (material == MinecraftSurfacePalette.MATERIAL_WATER
+                        || material == MinecraftSurfacePalette.MATERIAL_ICE) {
+                    y00 = seaLevel;
+                    y10 = seaLevel;
+                    y01 = seaLevel;
+                    y11 = seaLevel;
+                } else {
+                    y00 = quantizeHeight(raw00, verticalQuantum);
+                    y10 = quantizeHeight(raw10, verticalQuantum);
+                    y01 = quantizeHeight(raw01, verticalQuantum);
+                    y11 = quantizeHeight(raw11, verticalQuantum);
+                }
+
+                float invLength = 1.0F
+                        / (float) Math.sqrt(dx * dx + 1.0F + dz * dz);
+                float nx = -dx * invLength;
+                float ny = invLength;
+                float nz = -dz * invLength;
+                float lightDot =
+                        nx * -0.45F + ny * 0.86F + nz * -0.24F;
+                float shade = 0.74F
+                        + Math.max(0.0F, lightDot) * 0.28F;
+
+                int baseColor;
+                if (material == MinecraftSurfacePalette.MATERIAL_STONE
+                        && job.sampleMaterials[i00]
+                                != MinecraftSurfacePalette.MATERIAL_STONE
+                        && job.sampleMaterials[i10]
+                                != MinecraftSurfacePalette.MATERIAL_STONE
+                        && job.sampleMaterials[i01]
+                                != MinecraftSurfacePalette.MATERIAL_STONE
+                        && job.sampleMaterials[i11]
+                                != MinecraftSurfacePalette.MATERIAL_STONE) {
+                    baseColor = MinecraftSurfacePalette.stoneColor();
+                } else {
+                    baseColor = representativeColor(
+                            job,
+                            material,
+                            i00,
+                            i10,
+                            i01,
+                            i11
+                    );
+                }
+
+                int centerX = x0 + spacing / 2;
+                int centerZ = z0 + spacing / 2;
+                int centerY = Math.round(
+                        (y00 + y10 + y01 + y11) * 0.25F
+                );
+
+                int color = MaterialTerrainShading.apply(
+                        MinecraftSurfacePalette.applyLighting(
+                                baseColor,
+                                material == MinecraftSurfacePalette.MATERIAL_WATER
+                                        || material == MinecraftSurfacePalette.MATERIAL_ICE
+                                        ? 0.96F
+                                        : shade
+                        ),
+                        material,
+                        centerX,
+                        centerY,
+                        centerZ,
+                        spacing
+                );
+
+                // One flat material color per coarse facet. Geometry can slope
+                // between real sampled heights, but color no longer turns a
+                // 128/256-block cell into one giant interpolated gradient blob.
+                mesh.addQuad(
+                        x0, y00, z0,
+                        x0, y01, z1,
+                        x1, y11, z1,
+                        x1, y10, z0,
+                        color,
+                        material
+                );
+            }
+        }
+
+        return mesh.finish();
+    }
+
+    private static int displaySampleHeight(
+            GenerationJob job,
+            int sampleIndex,
+            int seaLevel
+    ) {
+        byte material = job.sampleMaterials[sampleIndex];
+        return material == MinecraftSurfacePalette.MATERIAL_WATER
+                || material == MinecraftSurfacePalette.MATERIAL_ICE
+                ? seaLevel
+                : job.heights[sampleIndex];
+    }
+
+    private static int quantizeHeight(int y, int quantum) {
+        if (quantum <= 1) {
+            return y;
+        }
+
+        return Math.round(y / (float) quantum) * quantum;
+    }
+
     private static MeshData buildSmoothMesh(GenerationJob job) {
         int[] vertices = new int[job.cellCount * 12];
         int[] colors = new int[job.cellCount * 4];
@@ -3487,7 +3663,7 @@ public final class WorldgenSurfaceSampler {
             int i01,
             int i11
     ) {
-        int[] counts = new int[7];
+        int[] counts = new int[MinecraftSurfacePalette.MATERIAL_COUNT];
         int[] indices = {i00, i10, i01, i11};
 
         for (int index : indices) {
@@ -3604,6 +3780,10 @@ public final class WorldgenSurfaceSampler {
             case MinecraftSurfacePalette.MATERIAL_SAND -> 0xB7A66F;
             case MinecraftSurfacePalette.MATERIAL_TERRACOTTA -> 0x8F4F38;
             case MinecraftSurfacePalette.MATERIAL_SNOW -> 0x83888A;
+            case MinecraftSurfacePalette.MATERIAL_GRAVEL -> 0x726F69;
+            case MinecraftSurfacePalette.MATERIAL_PODZOL -> 0x5A3E25;
+            case MinecraftSurfacePalette.MATERIAL_MUD -> 0x3E3834;
+            case MinecraftSurfacePalette.MATERIAL_ICE -> 0x8FB9D8;
             default -> MinecraftSurfacePalette.stoneColor();
         };
 

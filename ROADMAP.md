@@ -252,3 +252,17 @@
 - [x] generate newly exposed L3 directly at 32-block spacing instead of a 64-block bootstrap
 - [x] increase inter-LOD depth separation to suppress far-distance z-fighting / drought cracks
 - [ ] validate stationary high-altitude view, x15 motion, direction reversal, and pixel/crack cleanup
+
+
+## M6.0 Minecraft surface fidelity
+- [x] fix coarse async height workers to multiply grid coordinates by sample spacing
+- [x] stop stretching a tiny corner height sample across entire L3-L6 tiles
+- [x] raise far-level target detail to L3 16b / L4 32b / L5 64b / L6 128b
+- [x] replace L3-L6 per-vertex color gradients with flat material facets
+- [x] quantize distant vertical silhouette progressively by LOD instead of using one identical smooth look
+- [x] add gravel, podzol, mud, ice and layered badlands surface classes
+- [x] reduce broad procedural color blobs and use tighter material breakup
+- [x] invalidate M5 disk geometry with cache v21
+- [ ] add true block-atlas texturing / surface-rule reconstruction for near LODs
+- [ ] add vegetation/trees as a separate distant feature layer
+- [ ] validate L3-L6 visual distinction, shorelines, mountains, badlands and frozen biomes

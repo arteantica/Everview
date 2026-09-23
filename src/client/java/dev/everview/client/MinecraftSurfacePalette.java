@@ -22,6 +22,11 @@ public final class MinecraftSurfacePalette {
     public static final byte MATERIAL_SNOW = 4;
     public static final byte MATERIAL_TERRACOTTA = 5;
     public static final byte MATERIAL_DIRT = 6;
+    public static final byte MATERIAL_GRAVEL = 7;
+    public static final byte MATERIAL_PODZOL = 8;
+    public static final byte MATERIAL_MUD = 9;
+    public static final byte MATERIAL_ICE = 10;
+    public static final int MATERIAL_COUNT = 11;
 
     private static final int WATER = 0x3B6E98;
     private static final int SWAMP_WATER = 0x4D6256;
@@ -31,6 +36,10 @@ public final class MinecraftSurfacePalette {
     private static final int SNOW = 0xE7EBEC;
     private static final int TERRACOTTA = 0xA85F43;
     private static final int DIRT = 0x866043;
+    private static final int GRAVEL = 0x837E76;
+    private static final int PODZOL = 0x6B4A2D;
+    private static final int MUD = 0x443B36;
+    private static final int ICE = 0xA7D7F2;
     private static final int FALLBACK_GRASS = 0x6F9D50;
 
     // Biome identity/classification is invariant for the lifetime of a holder.
@@ -56,25 +65,45 @@ public final class MinecraftSurfacePalette {
 
         if (worldY < seaLevel
                 || (worldY <= seaLevel + 1 && profile.waterBiome())) {
-            if (profile.frozen()) {
-                return new SampleAppearance(FROZEN_WATER, MATERIAL_WATER);
+            if (profile.frozen()
+                    && worldY >= seaLevel - 1
+                    && profile.waterBiome()) {
+                return new SampleAppearance(ICE, MATERIAL_ICE);
             }
             if (profile.swamp()) {
                 return new SampleAppearance(SWAMP_WATER, MATERIAL_WATER);
+            }
+            if (profile.frozen()) {
+                return new SampleAppearance(FROZEN_WATER, MATERIAL_WATER);
             }
             return new SampleAppearance(WATER, MATERIAL_WATER);
         }
 
         if (profile.badlands()) {
-            return new SampleAppearance(TERRACOTTA, MATERIAL_TERRACOTTA);
+            return new SampleAppearance(
+                    terracottaColor(worldX, worldY, worldZ),
+                    MATERIAL_TERRACOTTA
+            );
         }
 
-        if (profile.desert()) {
+        if (profile.sandy()) {
             return new SampleAppearance(SAND, MATERIAL_SAND);
         }
 
-        // M3.0.1 keeps snow tied to cold / peak biomes instead of globally
-        // whitening every sufficiently tall mountain.
+        if (profile.mangrove() && worldY <= seaLevel + 5) {
+            return new SampleAppearance(MUD, MATERIAL_MUD);
+        }
+
+        if (profile.gravelly()) {
+            return new SampleAppearance(GRAVEL, MATERIAL_GRAVEL);
+        }
+
+        if (profile.podzol()) {
+            return new SampleAppearance(PODZOL, MATERIAL_PODZOL);
+        }
+
+        // Keep snow tied to cold / peak biomes instead of globally whitening
+        // every tall mountain.
         if ((profile.frozen() && worldY >= seaLevel + 18)
                 || (profile.highSnowPeak() && worldY >= seaLevel + 78)) {
             return new SampleAppearance(SNOW, MATERIAL_SNOW);
@@ -108,6 +137,45 @@ public final class MinecraftSurfacePalette {
         return DIRT;
     }
 
+    public static int gravelColor() {
+        return GRAVEL;
+    }
+
+    public static int podzolColor() {
+        return PODZOL;
+    }
+
+    public static int mudColor() {
+        return MUD;
+    }
+
+    public static int iceColor() {
+        return ICE;
+    }
+
+    private static int terracottaColor(
+            int worldX,
+            int worldY,
+            int worldZ
+    ) {
+        int offset = Math.floorMod(
+                (worldX >> 5) * 3 + (worldZ >> 5) * 5,
+                11
+        );
+        int band = Math.floorMod(worldY + offset, 18);
+
+        if (band == 2 || band == 3) {
+            return 0xC77857;
+        }
+        if (band == 8) {
+            return 0xD1A36A;
+        }
+        if (band == 13 || band == 14) {
+            return 0x8F4F3A;
+        }
+        return TERRACOTTA;
+    }
+
     public static int applyLighting(int rgb, float shade) {
         shade = Math.max(0.45F, Math.min(1.15F, shade));
 
@@ -136,20 +204,44 @@ public final class MinecraftSurfacePalette {
                 .map(key -> key.identifier().getPath().toLowerCase(Locale.ROOT))
                 .orElse("");
 
+        boolean frozen = containsAny(
+                path,
+                "frozen",
+                "snowy",
+                "ice_spikes",
+                "grove"
+        );
+        boolean stony = containsAny(
+                path,
+                "stony",
+                "windswept_gravelly",
+                "jagged_peaks",
+                "frozen_peaks"
+        );
+
         return new BiomeProfile(
-                containsAny(path, "frozen", "snowy", "ice_spikes", "grove"),
+                frozen,
                 containsAny(path, "frozen_peaks", "jagged_peaks"),
                 containsAny(path, "ocean", "river"),
                 path.contains("swamp"),
-                containsAny(path, "desert", "beach"),
+                path.contains("desert")
+                        || (path.contains("beach")
+                                && !path.contains("snowy")
+                                && !path.contains("stony")),
                 path.contains("badlands"),
+                stony,
                 containsAny(
                         path,
-                        "stony",
+                        "stony_shore",
                         "windswept_gravelly",
-                        "jagged_peaks",
-                        "frozen_peaks"
-                )
+                        "gravelly"
+                ),
+                containsAny(
+                        path,
+                        "old_growth_pine_taiga",
+                        "old_growth_spruce_taiga"
+                ),
+                path.contains("mangrove")
         );
     }
 
@@ -171,9 +263,12 @@ public final class MinecraftSurfacePalette {
             boolean highSnowPeak,
             boolean waterBiome,
             boolean swamp,
-            boolean desert,
+            boolean sandy,
             boolean badlands,
-            boolean stony
+            boolean stony,
+            boolean gravelly,
+            boolean podzol,
+            boolean mangrove
     ) {
     }
 
