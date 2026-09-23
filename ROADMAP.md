@@ -315,6 +315,7 @@
 - [x] move all L2-L6 height coverage to a dedicated multi-worker executor
 - [x] scale coverage workers up to 8 logical workers based on available processors
 - [x] make L4-L6 first-fill 4x coarser, then refine 2x -> target instead of blocking on near-final quality
+- [x] invalidate M6.3 cache with v24 so cold-start throughput is measurable
 - [ ] benchmark cold-start tiles/s and time to first complete 16K horizon
 - [ ] add cross-LOD shared height sample cache to eliminate duplicate worldgen calls
 - [ ] move material/mesh finishing off the server lane after thread-safety validation
