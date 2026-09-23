@@ -71,6 +71,7 @@
 - [x] near-first exact refinement after 70% L1/L2 bootstrap coverage
 - [x] weighted 2:1 near-refine / remaining-coverage scheduler
 - [x] conservative AABB overlap pass across LOD-ring seams
+- [x] L1/L2 roaming guard-band prefetch + visible-hole priority
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] view-direction / screen-space generation priority
 - [ ] texture-atlas / UV material rendering

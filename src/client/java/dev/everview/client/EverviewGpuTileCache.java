@@ -23,7 +23,7 @@ import java.util.Map;
  * not rebuild vertex data.
  */
 public final class EverviewGpuTileCache {
-    private static final int MAX_GPU_TILES = 2_048;
+    private static final int MAX_GPU_TILES = 3_072;
     private static final int MAX_UPLOADS_PER_FRAME = 8;
 
     private static final Map<LodTileKey, GpuTile> TILES =

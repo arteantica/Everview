@@ -27,11 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.5.1 adds near-first refinement on top of progressive terrain streaming.
- * Bootstrap coverage still advances across every ring, but once L1/L2 reach
- * 70% coverage the scheduler mixes two near exact-detail tiles for every one
- * remaining coverage tile. This lets the area around vanilla sharpen before
- * the entire 16K field has finished bootstrapping.
+ * M3.5.3 adds roaming prefetch on top of near-first progressive streaming.
+ * L1/L2 keep a small generated guard band just inside/outside their current
+ * annuli so a 32-block camera-anchor shift does not immediately expose empty
+ * terrain. Newly visible holes always outrank refinement work.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -43,10 +42,12 @@ public final class WorldgenSurfaceSampler {
     public static final long MAX_SLICE_BUDGET_NANOS = 12_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 128;
 
-    private static final int CACHE_LIMIT = 2_304;
+    private static final int CACHE_LIMIT = 3_072;
     private static final int NEAR_RING_MAX_LEVEL = 2;
     private static final double NEAR_REFINE_TRIGGER = 0.70;
     private static final int NEAR_REFINE_BURST = 2;
+    private static final int L1_PREFETCH_BLOCKS = 64;
+    private static final int L2_PREFETCH_BLOCKS = 128;
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
@@ -450,8 +451,16 @@ public final class WorldgenSurfaceSampler {
 
         for (WorldgenLodRing ring : rings) {
             List<WantedTile> entries = buildRingWantedTiles(centerX, centerZ, ring);
-            entries.sort(Comparator.comparingLong(entry ->
-                    tileCenterDistanceSq(entry.key(), entry.ring(), centerX, centerZ)));
+            entries.sort(
+                    Comparator.comparing(WantedTile::prefetch)
+                            .thenComparingLong(entry ->
+                                    tileCenterDistanceSq(
+                                            entry.key(),
+                                            entry.ring(),
+                                            centerX,
+                                            centerZ
+                                    ))
+            );
             perRing.add(entries);
         }
 
@@ -479,16 +488,28 @@ public final class WorldgenSurfaceSampler {
             WorldgenLodRing ring
     ) {
         int tileSize = ring.tileSize();
-        int minTileX = Math.floorDiv(centerX - ring.outerRadiusBlocks(), tileSize);
-        int maxTileX = Math.floorDiv(centerX + ring.outerRadiusBlocks(), tileSize);
-        int minTileZ = Math.floorDiv(centerZ - ring.outerRadiusBlocks(), tileSize);
-        int maxTileZ = Math.floorDiv(centerZ + ring.outerRadiusBlocks(), tileSize);
+        int prefetchBlocks = switch (ring.lodLevel()) {
+            case 1 -> L1_PREFETCH_BLOCKS;
+            case 2 -> L2_PREFETCH_BLOCKS;
+            default -> 0;
+        };
+
+        int streamInnerRadius = Math.max(
+                0,
+                ring.innerRadiusBlocks() - prefetchBlocks
+        );
+        int streamOuterRadius = ring.outerRadiusBlocks() + prefetchBlocks;
+
+        int minTileX = Math.floorDiv(centerX - streamOuterRadius, tileSize);
+        int maxTileX = Math.floorDiv(centerX + streamOuterRadius, tileSize);
+        int minTileZ = Math.floorDiv(centerZ - streamOuterRadius, tileSize);
+        int maxTileZ = Math.floorDiv(centerZ + streamOuterRadius, tileSize);
 
         List<WantedTile> entries = new ArrayList<>();
 
         for (int tileZ = minTileZ; tileZ <= maxTileZ; tileZ++) {
             for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
-                if (tileIntersectsAnnulus(
+                boolean visibleNow = tileIntersectsAnnulus(
                         tileX,
                         tileZ,
                         centerX,
@@ -496,9 +517,21 @@ public final class WorldgenSurfaceSampler {
                         ring.innerRadiusBlocks(),
                         ring.outerRadiusBlocks(),
                         tileSize
-                )) {
+                );
+
+                boolean inStreamGuard = visibleNow || tileIntersectsAnnulus(
+                        tileX,
+                        tileZ,
+                        centerX,
+                        centerZ,
+                        streamInnerRadius,
+                        streamOuterRadius,
+                        tileSize
+                );
+
+                if (inStreamGuard) {
                     LodTileKey key = new LodTileKey(ring.lodLevel(), tileX, tileZ);
-                    entries.add(new WantedTile(key, ring));
+                    entries.add(new WantedTile(key, ring, !visibleNow));
                 }
             }
         }
@@ -563,12 +596,18 @@ public final class WorldgenSurfaceSampler {
         WantedTile coverage = firstMissingCoverage(pending);
 
         if (coverage == null) {
-            // Coverage is complete. Finish near detail before progressively
-            // refining the remaining outer rings.
+            // Coverage + guard band are complete. Finish near detail before
+            // progressively refining the remaining outer rings.
             WantedTile nearRefine = firstRefinement(pending, true);
             return nearRefine != null
                     ? nearRefine
                     : firstRefinement(pending, false);
+        }
+
+        // A missing tile in the currently visible annulus is a real hole, so
+        // fill it immediately before any exact-detail refinement work.
+        if (!coverage.prefetch()) {
+            return coverage;
         }
 
         if (nearCoverageRatio() < NEAR_REFINE_TRIGGER) {
@@ -592,8 +631,21 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static WantedTile firstMissingCoverage(LodTileKey pending) {
+        // Never leave a currently visible hole waiting behind refinement or
+        // speculative work.
         for (WantedTile wanted : wantedTiles) {
-            if (wanted.key().equals(pending)) {
+            if (wanted.key().equals(pending) || wanted.prefetch()) {
+                continue;
+            }
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        // Once the visible annuli are covered, spend spare streaming slots on
+        // the L1/L2 guard band so the next camera-anchor shift is already warm.
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending) || !wanted.prefetch()) {
                 continue;
             }
             if (!CACHE.containsKey(wanted.key())) {
@@ -631,7 +683,8 @@ public final class WorldgenSurfaceSampler {
         int covered = 0;
 
         for (WantedTile wanted : wantedTiles) {
-            if (wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
+            if (wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL
+                    || wanted.prefetch()) {
                 continue;
             }
 
@@ -1515,7 +1568,8 @@ public final class WorldgenSurfaceSampler {
 
     private record WantedTile(
             LodTileKey key,
-            WorldgenLodRing ring
+            WorldgenLodRing ring,
+            boolean prefetch
     ) {
     }
 
