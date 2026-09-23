@@ -317,10 +317,10 @@ public final class WorldgenSurfaceSampler {
     private static List<WorldgenLodRing> createRings(int innerRadius) {
         List<WorldgenLodRing> rings = new ArrayList<>(6);
 
-        // M3.3.1 keeps the 4-block ultra-near sampling from M3.2.2 but cuts
-        // its tile size from 128 to 32 blocks. Persistent GPU buffers make the
-        // extra tile count affordable, while the smaller tiles let the
-        // vanilla handoff be clipped much more accurately.
+        // M3.4 pushes the stable ultra-near ring from 4-block to 2-block
+        // sampling now that persistent GPU buffers recovered the per-frame CPU
+        // headroom. Keep the 32-block tiles from M3.3.2 so the vanilla handoff
+        // remains tight and does not retreat from the camera.
         int ultraNearOuter = Math.min(
                 1_024,
                 Math.max(544, innerRadius + 192)
@@ -331,7 +331,7 @@ public final class WorldgenSurfaceSampler {
                 innerRadius,
                 ultraNearOuter,
                 32,
-                4
+                2
         ));
 
         if (ultraNearOuter < 1_024) {
@@ -784,7 +784,7 @@ public final class WorldgenSurfaceSampler {
 
     /**
      * Near Everview rings use deliberately blockier coarse-voxel surfaces.
-     * M3.2.2 uses 4x4 cells closest to vanilla and 8x8 cells farther out, each
+     * M3.4 uses 2x2 cells closest to vanilla and 8x8 cells farther out, each
      * as a flat plateau with vertical faces between neighboring plateaus and dark
      * skirts around tile edges. This sacrifices smooth triangles close to the
      * vanilla handoff in favor of silhouettes that read much more like Minecraft.
@@ -1057,9 +1057,9 @@ public final class WorldgenSurfaceSampler {
 
         int average = Math.round(sum / (float) count);
 
-        // At 8-block horizontal sampling, keep full one-block vertical steps.
-        // This is closer to Minecraft's silhouette without going all the way to
-        // expensive block-by-block geometry.
+        // At near-ring sampling (8 blocks or finer), keep full one-block
+        // vertical steps. The new 2-block L1 therefore gains horizontal detail
+        // without smoothing away Minecraft's stepped silhouette.
         return job.ring.sampleSpacing() <= 8
                 ? average
                 : Math.round(average / 2.0F) * 2;
