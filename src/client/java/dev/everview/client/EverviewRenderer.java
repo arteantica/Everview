@@ -17,7 +17,8 @@ import java.util.HashSet;
 import java.util.Set;
 
 /**
- * M3.3 persistent-GPU distant terrain renderer.
+ * M3.7.4 persistent-GPU distant terrain renderer with explicit vanilla
+ * chunk ownership at the inner handoff.
  *
  * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
  * Minecraft's opaque terrain RenderPass is still open. Everview therefore
@@ -102,8 +103,9 @@ public final class EverviewRenderer {
                 continue;
             }
 
-            // M3.5.5: L2 remains generated and GPU-resident as the roaming
-            // safety net, but an interior L2 tile is not submitted when every
+            // L2 remains generated as the roaming safety net. M3.7.4 clips
+            // any L1/L2 quads owned by vanilla chunks during GPU upload, while
+            // this rule still suppresses redundant interior L2 when every
             // 32-block L1 tile above it is already resident. Boundary L2 tiles
             // still draw because they own terrain outside the L1 annulus.
             if (tile.lodLevel() == 2
