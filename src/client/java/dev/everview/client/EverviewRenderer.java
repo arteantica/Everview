@@ -17,7 +17,8 @@ import java.util.HashSet;
 import java.util.Set;
 
 /**
- * M3.3 persistent-GPU distant terrain renderer.
+ * M3.7.4.1 persistent-GPU distant terrain renderer. Near LOD buffers are
+ * clipped only against vanilla chunks confirmed loaded by the client.
  *
  * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
  * Minecraft's opaque terrain RenderPass is still open. Everview therefore
