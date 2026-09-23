@@ -74,6 +74,7 @@
 - [x] L1/L2 roaming guard-band prefetch + visible-hole priority
 - [x] persistent overlapping L2 fallback underlay beneath the full L1 band
 - [x] prioritize missing visible L2 fallback tiles before all refinement
+- [x] suppress interior L2 underlay draws once resident L1 coverage is complete
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] view-direction / screen-space generation priority
 - [ ] texture-atlas / UV material rendering

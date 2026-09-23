@@ -13,6 +13,9 @@ import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
 
+import java.util.HashSet;
+import java.util.Set;
+
 /**
  * M3.3 persistent-GPU distant terrain renderer.
  *
@@ -81,9 +84,37 @@ public final class EverviewRenderer {
         RenderSystem.AutoStorageIndexBuffer quadIndices =
                 RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
 
+        WorldgenLodRing l1Ring = snapshot.ringForLevel(1);
+        Set<Long> residentL1Tiles = new HashSet<>();
+
+        if (l1Ring != null) {
+            for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+                if (tile.lodLevel() == 1
+                        && EverviewGpuTileCache.getResident(tile) != null) {
+                    residentL1Tiles.add(packTile(tile.tileX(), tile.tileZ()));
+                }
+            }
+        }
+
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
             WorldgenLodRing ring = snapshot.ringForLevel(tile.lodLevel());
             if (ring == null || !tileBelongsToRing(tile, ring, cameraX, cameraZ)) {
+                continue;
+            }
+
+            // M3.5.5: L2 remains generated and GPU-resident as the roaming
+            // safety net, but an interior L2 tile is not submitted when every
+            // 32-block L1 tile above it is already resident. Boundary L2 tiles
+            // still draw because they own terrain outside the L1 annulus.
+            if (tile.lodLevel() == 2
+                    && l1Ring != null
+                    && fullyCoveredByResidentL1(
+                            tile,
+                            l1Ring,
+                            residentL1Tiles,
+                            cameraX,
+                            cameraZ
+                    )) {
                 continue;
             }
 
@@ -145,6 +176,79 @@ public final class EverviewRenderer {
                     distance
             );
         }
+    }
+
+    private static boolean fullyCoveredByResidentL1(
+            WorldgenSurfaceTile coarseTile,
+            WorldgenLodRing l1Ring,
+            Set<Long> residentL1Tiles,
+            double cameraX,
+            double cameraZ
+    ) {
+        int l1TileSize = l1Ring.tileSize();
+        int minTileX = Math.floorDiv(coarseTile.minX(), l1TileSize);
+        int maxTileX = Math.floorDiv(coarseTile.maxX() - 1, l1TileSize);
+        int minTileZ = Math.floorDiv(coarseTile.minZ(), l1TileSize);
+        int maxTileZ = Math.floorDiv(coarseTile.maxZ() - 1, l1TileSize);
+
+        boolean checkedAny = false;
+
+        for (int tileZ = minTileZ; tileZ <= maxTileZ; tileZ++) {
+            for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
+                if (!virtualL1TileBelongsToRing(
+                        tileX,
+                        tileZ,
+                        l1Ring,
+                        cameraX,
+                        cameraZ
+                )) {
+                    // Part of this coarse tile is outside L1 ownership, so L2
+                    // still has real terrain to provide there.
+                    return false;
+                }
+
+                checkedAny = true;
+                if (!residentL1Tiles.contains(packTile(tileX, tileZ))) {
+                    return false;
+                }
+            }
+        }
+
+        return checkedAny;
+    }
+
+    private static boolean virtualL1TileBelongsToRing(
+            int tileX,
+            int tileZ,
+            WorldgenLodRing ring,
+            double cameraX,
+            double cameraZ
+    ) {
+        double minX = tileX * (double) ring.tileSize();
+        double minZ = tileZ * (double) ring.tileSize();
+        double maxX = minX + ring.tileSize();
+        double maxZ = minZ + ring.tileSize();
+
+        double centerX = (minX + maxX) * 0.5;
+        double centerZ = (minZ + maxZ) * 0.5;
+        double centerDistance = Math.hypot(
+                centerX - cameraX,
+                centerZ - cameraZ
+        );
+
+        double nearestX = Math.max(minX, Math.min(cameraX, maxX));
+        double nearestZ = Math.max(minZ, Math.min(cameraZ, maxZ));
+        double nearestDistance = Math.hypot(
+                nearestX - cameraX,
+                nearestZ - cameraZ
+        );
+
+        return centerDistance >= ring.innerRadiusBlocks()
+                && nearestDistance <= ring.outerRadiusBlocks();
+    }
+
+    private static long packTile(int tileX, int tileZ) {
+        return ((long) tileX << 32) ^ (tileZ & 0xFFFF_FFFFL);
     }
 
     /**
