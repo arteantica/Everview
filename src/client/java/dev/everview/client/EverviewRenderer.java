@@ -10,7 +10,6 @@ import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
-import net.minecraft.util.ARGB;
 import net.minecraft.world.attribute.EnvironmentAttributes;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -18,6 +17,7 @@ import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
+import org.joml.Vector3fc;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -528,13 +528,13 @@ public final class EverviewRenderer {
                 Math.min(1.0F, client.level.getThunderLevel(partialTick))
         );
 
-        int skyLightColor = camera.attributeProbe().getValue(
+        Vector3fc skyLightColor = camera.attributeProbe().getValue(
                 EnvironmentAttributes.SKY_LIGHT_COLOR,
                 partialTick
         );
-        float sr = ARGB.redFloat(skyLightColor);
-        float sg = ARGB.greenFloat(skyLightColor);
-        float sb = ARGB.blueFloat(skyLightColor);
+        float sr = skyLightColor.x();
+        float sg = skyLightColor.y();
+        float sb = skyLightColor.z();
 
         float brightness = 0.24F + skyFactor * 0.76F;
         brightness *= 1.0F - rain * 0.18F;
