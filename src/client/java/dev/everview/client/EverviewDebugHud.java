@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M5.5 DEV | GLOBAL SAFETY FLOOR");
+        lines.add("Everview M5.6 DEV | MOVING-CAMERA STABILITY");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Render: 3D-safe vanilla handoff | nested L3/L4/L5/L6 fallback disks");
-        lines.add("Streaming: global L6 floor first | finer disks replace it as they become resident");
+        lines.add("Render: high-altitude vanilla holdoff | deeper-separated nested fallback disks");
+        lines.add("Streaming: local/predictive L3 first | global L6 second | 1536b max lead");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),

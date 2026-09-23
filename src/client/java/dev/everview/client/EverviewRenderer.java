@@ -43,14 +43,17 @@ public final class EverviewRenderer {
     private static final Vector3f MODEL_OFFSET = new Vector3f();
     private static final Matrix4f TEXTURE_MATRIX = new Matrix4f();
 
-    // Keep finer rings slightly above coarser overlapping rings. The offset is
-    // intentionally sub-block so it closes transition cracks without making
-    // distant terrain visibly sink at ring boundaries.
-    private static final double BASE_TERRAIN_BIAS = 0.22D;
-    private static final double RING_LAYER_BIAS = 0.06D;
+    // Nested safety floors intentionally overlap while finer coverage streams.
+    // Sub-block separation was not enough once the camera was high/far: depth
+    // precision made the overlapping floors fight, producing the drought-like
+    // cracks and scattered square pixels seen in M5.5. Keep each coarser layer
+    // meaningfully below the finer one instead.
+    private static final double BASE_TERRAIN_BIAS = 0.35D;
+    private static final double RING_LAYER_BIAS = 0.75D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
     private static final double VANILLA_OWNERSHIP_MARGIN_BLOCKS = 64.0D;
     private static final double VANILLA_3D_HANDOFF_MARGIN_BLOCKS = 96.0D;
+    private static final double MAX_VANILLA_VERTICAL_HANDOFF_BLOCKS = 512.0D;
     private static final int[] SURFACE_PROBE_X = {8, 2, 13, 2, 13};
     private static final int[] SURFACE_PROBE_Z = {8, 2, 2, 13, 13};
 
@@ -619,8 +622,15 @@ public final class EverviewRenderer {
         double vanillaReach = EverviewFarPlane.vanillaDepthFar()
                 + VANILLA_3D_HANDOFF_MARGIN_BLOCKS;
 
-        if (dx * dx + dy * dy + dz * dz
-                > vanillaReach * vanillaReach) {
+        // M5.5 still allowed compiled vanilla sections to own the column while
+        // the camera was hundreds of blocks above them. Minecraft's section
+        // visibility flag can remain true even when that section is not part of
+        // the useful current-camera terrain presentation. When flying high,
+        // keep the LOD floor until the camera is vertically close enough that a
+        // vanilla handoff is visually safe.
+        if (Math.abs(dy) > MAX_VANILLA_VERTICAL_HANDOFF_BLOCKS
+                || dx * dx + dy * dy + dz * dz
+                        > vanillaReach * vanillaReach) {
             ColumnOwnershipResult result =
                     new ColumnOwnershipResult(false, true);
             columns.put(key, result);

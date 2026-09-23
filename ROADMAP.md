@@ -242,3 +242,13 @@
 - [x] retire coarse regions only when their immediate finer disk is actually resident
 - [x] expose global L6 safety-floor readiness in the HUD
 - [ ] validate straight-down high-altitude flight, x15 horizontal flight, and 16K far coverage
+
+
+## M5.6 moving-camera stability
+- [x] add a 512-block vertical safety gate before vanilla may retire LOD
+- [x] keep high-altitude compiled vanilla from reopening the center hole while moving
+- [x] prioritize current/predictive L3 before newly exposed far-edge L6 floor work
+- [x] increase predictive lead horizon to 3.0 seconds / 1536 blocks
+- [x] generate newly exposed L3 directly at 32-block spacing instead of a 64-block bootstrap
+- [x] increase inter-LOD depth separation to suppress far-distance z-fighting / drought cracks
+- [ ] validate stationary high-altitude view, x15 motion, direction reversal, and pixel/crack cleanup

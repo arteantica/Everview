@@ -62,8 +62,8 @@ public final class WorldgenSurfaceSampler {
     private static final double PREDICTION_START_BLOCKS_PER_SECOND = 12.0;
     private static final double HIGH_SPEED_BLOCKS_PER_SECOND = 64.0;
     private static final double VELOCITY_SMOOTHING = 0.35;
-    private static final double PREDICTION_SECONDS = 1.5;
-    private static final int MAX_PREDICTIVE_LEAD_BLOCKS = 768;
+    private static final double PREDICTION_SECONDS = 3.0;
+    private static final int MAX_PREDICTIVE_LEAD_BLOCKS = 1_536;
     private static final int PREDICTIVE_ANCHOR_QUANTUM = 64;
     private static final int REMAINING_COVERAGE_BURST = 8;
     private static final int EXACT_GEOMETRY_BURST = 3;
@@ -1270,6 +1270,14 @@ public final class WorldgenSurfaceSampler {
             return target;
         }
 
+        if (existing == null
+                && ring.lodLevel() == EMERGENCY_UNDERLAY_LEVEL) {
+            // The emergency floor is actually visible during movement. A 64b
+            // bootstrap looked like a giant square "hole" even though geometry
+            // was present. Generate L3 directly at its 32b target spacing.
+            return ring.sampleSpacing();
+        }
+
         return existing == null
                 ? Math.min(ring.tileSize(), ring.sampleSpacing() * 2)
                 : ring.sampleSpacing();
@@ -1278,24 +1286,24 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        // -1) Establish the global L6 safety floor first. This is intentionally
-        // extremely coarse and cheap, but once present every point out to 16K
-        // has something underneath it while finer disks stream/refine.
-        WantedTile globalFloor =
-                firstMissingGlobalSafetyFloorCoverage(pending);
-        if (globalFloor != null) {
-            balancedCoverageStep = 0;
-            return globalFloor;
-        }
-
-        // 0) Establish the full 0-2K L3 safety floor first. It is the hard
-        // no-sky guarantee for unloaded/not-ready vanilla and for high-altitude
-        // downward views. At speed the same cheap floor is also kept warm ahead.
+        // -1) Keep the local/predictive L3 safety floor solid before chasing
+        // newly exposed far-edge L6 tiles. M5.5 rebuilt the giant coarse patch
+        // under the camera whenever movement outran local fallback streaming.
         WantedTile emergencyUnderlay =
                 firstMissingEmergencyUnderlayCoverage(pending);
         if (emergencyUnderlay != null) {
             balancedCoverageStep = 0;
             return emergencyUnderlay;
+        }
+
+        // 0) Once the local 0-2K floor is safe, extend/repair the 0-16K L6
+        // world-scale floor. This retains global continuity without sacrificing
+        // the area the player is actually flying over.
+        WantedTile globalFloor =
+                firstMissingGlobalSafetyFloorCoverage(pending);
+        if (globalFloor != null) {
+            balancedCoverageStep = 0;
+            return globalFloor;
         }
 
         // 1) Detached exact geometry is allowed to run beside coverage, but
