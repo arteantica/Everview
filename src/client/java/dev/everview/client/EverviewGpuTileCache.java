@@ -170,7 +170,7 @@ public final class EverviewGpuTileCache {
                     key = classifyUnderlayBatch(
                             piece.vertices(),
                             0,
-                            regionSize,
+                            L3_UNDERLAY_REGION_SIZE,
                             true
                     );
                 } else if (tile.lodLevel() == 4) {
