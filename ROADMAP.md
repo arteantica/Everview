@@ -105,7 +105,8 @@
 - [x] one-draw-per-tile fast path outside the vanilla handoff zone
 - [x] expose real draw-call / handoff-batch telemetry
 - [x] coalesce adjacent visible handoff batches into contiguous indexed draw ranges
-- [ ] benchmark coalesced handoff CPU cost at full 1b residency
+- [x] gate upload-time top-face ownership on renderer-visible terrain in the same chunk column
+- [ ] benchmark fallback-safe handoff CPU cost at full 1b residency
 - [ ] benchmark velocity prefetch at elytra and FlySpeed travel rates
 - [ ] block-faithful 2-block intermediate geometry
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing

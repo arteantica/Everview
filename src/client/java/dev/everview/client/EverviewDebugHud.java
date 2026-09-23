@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.8.2 | COALESCED HANDOFF RANGES");
+        lines.add("Everview M3.8.3 | FALLBACK-SAFE HANDOFF");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Render: boundary ownership + merged visible index ranges | far LOD = 1 draw/tile");
+        lines.add("Render: merged handoff ranges | uploads yield only after same-column vanilla is visible");
         lines.add("Stream: velocity lead + predictive L2 safety carpet | high speed = coverage only");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",

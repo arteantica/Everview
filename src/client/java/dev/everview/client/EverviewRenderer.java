@@ -21,10 +21,10 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * M3.8.2 persistent-GPU distant terrain renderer. Section-level ownership is
- * still confined to the vanilla boundary, but adjacent visible handoff batches
- * are now coalesced into contiguous index ranges before submission. This keeps
- * the exact same ownership decisions while drastically reducing CPU draw calls.
+ * M3.8.3 persistent-GPU distant terrain renderer. Coalesced handoff ranges stay
+ * intact, but upload-time early ownership is now fallback-safe: a fresh upload
+ * can only hide an LOD top face when the same vanilla chunk column is already
+ * visibly rendering nearby terrain.
  *
  * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
  * Minecraft's opaque terrain RenderPass is still open. Everview therefore
@@ -42,6 +42,7 @@ public final class EverviewRenderer {
     private static final double RING_LAYER_BIAS = 0.06D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
     private static final double LIVE_HANDOFF_MARGIN_BLOCKS = 64.0D;
+    private static final int EARLY_HANDOFF_VISIBLE_NEIGHBOR_SECTIONS = 2;
 
     private static final Map<SectionKey, Long> RECENTLY_COMPILED_SECTIONS =
             new HashMap<>();
@@ -419,8 +420,8 @@ public final class EverviewRenderer {
             Map<SectionKey, Boolean> visibility
     ) {
         // LOD/worldgen surface height and the vanilla rendered surface can land
-        // on opposite sides of a 16-block section boundary. Keep the proven
-        // +/-1 visible-section rule first.
+        // on opposite sides of a 16-block section boundary. Renderer-visible
+        // terrain remains the authoritative ownership signal.
         for (int offset = -1; offset <= 1; offset++) {
             if (vanillaSectionVisible(
                     client,
@@ -433,22 +434,49 @@ public final class EverviewRenderer {
             }
         }
 
-        // M3.7.4.6.1: RenderSection.updateUploadTime() fires when the compiled
-        // vanilla mesh reaches the upload handoff, slightly before the section
-        // necessarily appears in the final visibility list. Use that exact
-        // event as a short-lived early-ownership hint for TOP faces only. The
-        // hint expires automatically, so if vanilla never becomes visible the
-        // persistent Everview fallback returns instead of leaving a stale hole.
+        boolean recentlyUploaded = false;
+
         for (int offset = -1; offset <= 1; offset++) {
             if (recentlyCompiledSection(
                     chunkX,
                     sectionY + offset,
                     chunkZ
             )) {
+                recentlyUploaded = true;
+                break;
+            }
+        }
+
+        if (!recentlyUploaded) {
+            return false;
+        }
+
+        // M3.8.3: an upload alone is not enough to suppress the persistent LOD.
+        // That was able to create a white gap while vanilla had a mesh uploaded
+        // but had not actually started drawing the chunk column. Permit the
+        // early hint only after nearby terrain in THIS SAME chunk column is
+        // already renderer-visible. The +/-1 region was checked above, so this
+        // effectively looks only at the next neighboring vertical sections.
+        for (int offset = -EARLY_HANDOFF_VISIBLE_NEIGHBOR_SECTIONS;
+                offset <= EARLY_HANDOFF_VISIBLE_NEIGHBOR_SECTIONS;
+                offset++) {
+            if (offset >= -1 && offset <= 1) {
+                continue;
+            }
+
+            if (vanillaSectionVisible(
+                    client,
+                    chunkX,
+                    sectionY + offset,
+                    chunkZ,
+                    visibility
+            )) {
                 return true;
             }
         }
 
+        // Keep Everview underneath until vanilla proves that this chunk column
+        // is actually rendering. A brief green overlap is preferable to a hole.
         return false;
     }
 
