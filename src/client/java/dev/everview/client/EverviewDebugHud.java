@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M4 DEV | EXPLICIT TILE STAGES");
+        lines.add("Everview M4 DEV | STAGED LOD ENGINE");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Render: merged handoff ranges | uploads yield only after same-column vanilla is visible");
-        lines.add("Refine: exact 1b heights first -> full biome/material appearance second");
+        lines.add("Refine: coverage -> exact geometry (bounded lead) -> exact appearance");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),

@@ -54,6 +54,8 @@ public final class WorldgenSurfaceSampler {
     private static final int MAX_PREDICTIVE_LEAD_BLOCKS = 768;
     private static final int PREDICTIVE_ANCHOR_QUANTUM = 64;
     private static final int REMAINING_COVERAGE_BURST = 8;
+    private static final int EXACT_GEOMETRY_BURST = 3;
+    private static final int MAX_PROVISIONAL_EXACT_TILES = 12;
     private static final int L1_PREFETCH_BLOCKS = 64;
     private static final int L2_PREFETCH_BLOCKS = 128;
     private static final int L1_BOOTSTRAP_SPACING = 4;
@@ -130,6 +132,7 @@ public final class WorldgenSurfaceSampler {
     private static long initialFillStartedNanos;
     private static long initialFillCompletedNanos;
     private static int balancedCoverageStep;
+    private static int exactGeometryBurstStep;
 
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
@@ -203,13 +206,12 @@ public final class WorldgenSurfaceSampler {
             }
 
             WorldgenSurfaceTile tile = CACHE.get(wanted.key());
-            if (tile == null || tile.sampleSpacing() != L1_EXACT_SPACING) {
+            if (tile == null || !tile.stage().exactGeometry()) {
                 continue;
             }
 
             appearanceDesired++;
-            L1SampleGrid grid = L1_SAMPLE_CACHE.get(wanted.key());
-            if (grid == null || !grid.requiresAppearanceRefinement) {
+            if (tile.stage().exactAppearance()) {
                 appearanceReady++;
             }
         }
@@ -404,7 +406,7 @@ public final class WorldgenSurfaceSampler {
                     trimL1SampleCache();
 
                     appearanceOnly = existing != null
-                            && existing.sampleSpacing() == L1_EXACT_SPACING
+                            && existing.stage() == WorldgenTileStage.EXACT_GEOMETRY
                             && sampleGrid.requiresAppearanceRefinement
                             && next.targetSpacing() == L1_EXACT_SPACING;
                     if (appearanceOnly) {
@@ -739,6 +741,7 @@ public final class WorldgenSurfaceSampler {
         initialFillStartedNanos = 0L;
         initialFillCompletedNanos = 0L;
         balancedCoverageStep = 0;
+        exactGeometryBurstStep = 0;
         adaptiveSliceBudgetNanos = BASE_SLICE_BUDGET_NANOS;
         serverTickMs = 0.0;
         clientFrameMs = 0.0;
@@ -1221,13 +1224,10 @@ public final class WorldgenSurfaceSampler {
                     : firstMissingOtherGuardCoverage(pending);
         }
 
-        // 5) Normal-speed quality work may interleave only after the entire
-        // visible near field is solid. Far horizon coverage keeps the existing
-        // 8:1 advantage over refinement.
-        WantedTile frontQuality = firstExactBandRefinement(pending);
-        if (frontQuality == null) {
-            frontQuality = firstIntermediateNearRefinement(pending);
-        }
+        // 5) Normal-speed quality work is an explicit staged pipeline:
+        // exact geometry is allowed to lead, but never by more than a small
+        // bounded backlog before exact appearance is forced to catch up.
+        WantedTile qualityWork = selectQualityWork(pending);
 
         WantedTile remainingCoverage = remainingVisible != null
                 ? remainingVisible
@@ -1236,14 +1236,14 @@ public final class WorldgenSurfaceSampler {
             remainingCoverage = firstMissingOtherGuardCoverage(pending);
         }
 
-        if (remainingCoverage != null && frontQuality != null) {
+        if (remainingCoverage != null && qualityWork != null) {
             if (balancedCoverageStep < REMAINING_COVERAGE_BURST) {
                 balancedCoverageStep++;
                 return remainingCoverage;
             }
 
             balancedCoverageStep = 0;
-            return frontQuality;
+            return qualityWork;
         }
 
         if (remainingCoverage != null) {
@@ -1251,17 +1251,12 @@ public final class WorldgenSurfaceSampler {
             return remainingCoverage;
         }
 
-        if (frontQuality != null) {
+        if (qualityWork != null) {
             balancedCoverageStep = 0;
-            return frontQuality;
+            return qualityWork;
         }
 
-        WantedTile remainingRefinement = firstRefinement(pending, false);
-        if (remainingRefinement != null) {
-            return remainingRefinement;
-        }
-
-        return firstExactAppearanceRefinement(pending);
+        return null;
     }
 
     private static boolean isEmergencyUnderlayWanted(
@@ -1507,6 +1502,71 @@ public final class WorldgenSurfaceSampler {
         return null;
     }
 
+    private static WantedTile selectQualityWork(
+            LodTileKey pending
+    ) {
+        WantedTile exactGeometry = firstExactBandRefinement(pending);
+        WantedTile exactAppearance =
+                firstExactAppearanceRefinement(pending);
+        WantedTile intermediate =
+                firstIntermediateNearRefinement(pending);
+
+        int provisional = provisionalExactTileCount();
+
+        if (provisional >= MAX_PROVISIONAL_EXACT_TILES
+                && exactAppearance != null) {
+            exactGeometryBurstStep = 0;
+            return exactAppearance;
+        }
+
+        if (exactGeometry != null && exactAppearance != null) {
+            if (exactGeometryBurstStep < EXACT_GEOMETRY_BURST) {
+                exactGeometryBurstStep++;
+                return exactGeometry;
+            }
+
+            exactGeometryBurstStep = 0;
+            return exactAppearance;
+        }
+
+        if (exactGeometry != null) {
+            exactGeometryBurstStep = Math.min(
+                    EXACT_GEOMETRY_BURST,
+                    exactGeometryBurstStep + 1
+            );
+            return exactGeometry;
+        }
+
+        if (exactAppearance != null) {
+            exactGeometryBurstStep = 0;
+            return exactAppearance;
+        }
+
+        if (intermediate != null) {
+            return intermediate;
+        }
+
+        return firstRefinement(pending, false);
+    }
+
+    private static int provisionalExactTileCount() {
+        int count = 0;
+
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.prefetch() || wanted.ring().lodLevel() != 1) {
+                continue;
+            }
+
+            WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+            if (tile != null
+                    && tile.stage() == WorldgenTileStage.EXACT_GEOMETRY) {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
     private static WantedTile firstExactBandRefinement(
             LodTileKey pending
     ) {
@@ -1564,7 +1624,7 @@ public final class WorldgenSurfaceSampler {
             WorldgenSurfaceTile tile = CACHE.get(wanted.key());
             L1SampleGrid grid = L1_SAMPLE_CACHE.get(wanted.key());
             if (tile != null
-                    && tile.sampleSpacing() == L1_EXACT_SPACING
+                    && tile.stage() == WorldgenTileStage.EXACT_GEOMETRY
                     && grid != null
                     && grid.requiresAppearanceRefinement) {
                 return wanted;
