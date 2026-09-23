@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.9.1 | EMERGENCY UNDERLAY");
+        lines.add("Everview M3.9.2 | PARTIAL UNDERLAY OWNERSHIP");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Render: merged handoff ranges | uploads yield only after same-column vanilla is visible");
-        lines.add("Stream: 64b L3 safety floor -> L2 -> L1 -> outward rings -> refinement");
+        lines.add("Stream: L3 safety floor retires per 128b L2 region -> L2 -> L1 -> refinement");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),

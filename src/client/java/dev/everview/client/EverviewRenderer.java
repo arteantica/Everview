@@ -21,10 +21,10 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * M3.9.1 persistent-GPU distant terrain renderer. Coalesced handoff ranges stay
- * intact. L3 now acts as an emergency underlay beneath L1/L2 and is skipped as
- * soon as every overlapping L2 tile is resident, mirroring the existing L2
- * beneath L1 behavior.
+ * M3.9.2 persistent-GPU distant terrain renderer. L3 emergency tiles are now
+ * partitioned into 128x128 L2 ownership regions. Each region retires
+ * independently as its matching L2 tile becomes resident, removing giant
+ * fallback rectangles while preserving missing-region coverage.
  *
  * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
  * Minecraft's opaque terrain RenderPass is still open. Everview therefore
@@ -148,18 +148,6 @@ public final class EverviewRenderer {
                 continue;
             }
 
-            if (tile.lodLevel() == 3
-                    && l2Ring != null
-                    && fullyCoveredByResidentFinerRing(
-                            tile,
-                            l2Ring,
-                            residentL2Tiles,
-                            cameraX,
-                            cameraZ
-                    )) {
-                continue;
-            }
-
             AABB bounds = new AABB(
                     tile.minX(),
                     tile.minY() - 4.0,
@@ -212,11 +200,88 @@ public final class EverviewRenderer {
                             cameraZ,
                             vanillaRadius
                     );
+            boolean partialUnderlay = tile.lodLevel() == 3
+                    && l2Ring != null
+                    && hasCoveredUnderlayRegion(
+                            gpuTile,
+                            l2Ring,
+                            residentL2Tiles,
+                            cameraX,
+                            cameraZ
+                    );
 
             boolean drewAny = false;
             int drawnQuads = 0;
 
-            if (!liveHandoff) {
+            if (partialUnderlay) {
+                int rangeFirstIndex = -1;
+                int rangeIndexCount = 0;
+
+                for (EverviewGpuTileCache.DrawBatch batch : gpuTile.drawBatches()) {
+                    boolean coveredByL2 = batch.underlayRegion()
+                            && finerRingOwnsRegion(
+                                    batch.regionTileX(),
+                                    batch.regionTileZ(),
+                                    l2Ring,
+                                    residentL2Tiles,
+                                    cameraX,
+                                    cameraZ
+                            );
+
+                    if (coveredByL2) {
+                        if (rangeIndexCount > 0) {
+                            renderPass.drawIndexed(
+                                    rangeIndexCount,
+                                    1,
+                                    rangeFirstIndex,
+                                    0,
+                                    0
+                            );
+                            EverviewMetrics.recordDrawCall(false);
+                            rangeFirstIndex = -1;
+                            rangeIndexCount = 0;
+                        }
+                        continue;
+                    }
+
+                    if (!drewAny) {
+                        EverviewMetrics.recordSubmission(tile.lodLevel());
+                        drewAny = true;
+                    }
+
+                    if (rangeIndexCount == 0) {
+                        rangeFirstIndex = batch.firstIndex();
+                        rangeIndexCount = batch.indexCount();
+                    } else if (rangeFirstIndex + rangeIndexCount
+                            == batch.firstIndex()) {
+                        rangeIndexCount += batch.indexCount();
+                    } else {
+                        renderPass.drawIndexed(
+                                rangeIndexCount,
+                                1,
+                                rangeFirstIndex,
+                                0,
+                                0
+                        );
+                        EverviewMetrics.recordDrawCall(false);
+                        rangeFirstIndex = batch.firstIndex();
+                        rangeIndexCount = batch.indexCount();
+                    }
+
+                    drawnQuads += batch.indexCount() / 6;
+                }
+
+                if (rangeIndexCount > 0) {
+                    renderPass.drawIndexed(
+                            rangeIndexCount,
+                            1,
+                            rangeFirstIndex,
+                            0,
+                            0
+                    );
+                    EverviewMetrics.recordDrawCall(false);
+                }
+            } else if (!liveHandoff) {
                 // Fast path: vanilla cannot overlap this tile, so do not walk
                 // section batches or query renderer ownership at all.
                 EverviewMetrics.recordSubmission(tile.lodLevel());
@@ -530,6 +595,48 @@ public final class EverviewRenderer {
             int sectionY,
             int chunkZ
     ) {
+    }
+
+    private static boolean hasCoveredUnderlayRegion(
+            EverviewGpuTileCache.GpuTile gpuTile,
+            WorldgenLodRing finerRing,
+            Set<Long> residentFinerTiles,
+            double cameraX,
+            double cameraZ
+    ) {
+        for (EverviewGpuTileCache.DrawBatch batch : gpuTile.drawBatches()) {
+            if (batch.underlayRegion()
+                    && finerRingOwnsRegion(
+                            batch.regionTileX(),
+                            batch.regionTileZ(),
+                            finerRing,
+                            residentFinerTiles,
+                            cameraX,
+                            cameraZ
+                    )) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static boolean finerRingOwnsRegion(
+            int tileX,
+            int tileZ,
+            WorldgenLodRing finerRing,
+            Set<Long> residentFinerTiles,
+            double cameraX,
+            double cameraZ
+    ) {
+        return virtualFinerTileBelongsToRing(
+                        tileX,
+                        tileZ,
+                        finerRing,
+                        cameraX,
+                        cameraZ
+                )
+                && residentFinerTiles.contains(packTile(tileX, tileZ));
     }
 
     private static boolean fullyCoveredByResidentFinerRing(

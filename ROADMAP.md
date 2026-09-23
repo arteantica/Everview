@@ -111,6 +111,8 @@
 - [x] expose outward-frontier distance and near-field continuity telemetry
 - [x] overlap L3 beneath the full near field as a 64b-bootstrap emergency safety floor
 - [x] suppress emergency L3 tiles once the overlapping L2 region is fully resident
+- [x] split L3 GPU geometry into 128x128 L2 ownership regions
+- [x] retire each emergency underlay region independently as matching L2 becomes resident
 - [x] prioritize current/predictive emergency underlay before L2/L1 detail coverage
 - [ ] benchmark emergency-underlay continuity at x7 FlySpeed and normal elytra speeds
 - [ ] benchmark fallback-safe handoff CPU cost at full 1b residency

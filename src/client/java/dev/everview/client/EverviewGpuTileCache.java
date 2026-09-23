@@ -21,13 +21,14 @@ import java.util.Map;
  * Render-thread-owned persistent GPU storage for generated LOD tiles.
  *
  * Tile geometry is uploaded once as POSITION_COLOR data in tile-local X/Z.
- * M3.7.4.5 keeps section-split walls and marks horizontal surface batches
- * separately so the renderer can use a small vertical ownership tolerance for
- * top faces without weakening wall/seam ownership.
+ * L1/L2 keep section-aware vanilla handoff batches. M3.9.2 also partitions L3
+ * into 128x128 ownership regions so its emergency underlay can retire one L2
+ * region at a time instead of lingering as a whole 256x256 slab.
  */
 public final class EverviewGpuTileCache {
     private static final int MAX_GPU_TILES = 3_072;
     private static final int MAX_UPLOADS_PER_FRAME = 8;
+    private static final int L3_UNDERLAY_REGION_SIZE = 128;
 
     private static final Map<LodTileKey, GpuTile> TILES =
             new LinkedHashMap<>(256, 0.75F, true);
@@ -158,9 +159,15 @@ public final class EverviewGpuTileCache {
             emittedQuadCount += pieces.size();
 
             for (QuadPiece piece : pieces) {
-                BatchKey key = tile.lodLevel() <= 2
-                        ? classifyBatch(piece.vertices(), 0)
-                        : BatchKey.ALWAYS;
+                BatchKey key;
+
+                if (tile.lodLevel() <= 2) {
+                    key = classifyBatch(piece.vertices(), 0);
+                } else if (tile.lodLevel() == 3) {
+                    key = classifyUnderlayRegion(piece.vertices(), 0);
+                } else {
+                    key = BatchKey.ALWAYS;
+                }
 
                 groupedQuads.computeIfAbsent(
                         key,
@@ -219,7 +226,10 @@ public final class EverviewGpuTileCache {
                         key.sectionY(),
                         key.boundary(),
                         key.chunkBX(),
-                        key.chunkBZ()
+                        key.chunkBZ(),
+                        key.underlayRegion(),
+                        key.regionTileX(),
+                        key.regionTileZ()
                 ));
                 firstIndex += indexCount;
             }
@@ -415,6 +425,40 @@ public final class EverviewGpuTileCache {
         return BatchKey.ALWAYS;
     }
 
+    private static BatchKey classifyUnderlayRegion(
+            int[] vertices,
+            int quadOffset
+    ) {
+        int minX = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE;
+        int maxZ = Integer.MIN_VALUE;
+
+        for (int v = 0; v < 4; v++) {
+            int i = quadOffset + v * 3;
+            minX = Math.min(minX, vertices[i]);
+            maxX = Math.max(maxX, vertices[i]);
+            minZ = Math.min(minZ, vertices[i + 2]);
+            maxZ = Math.max(maxZ, vertices[i + 2]);
+        }
+
+        // L3 cells are aligned to 32/64-block sampling and therefore do not
+        // straddle a 128-block L2 ownership region. For zero-width wall axes,
+        // bias the sample one block inward so a boundary wall belongs to the
+        // region containing the geometry rather than the next tile.
+        int sampleX = minX == maxX
+                ? minX - (Math.floorMod(minX, L3_UNDERLAY_REGION_SIZE) == 0 ? 1 : 0)
+                : minX + Math.max(0, (maxX - minX - 1) / 2);
+        int sampleZ = minZ == maxZ
+                ? minZ - (Math.floorMod(minZ, L3_UNDERLAY_REGION_SIZE) == 0 ? 1 : 0)
+                : minZ + Math.max(0, (maxZ - minZ - 1) / 2);
+
+        return BatchKey.underlayRegion(
+                Math.floorDiv(sampleX, L3_UNDERLAY_REGION_SIZE),
+                Math.floorDiv(sampleZ, L3_UNDERLAY_REGION_SIZE)
+        );
+    }
+
     private record BatchKey(
             boolean vanillaSensitive,
             boolean surface,
@@ -423,10 +467,16 @@ public final class EverviewGpuTileCache {
             int sectionY,
             boolean boundary,
             int chunkBX,
-            int chunkBZ
+            int chunkBZ,
+            boolean underlayRegion,
+            int regionTileX,
+            int regionTileZ
     ) {
         private static final BatchKey ALWAYS =
-                new BatchKey(false, false, 0, 0, 0, false, 0, 0);
+                new BatchKey(
+                        false, false, 0, 0, 0, false, 0, 0,
+                        false, 0, 0
+                );
 
         private static BatchKey surface(
                 int chunkX,
@@ -439,6 +489,9 @@ public final class EverviewGpuTileCache {
                     chunkX,
                     chunkZ,
                     sectionY,
+                    false,
+                    0,
+                    0,
                     false,
                     0,
                     0
@@ -456,6 +509,9 @@ public final class EverviewGpuTileCache {
                     chunkX,
                     chunkZ,
                     sectionY,
+                    false,
+                    0,
+                    0,
                     false,
                     0,
                     0
@@ -477,7 +533,29 @@ public final class EverviewGpuTileCache {
                     sectionY,
                     true,
                     chunkBX,
-                    chunkBZ
+                    chunkBZ,
+                    false,
+                    0,
+                    0
+            );
+        }
+
+        private static BatchKey underlayRegion(
+                int regionTileX,
+                int regionTileZ
+        ) {
+            return new BatchKey(
+                    false,
+                    false,
+                    0,
+                    0,
+                    0,
+                    false,
+                    0,
+                    0,
+                    true,
+                    regionTileX,
+                    regionTileZ
             );
         }
     }
@@ -503,7 +581,10 @@ public final class EverviewGpuTileCache {
             int sectionY,
             boolean boundary,
             int chunkBX,
-            int chunkBZ
+            int chunkBZ,
+            boolean underlayRegion,
+            int regionTileX,
+            int regionTileZ
     ) {
     }
 
