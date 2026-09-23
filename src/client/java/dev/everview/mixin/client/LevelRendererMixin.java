@@ -8,6 +8,7 @@ import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.ModifyArg;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
@@ -33,6 +34,24 @@ public abstract class LevelRendererMixin {
             CallbackInfo ci
     ) {
         EverviewRenderer.drawPersistentTerrain(renderPass);
+    }
+
+
+    /**
+     * Everview provides the visual handoff underneath newly compiled chunks.
+     * A section fade exposes the sky/background through partially opaque
+     * vanilla terrain, so vanilla sections become fully opaque immediately.
+     */
+    @ModifyArg(
+            method = "compileSections",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection;setFadeDuration(J)V"
+            ),
+            index = 0
+    )
+    private long everview$disableVanillaChunkFade(long fadeDuration) {
+        return 0L;
     }
 
 }

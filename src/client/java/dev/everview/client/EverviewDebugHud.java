@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M6.2 DEV | QUALITY-FIRST LIGHTING");
+        lines.add("Everview M6.3 DEV | VANILLA SHIELD");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Visual: full L1 exact target | FogRenderer atmospheric fog OFF | live world lighting");
+        lines.add("Visual: L3 shields vanilla from coarse floors | vanilla chunk fade OFF | live lighting");
         lines.add("LOD targets: L1 1b | L2 2b | L3 4b | L4 8b | L5 16b | L6 32b");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",

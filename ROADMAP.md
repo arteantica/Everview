@@ -294,3 +294,12 @@
 - [ ] validate night / sunrise / rain lighting against adjacent vanilla terrain
 - [ ] benchmark the denser 2/4/8/16/32b hierarchy
 - [ ] begin block-atlas UV surface rendering after this priority/density baseline is stable
+
+
+## M6.3 vanilla shield
+- [x] stream L3 from startup instead of starving it behind near coverage and the L6 floor
+- [x] interleave startup at 4 near : 2 L3 shield : 1 L6 horizon
+- [x] let resident L3 directly retire overlapping L4/L5/L6 regions without waiting for the intermediate chain
+- [x] stop very coarse fallback terrain from bleeding through caves, rivers and vegetation gaps near vanilla
+- [x] force newly compiled vanilla sections to zero fade duration so they appear opaque immediately
+- [ ] validate cave mouths, rivers, trees, newly generated chunks and high-speed handoff
