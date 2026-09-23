@@ -21,10 +21,10 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * M3.7.4.6.1 persistent-GPU distant terrain renderer. Near LOD geometry stays
- * permanently resident. Horizontal surface batches still use renderer-visible
- * chunk-column ownership, while RenderSection upload completion provides a
- * short early-handoff hint before the visibility list catches up.
+ * M3.8.1 persistent-GPU distant terrain renderer. Expensive section-level
+ * live ownership is now confined to a narrow band around the vanilla render
+ * boundary. Near tiles safely outside that band render as one full GPU draw,
+ * keeping the proven live fallback only where vanilla can actually overlap.
  *
  * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
  * Minecraft's opaque terrain RenderPass is still open. Everview therefore
@@ -41,6 +41,7 @@ public final class EverviewRenderer {
     private static final double BASE_TERRAIN_BIAS = 0.22D;
     private static final double RING_LAYER_BIAS = 0.06D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
+    private static final double LIVE_HANDOFF_MARGIN_BLOCKS = 64.0D;
 
     private static final Map<SectionKey, Long> RECENTLY_COMPILED_SECTIONS =
             new HashMap<>();
@@ -105,6 +106,8 @@ public final class EverviewRenderer {
         WorldgenLodRing l1Ring = snapshot.ringForLevel(1);
         Set<Long> residentL1Tiles = new HashSet<>();
         Map<SectionKey, Boolean> vanillaVisibility = new HashMap<>();
+        double vanillaRadius =
+                client.options.getEffectiveRenderDistance() * 16.0D;
 
         if (l1Ring != null) {
             for (WorldgenSurfaceTile tile : snapshot.tiles()) {
@@ -182,32 +185,57 @@ public final class EverviewRenderer {
             renderPass.setIndexBuffer(indexBuffer, quadIndices.type());
             renderPass.setUniform("DynamicTransforms", dynamicTransforms);
 
+            boolean liveHandoff = tile.lodLevel() <= 2
+                    && tileIntersectsLiveHandoffBand(
+                            tile,
+                            cameraX,
+                            cameraZ,
+                            vanillaRadius
+                    );
+
             boolean drewAny = false;
             int drawnQuads = 0;
 
-            for (EverviewGpuTileCache.DrawBatch batch : gpuTile.drawBatches()) {
-                if (batch.vanillaSensitive()
-                        && vanillaOwnsBatch(
-                                client,
-                                batch,
-                                vanillaVisibility
-                        )) {
-                    continue;
-                }
-
-                if (!drewAny) {
-                    EverviewMetrics.recordSubmission(tile.lodLevel());
-                    drewAny = true;
-                }
-
+            if (!liveHandoff) {
+                // Fast path: vanilla cannot overlap this tile, so do not walk
+                // section batches or query renderer ownership at all.
+                EverviewMetrics.recordSubmission(tile.lodLevel());
                 renderPass.drawIndexed(
-                        batch.indexCount(),
+                        gpuTile.indexCount(),
                         1,
-                        batch.firstIndex(),
+                        0,
                         0,
                         0
                 );
-                drawnQuads += batch.indexCount() / 6;
+                EverviewMetrics.recordDrawCall(false);
+                drewAny = true;
+                drawnQuads = gpuTile.indexCount() / 6;
+            } else {
+                for (EverviewGpuTileCache.DrawBatch batch : gpuTile.drawBatches()) {
+                    if (batch.vanillaSensitive()
+                            && vanillaOwnsBatch(
+                                    client,
+                                    batch,
+                                    vanillaVisibility
+                            )) {
+                        continue;
+                    }
+
+                    if (!drewAny) {
+                        EverviewMetrics.recordSubmission(tile.lodLevel());
+                        drewAny = true;
+                    }
+
+                    renderPass.drawIndexed(
+                            batch.indexCount(),
+                            1,
+                            batch.firstIndex(),
+                            0,
+                            0
+                    );
+                    EverviewMetrics.recordDrawCall(true);
+                    drawnQuads += batch.indexCount() / 6;
+                }
             }
 
             if (!drewAny) {
@@ -225,6 +253,44 @@ public final class EverviewRenderer {
                     distance
             );
         }
+    }
+
+    private static boolean tileIntersectsLiveHandoffBand(
+            WorldgenSurfaceTile tile,
+            double cameraX,
+            double cameraZ,
+            double vanillaRadius
+    ) {
+        double minX = tile.minX();
+        double minZ = tile.minZ();
+        double maxX = tile.maxX();
+        double maxZ = tile.maxZ();
+
+        double nearestX = Math.max(minX, Math.min(cameraX, maxX));
+        double nearestZ = Math.max(minZ, Math.min(cameraZ, maxZ));
+        double nearestDistance = Math.hypot(
+                nearestX - cameraX,
+                nearestZ - cameraZ
+        );
+
+        double farthestDx = Math.max(
+                Math.abs(minX - cameraX),
+                Math.abs(maxX - cameraX)
+        );
+        double farthestDz = Math.max(
+                Math.abs(minZ - cameraZ),
+                Math.abs(maxZ - cameraZ)
+        );
+        double farthestDistance = Math.hypot(farthestDx, farthestDz);
+
+        double bandInner = Math.max(
+                0.0D,
+                vanillaRadius - LIVE_HANDOFF_MARGIN_BLOCKS
+        );
+        double bandOuter = vanillaRadius + LIVE_HANDOFF_MARGIN_BLOCKS;
+
+        return nearestDistance <= bandOuter
+                && farthestDistance >= bandInner;
     }
 
     public static void noteRecentlyCompiledSection(BlockPos origin) {

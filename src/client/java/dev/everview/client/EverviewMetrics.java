@@ -19,6 +19,9 @@ public final class EverviewMetrics {
     private static volatile int incompleteTiles;
 
     private static volatile int submissions;
+    private static volatile int drawCalls;
+    private static volatile int handoffDrawCalls;
+    private static volatile int fastTileDrawCalls;
     private static volatile int tilesDrawn;
     private static volatile int tilesCulled;
     private static volatile double updateMs;
@@ -49,6 +52,9 @@ public final class EverviewMetrics {
 
     public static void beginRenderFrame() {
         submissions = 0;
+        drawCalls = 0;
+        handoffDrawCalls = 0;
+        fastTileDrawCalls = 0;
         tilesDrawn = 0;
         tilesCulled = 0;
         frameDrawNanos = 0L;
@@ -82,6 +88,15 @@ public final class EverviewMetrics {
         recordSubmission();
         if (validLod(lodLevel)) {
             ringSubmissions[lodLevel]++;
+        }
+    }
+
+    public static void recordDrawCall(boolean handoffBatch) {
+        drawCalls++;
+        if (handoffBatch) {
+            handoffDrawCalls++;
+        } else {
+            fastTileDrawCalls++;
         }
     }
 
@@ -131,6 +146,9 @@ public final class EverviewMetrics {
                 evictions,
                 incompleteTiles,
                 submissions,
+                drawCalls,
+                handoffDrawCalls,
+                fastTileDrawCalls,
                 tilesDrawn,
                 tilesCulled,
                 updateMs,
@@ -163,6 +181,9 @@ public final class EverviewMetrics {
             int evictions,
             int incompleteTiles,
             int submissions,
+            int drawCalls,
+            int handoffDrawCalls,
+            int fastTileDrawCalls,
             int tilesDrawn,
             int tilesCulled,
             double updateMs,

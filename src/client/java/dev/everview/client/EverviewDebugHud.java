@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.8 | VELOCITY PREFETCH");
+        lines.add("Everview M3.8.1 | BOUNDARY-ONLY BATCHING");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Handoff: top faces yield on visible OR freshly uploaded vanilla sections");
+        lines.add("Render: live section batching only near vanilla edge | far LOD = 1 draw/tile");
         lines.add("Stream: velocity lead + predictive L2 safety carpet | high speed = coverage only");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
@@ -223,6 +223,9 @@ public final class EverviewDebugHud {
 
         lines.add("Frame total c/s/d: " + metrics.tilesCulled() + "/"
                 + metrics.submissions() + "/" + metrics.tilesDrawn());
+        lines.add("Draw calls: " + metrics.drawCalls()
+                + " | handoff " + metrics.handoffDrawCalls()
+                + " | fast " + metrics.fastTileDrawCalls());
         lines.add("Geometry CPU: " + formatMs(metrics.drawMs())
                 + " | target: " + EverviewClient.TARGET_DISTANCE_BLOCKS);
 
