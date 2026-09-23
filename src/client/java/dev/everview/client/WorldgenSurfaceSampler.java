@@ -27,10 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.6.3 makes coverage absolute priority. Everview now finishes every
- * currently visible coarse tile first, then the L1/L2 roaming guard band,
- * before spending any generation time on 2-block or 1-block refinement.
- * Distance-tiered L1 targets remain unchanged.
+ * M3.6.4 makes L1 view-prioritized. The full L2 safety net still establishes
+ * 360-degree coarse coverage first, but only the camera-facing half of L1 is
+ * treated as urgent. Front L1 coverage and detail can finish before rear L1
+ * tiles, which remain safely represented by L2 until spare generation time.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -53,6 +53,8 @@ public final class WorldgenSurfaceSampler {
     private static final int L1_EXACT_BAND_BLOCKS = 64;
     private static final int L1_INTERMEDIATE_BAND_BLOCKS = 128;
     private static final int EXACT_REFINE_COVERAGE_STEPS = 2;
+    private static final int VIEW_SECTOR_COUNT = 16;
+    private static final double VIEW_SECTOR_DEGREES = 360.0 / VIEW_SECTOR_COUNT;
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
@@ -87,6 +89,7 @@ public final class WorldgenSurfaceSampler {
     private static int lastAnchorX = Integer.MIN_VALUE;
     private static int lastAnchorZ = Integer.MIN_VALUE;
     private static int lastInnerRadius = Integer.MIN_VALUE;
+    private static int lastViewSector = Integer.MIN_VALUE;
 
     private static long epoch;
     private static long nextSliceId;
@@ -106,6 +109,37 @@ public final class WorldgenSurfaceSampler {
 
     public static WorldgenSurfaceSnapshot snapshot() {
         return snapshot;
+    }
+
+    public static L1ViewStatus l1ViewStatus() {
+        int desired = 0;
+        int covered = 0;
+        int intermediate = 0;
+        int exact = 0;
+
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.ring().lodLevel() != 1
+                    || wanted.prefetch()
+                    || !wanted.foreground()) {
+                continue;
+            }
+
+            desired++;
+            WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+            if (tile == null) {
+                continue;
+            }
+
+            covered++;
+            if (tile.sampleSpacing() <= L1_INTERMEDIATE_SPACING) {
+                intermediate++;
+            }
+            if (tile.sampleSpacing() <= L1_EXACT_SPACING) {
+                exact++;
+            }
+        }
+
+        return new L1ViewStatus(desired, covered, intermediate, exact);
     }
 
     public static void tick(Minecraft client) {
@@ -134,6 +168,18 @@ public final class WorldgenSurfaceSampler {
         int centerX = client.player.getBlockX();
         int centerZ = client.player.getBlockZ();
 
+        float viewYaw = client.player.getYRot();
+        int viewSector = Math.floorMod(
+                (int) Math.floor(
+                        (viewYaw + VIEW_SECTOR_DEGREES * 0.5)
+                                / VIEW_SECTOR_DEGREES
+                ),
+                VIEW_SECTOR_COUNT
+        );
+        double yawRadians = Math.toRadians(viewYaw);
+        double forwardX = -Math.sin(yawRadians);
+        double forwardZ = Math.cos(yawRadians);
+
         int vanillaRadius = client.options.getEffectiveRenderDistance() * 16;
         int innerRadius = Math.max(
                 MIN_INNER_RADIUS,
@@ -154,12 +200,20 @@ public final class WorldgenSurfaceSampler {
 
         if (anchorX != lastAnchorX
                 || anchorZ != lastAnchorZ
-                || innerRadius != lastInnerRadius) {
+                || innerRadius != lastInnerRadius
+                || viewSector != lastViewSector) {
             lastAnchorX = anchorX;
             lastAnchorZ = anchorZ;
             lastInnerRadius = innerRadius;
+            lastViewSector = viewSector;
             activeRings = createRings(innerRadius);
-            wantedTiles = buildWantedTiles(centerX, centerZ, activeRings);
+            wantedTiles = buildWantedTiles(
+                    centerX,
+                    centerZ,
+                    activeRings,
+                    forwardX,
+                    forwardZ
+            );
 
             if (initialFillStartedNanos == 0L && !wantedTiles.isEmpty()) {
                 initialFillStartedNanos = System.nanoTime();
@@ -390,6 +444,7 @@ public final class WorldgenSurfaceSampler {
         lastAnchorX = Integer.MIN_VALUE;
         lastAnchorZ = Integer.MIN_VALUE;
         lastInnerRadius = Integer.MIN_VALUE;
+        lastViewSector = Integer.MIN_VALUE;
         lastGenerationMs = 0.0;
         lastSliceMs = 0.0;
         lastSliceSamples = 0;
@@ -447,14 +502,25 @@ public final class WorldgenSurfaceSampler {
     private static List<WantedTile> buildWantedTiles(
             int centerX,
             int centerZ,
-            List<WorldgenLodRing> rings
+            List<WorldgenLodRing> rings,
+            double forwardX,
+            double forwardZ
     ) {
         List<List<WantedTile>> perRing = new ArrayList<>();
 
         for (WorldgenLodRing ring : rings) {
-            List<WantedTile> entries = buildRingWantedTiles(centerX, centerZ, ring);
+            List<WantedTile> entries = buildRingWantedTiles(
+                    centerX,
+                    centerZ,
+                    ring,
+                    forwardX,
+                    forwardZ
+            );
             entries.sort(
-                    Comparator.comparing(WantedTile::prefetch)
+                    Comparator.comparingInt(
+                                    (WantedTile entry) -> entry.foreground() ? 0 : 1
+                            )
+                            .thenComparing(WantedTile::prefetch)
                             .thenComparingLong(entry ->
                                     tileCenterDistanceSq(
                                             entry.key(),
@@ -487,7 +553,9 @@ public final class WorldgenSurfaceSampler {
     private static List<WantedTile> buildRingWantedTiles(
             int centerX,
             int centerZ,
-            WorldgenLodRing ring
+            WorldgenLodRing ring,
+            double forwardX,
+            double forwardZ
     ) {
         int tileSize = ring.tileSize();
         int prefetchBlocks = switch (ring.lodLevel()) {
@@ -534,8 +602,17 @@ public final class WorldgenSurfaceSampler {
                 if (inStreamGuard) {
                     LodTileKey key = new LodTileKey(ring.lodLevel(), tileX, tileZ);
                     int targetSpacing = ring.sampleSpacing();
+                    boolean foreground = true;
 
                     if (ring.lodLevel() == 1) {
+                        double tileCenterX = tileX * (double) tileSize + tileSize * 0.5;
+                        double tileCenterZ = tileZ * (double) tileSize + tileSize * 0.5;
+                        double dx = tileCenterX - centerX;
+                        double dz = tileCenterZ - centerZ;
+
+                        // Front hemisphere is urgent. Rear L1 stays optional
+                        // because the persistent L2 underlay already covers it.
+                        foreground = dx * forwardX + dz * forwardZ >= 0.0;
                         if (!visibleNow) {
                             targetSpacing = L1_BOOTSTRAP_SPACING;
                         } else {
@@ -566,7 +643,8 @@ public final class WorldgenSurfaceSampler {
                             key,
                             ring,
                             !visibleNow,
-                            targetSpacing
+                            targetSpacing,
+                            foreground
                     ));
                 }
             }
@@ -663,17 +741,17 @@ public final class WorldgenSurfaceSampler {
             return fallback;
         }
 
-        // M3.6.3: do not begin quality refinement while any visible coarse
-        // terrain is still missing. This removes the 70%-coverage slowdown
-        // where 4b -> 2b work used to compete with unfinished coverage.
-        WantedTile visibleCoverage = firstMissingVisibleCoverage(pending);
+        // M3.6.4: after the 360-degree L2 fallback exists, only camera-facing
+        // L1 counts as urgent visible coverage. Rear L1 can remain represented
+        // by L2 until foreground coverage/detail is established.
+        WantedTile visibleCoverage = firstMissingForegroundVisibleCoverage(pending);
         if (visibleCoverage != null) {
             return visibleCoverage;
         }
 
-        // Once the complete visible field exists, warm only the L1/L2 guard
-        // band needed for normal roaming before touching expensive detail.
-        WantedTile nearGuard = firstMissingNearGuardCoverage(pending);
+        // Warm only camera-facing L1 guard plus the full L2 guard before
+        // spending generation time on high detail.
+        WantedTile nearGuard = firstMissingForegroundNearGuardCoverage(pending);
         if (nearGuard != null) {
             return nearGuard;
         }
@@ -718,9 +796,14 @@ public final class WorldgenSurfaceSampler {
         return null;
     }
 
-    private static WantedTile firstMissingVisibleCoverage(LodTileKey pending) {
+    private static WantedTile firstMissingForegroundVisibleCoverage(
+            LodTileKey pending
+    ) {
         for (WantedTile wanted : wantedTiles) {
             if (wanted.key().equals(pending) || wanted.prefetch()) {
+                continue;
+            }
+            if (wanted.ring().lodLevel() == 1 && !wanted.foreground()) {
                 continue;
             }
 
@@ -732,11 +815,16 @@ public final class WorldgenSurfaceSampler {
         return null;
     }
 
-    private static WantedTile firstMissingNearGuardCoverage(LodTileKey pending) {
+    private static WantedTile firstMissingForegroundNearGuardCoverage(
+            LodTileKey pending
+    ) {
         for (WantedTile wanted : wantedTiles) {
             if (wanted.key().equals(pending)
                     || !wanted.prefetch()
                     || wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
+                continue;
+            }
+            if (wanted.ring().lodLevel() == 1 && !wanted.foreground()) {
                 continue;
             }
 
@@ -781,6 +869,9 @@ public final class WorldgenSurfaceSampler {
             if (wanted.key().equals(pending) || wanted.prefetch()) {
                 continue;
             }
+            if (wanted.ring().lodLevel() == 1 && !wanted.foreground()) {
+                continue;
+            }
 
             int level = wanted.ring().lodLevel();
             WorldgenSurfaceTile tile = CACHE.get(wanted.key());
@@ -809,6 +900,7 @@ public final class WorldgenSurfaceSampler {
             if (wanted.key().equals(pending)
                     || wanted.prefetch()
                     || wanted.ring().lodLevel() != 1
+                    || !wanted.foreground()
                     || wanted.targetSpacing() != L1_EXACT_SPACING) {
                 continue;
             }
@@ -1719,11 +1811,20 @@ public final class WorldgenSurfaceSampler {
         }
     }
 
+    public record L1ViewStatus(
+            int desired,
+            int covered,
+            int intermediate,
+            int exact
+    ) {
+    }
+
     private record WantedTile(
             LodTileKey key,
             WorldgenLodRing ring,
             boolean prefetch,
-            int targetSpacing
+            int targetSpacing,
+            boolean foreground
     ) {
     }
 

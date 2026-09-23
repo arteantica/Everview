@@ -81,8 +81,10 @@
 - [x] coverage-first scheduler: visible coarse field + near guard before any detail refinement
 - [ ] benchmark coverage-first distance-tiered L1 generation / VRAM / roaming cost
 - [x] isolate M3.6.3 scheduler with fresh v15 disk cache benchmark
+- [x] camera-facing L1 generation priority with rear-half L2 fallback
+- [x] rebuild L1 priority on 22.5-degree view sectors
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
-- [ ] view-direction / screen-space generation priority
+- [ ] screen-space error driven detail selection
 - [ ] texture-atlas / UV material rendering
 - [ ] structures
 - [ ] trees

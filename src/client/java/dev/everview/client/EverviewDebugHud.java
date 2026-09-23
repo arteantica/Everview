@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.6.3.1 | CLEAN CACHE BENCH");
+        lines.add("Everview M3.6.4 | VIEW-PRIORITY L1");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Scheduler: visible coverage -> L1/L2 guard -> 2b -> 1b | distance-tiered L1");
+        lines.add("Scheduler: L2 360 -> front L1 -> front guard -> 2b/1b -> rear L1");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
@@ -148,6 +148,19 @@ public final class EverviewDebugHud {
                     l1Desired,
                     l1Exact,
                     l1Desired
+            ));
+
+            WorldgenSurfaceSampler.L1ViewStatus front =
+                    WorldgenSurfaceSampler.l1ViewStatus();
+
+            lines.add(String.format(
+                    "L1 front: cover %d/%d | <=2b %d/%d | 1b %d/%d",
+                    front.covered(),
+                    front.desired(),
+                    front.intermediate(),
+                    front.desired(),
+                    front.exact(),
+                    front.desired()
             ));
 
             double tilesPerSecond = far.initialFillSeconds() > 0.0
