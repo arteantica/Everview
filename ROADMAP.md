@@ -178,3 +178,14 @@
 - [x] block the one-draw L1/L2 fast path wherever vanilla may already own visible chunk sections
 - [x] widen surface-section ownership tolerance for water and terrain section-boundary mismatches
 - [x] preserve LOD fallback where vanilla is not actually renderer-visible
+
+
+## M5 hard chunk-column ownership
+- [x] branch from M4.2 instead of stacking another handoff micro-patch
+- [x] apply vanilla ownership to L1, L2, and emergency L3
+- [x] split L3 geometry through 16x16 vanilla chunk ownership cells
+- [x] preserve L3's independent 128x128 L2 fallback ownership metadata
+- [x] deep vanilla region: loaded chunk column wins immediately
+- [x] outer vanilla fringe: renderer-visible test retains no-hole fallback
+- [x] expose vanilla/finer/visible ownership batch counts in HUD
+- [ ] stress-test land, ocean, coast, x7 flight, and rapid direction reversal

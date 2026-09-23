@@ -23,9 +23,9 @@ import java.util.Set;
 /**
  * M4 unified hierarchical ownership renderer.
  *
- * Ownership is resolved from fine to coarse on the same draw-batch stream:
- * vanilla > L1 > L2 > L3. M4.2 applies vanilla ownership throughout the
- * complete renderer-overlap area rather than only near the nominal edge. L2 no longer disappears as an all-or-nothing
+ * M5 hard column ownership: vanilla owns complete loaded chunk columns deep
+ * inside its render radius, while the outer fringe still requires renderer
+ * visibility before handoff. L1/L2/L3 all use the same ownership mask. L2 no longer disappears as an all-or-nothing
  * 128-block tile; each section batch retires as its corresponding 32-block L1
  * tile becomes GPU-resident. L3 keeps its per-L2-region fallback. All masks
  * coalesce adjacent visible ranges before submission.
@@ -46,7 +46,13 @@ public final class EverviewRenderer {
     private static final double RING_LAYER_BIAS = 0.06D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
     private static final double VANILLA_OWNERSHIP_MARGIN_BLOCKS = 64.0D;
+    private static final double DEEP_VANILLA_GUARD_BLOCKS = 96.0D;
     private static final int EARLY_HANDOFF_VISIBLE_NEIGHBOR_SECTIONS = 2;
+
+    private static int lastVanillaOwnedBatches;
+    private static int lastFinerOwnedBatches;
+    private static int lastVisibleLodBatches;
+    private static int lastDeepLoadedClaims;
 
     private static final Map<SectionKey, Long> RECENTLY_COMPILED_SECTIONS =
             new HashMap<>();
@@ -115,6 +121,11 @@ public final class EverviewRenderer {
         Set<Long> residentL1Tiles = new HashSet<>();
         Set<Long> residentL2Tiles = new HashSet<>();
         Map<SectionKey, Boolean> vanillaVisibility = new HashMap<>();
+        Map<ChunkKey, Boolean> vanillaColumns = new HashMap<>();
+        int vanillaOwnedBatches = 0;
+        int finerOwnedBatches = 0;
+        int visibleLodBatches = 0;
+        int deepLoadedClaims = 0;
         double vanillaRadius =
                 client.options.getEffectiveRenderDistance() * 16.0D;
 
@@ -197,7 +208,7 @@ public final class EverviewRenderer {
                     dynamicTransforms
             );
 
-            boolean vanillaOwnership = tile.lodLevel() <= 2
+            boolean vanillaOwnership = tile.lodLevel() <= 3
                     && tileIntersectsVanillaOwnershipArea(
                             tile,
                             cameraX,
@@ -269,13 +280,29 @@ public final class EverviewRenderer {
                                 );
                     }
 
-                    boolean ownedByVanilla = vanillaOwnership
-                            && batch.vanillaSensitive()
-                            && vanillaOwnsBatch(
-                                    client,
-                                    batch,
-                                    vanillaVisibility
-                            );
+                    ColumnOwnershipResult vanillaResult =
+                            vanillaOwnership && batch.vanillaSensitive()
+                                    ? vanillaOwnsBatch(
+                                            client,
+                                            batch,
+                                            vanillaVisibility,
+                                            vanillaColumns,
+                                            cameraX,
+                                            cameraZ,
+                                            vanillaRadius
+                                    )
+                                    : ColumnOwnershipResult.NOT_OWNED;
+                    boolean ownedByVanilla = vanillaResult.owned();
+
+                    if (ownedByFinerLod) {
+                        finerOwnedBatches++;
+                    }
+                    if (ownedByVanilla) {
+                        vanillaOwnedBatches++;
+                        if (vanillaResult.deepLoaded()) {
+                            deepLoadedClaims++;
+                        }
+                    }
 
                     if (ownedByFinerLod || ownedByVanilla) {
                         if (rangeIndexCount > 0) {
@@ -334,6 +361,7 @@ public final class EverviewRenderer {
                     }
 
                     drawnQuads += batch.indexCount() / 6;
+                    visibleLodBatches++;
                 }
 
                 if (rangeIndexCount > 0) {
@@ -370,6 +398,20 @@ public final class EverviewRenderer {
                     distance
             );
         }
+
+        lastVanillaOwnedBatches = vanillaOwnedBatches;
+        lastFinerOwnedBatches = finerOwnedBatches;
+        lastVisibleLodBatches = visibleLodBatches;
+        lastDeepLoadedClaims = deepLoadedClaims;
+    }
+
+    public static OwnershipStats ownershipStats() {
+        return new OwnershipStats(
+                lastVanillaOwnedBatches,
+                lastFinerOwnedBatches,
+                lastVisibleLodBatches,
+                lastDeepLoadedClaims
+        );
     }
 
     private static boolean tileIntersectsVanillaOwnershipArea(
@@ -432,45 +474,95 @@ public final class EverviewRenderer {
                 && System.nanoTime() - compiledAt <= RECENT_COMPILE_HINT_NANOS;
     }
 
-    private static boolean vanillaOwnsBatch(
+    private static ColumnOwnershipResult vanillaOwnsBatch(
             Minecraft client,
             EverviewGpuTileCache.DrawBatch batch,
-            Map<SectionKey, Boolean> visibility
+            Map<SectionKey, Boolean> visibility,
+            Map<ChunkKey, Boolean> columns,
+            double cameraX,
+            double cameraZ,
+            double vanillaRadius
     ) {
-        if (batch.surface()) {
-            return vanillaSurfaceColumnVisible(
-                    client,
-                    batch.chunkAX(),
-                    batch.sectionY(),
-                    batch.chunkAZ(),
-                    visibility
-            );
-        }
-
-        boolean aVisible = vanillaSectionVisible(
+        ColumnOwnershipResult aOwned = vanillaChunkColumnOwned(
                 client,
                 batch.chunkAX(),
                 batch.sectionY(),
                 batch.chunkAZ(),
-                visibility
+                visibility,
+                columns,
+                cameraX,
+                cameraZ,
+                vanillaRadius
         );
 
         if (!batch.boundary()) {
-            return aVisible;
+            return aOwned;
         }
 
-        boolean bVisible = vanillaSectionVisible(
+        ColumnOwnershipResult bOwned = vanillaChunkColumnOwned(
                 client,
                 batch.chunkBX(),
                 batch.sectionY(),
                 batch.chunkBZ(),
-                visibility
+                visibility,
+                columns,
+                cameraX,
+                cameraZ,
+                vanillaRadius
         );
 
-        // Boundary walls are the artifact we saw in M3.7.4.2. Once either
-        // adjacent vanilla side is renderer-ready, the wall is no longer
-        // needed as a safety face and is suppressed.
-        return aVisible || bVisible;
+        return new ColumnOwnershipResult(
+                aOwned.owned() || bOwned.owned(),
+                aOwned.deepLoaded() || bOwned.deepLoaded()
+        );
+    }
+
+    private static ColumnOwnershipResult vanillaChunkColumnOwned(
+            Minecraft client,
+            int chunkX,
+            int hintSectionY,
+            int chunkZ,
+            Map<SectionKey, Boolean> visibility,
+            Map<ChunkKey, Boolean> columns,
+            double cameraX,
+            double cameraZ,
+            double vanillaRadius
+    ) {
+        ChunkKey key = new ChunkKey(chunkX, chunkZ);
+        Boolean cached = columns.get(key);
+        if (cached != null) {
+            return new ColumnOwnershipResult(cached, false);
+        }
+
+        double chunkCenterX = chunkX * 16.0D + 8.0D;
+        double chunkCenterZ = chunkZ * 16.0D + 8.0D;
+        double distance = Math.hypot(
+                chunkCenterX - cameraX,
+                chunkCenterZ - cameraZ
+        );
+
+        boolean deepInsideVanilla = distance
+                <= Math.max(
+                        0.0D,
+                        vanillaRadius - DEEP_VANILLA_GUARD_BLOCKS
+                );
+
+        if (deepInsideVanilla
+                && client.level != null
+                && client.level.hasChunk(chunkX, chunkZ)) {
+            columns.put(key, true);
+            return new ColumnOwnershipResult(true, true);
+        }
+
+        boolean visible = vanillaSurfaceColumnVisible(
+                client,
+                chunkX,
+                hintSectionY,
+                chunkZ,
+                visibility
+        );
+        columns.put(key, visible);
+        return new ColumnOwnershipResult(visible, false);
     }
 
     private static boolean vanillaSurfaceColumnVisible(
@@ -565,6 +657,28 @@ public final class EverviewRenderer {
         );
         visibility.put(key, visible);
         return visible;
+    }
+
+    public record OwnershipStats(
+            int vanillaOwnedBatches,
+            int finerOwnedBatches,
+            int visibleLodBatches,
+            int deepLoadedClaims
+    ) {
+    }
+
+    private record ColumnOwnershipResult(
+            boolean owned,
+            boolean deepLoaded
+    ) {
+        private static final ColumnOwnershipResult NOT_OWNED =
+                new ColumnOwnershipResult(false, false);
+    }
+
+    private record ChunkKey(
+            int chunkX,
+            int chunkZ
+    ) {
     }
 
     private record SectionKey(

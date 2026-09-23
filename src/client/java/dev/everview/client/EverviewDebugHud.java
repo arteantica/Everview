@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M4.2 ALPHA | ABSOLUTE VANILLA OWNERSHIP");
+        lines.add("Everview M5.0 DEV | HARD COLUMN OWNERSHIP");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Render: merged handoff ranges | uploads yield only after same-column vanilla is visible");
-        lines.add("Ownership: vanilla-visible > L1 > L2 > L3 | dual-lane refinement");
+        lines.add("Ownership: loaded vanilla columns > L1 > L2 > L3 | fringe keeps fallback");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
@@ -255,6 +255,16 @@ public final class EverviewDebugHud {
         } else {
             lines.add("Far WORLDGEN: unavailable (singleplayer test path)");
         }
+
+        EverviewRenderer.OwnershipStats ownership =
+                EverviewRenderer.ownershipStats();
+        lines.add(String.format(
+                "Ownership mask: vanilla %d | finer %d | LOD visible %d | deep claims %d",
+                ownership.vanillaOwnedBatches(),
+                ownership.finerOwnedBatches(),
+                ownership.visibleLodBatches(),
+                ownership.deepLoadedClaims()
+        ));
 
         EverviewGpuTileCache.Stats gpu = EverviewGpuTileCache.stats();
         lines.add(String.format(

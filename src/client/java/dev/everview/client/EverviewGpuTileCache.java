@@ -21,9 +21,9 @@ import java.util.Map;
  * Render-thread-owned persistent GPU storage for generated LOD tiles.
  *
  * Tile geometry is uploaded once as POSITION_COLOR data in tile-local X/Z.
- * L1/L2 keep section-aware vanilla handoff batches. M3.9.2 also partitions L3
- * into 128x128 ownership regions so its emergency underlay can retire one L2
- * region at a time instead of lingering as a whole 256x256 slab.
+ * M5 partitions every near-ring quad through the 16x16 vanilla chunk grid.
+ * L3 therefore carries both vanilla chunk-column ownership and its 128x128 L2
+ * fallback-region ownership, so no emergency surface can leak through vanilla.
  */
 public final class EverviewGpuTileCache {
     private static final int MAX_GPU_TILES = 3_072;
@@ -152,8 +152,8 @@ public final class EverviewGpuTileCache {
         int emittedQuadCount = 0;
 
         for (int quadOffset = 0; quadOffset < vertices.length; quadOffset += 12) {
-            List<QuadPiece> pieces = tile.lodLevel() <= 2
-                    ? splitNearQuadBySection(vertices, colors, quadOffset)
+            List<QuadPiece> pieces = tile.lodLevel() <= 3
+                    ? splitQuadForOwnership(vertices, colors, quadOffset)
                     : List.of(copyQuad(vertices, colors, quadOffset));
 
             emittedQuadCount += pieces.size();
@@ -164,7 +164,7 @@ public final class EverviewGpuTileCache {
                 if (tile.lodLevel() <= 2) {
                     key = classifyBatch(piece.vertices(), 0);
                 } else if (tile.lodLevel() == 3) {
-                    key = classifyUnderlayRegion(piece.vertices(), 0);
+                    key = classifyUnderlayBatch(piece.vertices(), 0);
                 } else {
                     key = BatchKey.ALWAYS;
                 }
@@ -251,6 +251,164 @@ public final class EverviewGpuTileCache {
                 );
             }
         }
+    }
+
+    private static List<QuadPiece> splitQuadForOwnership(
+            int[] vertices,
+            int[] colors,
+            int quadOffset
+    ) {
+        List<QuadPiece> sectionPieces =
+                splitNearQuadBySection(vertices, colors, quadOffset);
+        List<QuadPiece> ownedPieces = new ArrayList<>();
+
+        for (QuadPiece piece : sectionPieces) {
+            ownedPieces.addAll(splitPieceByChunkColumns(piece));
+        }
+
+        return ownedPieces;
+    }
+
+    private static List<QuadPiece> splitPieceByChunkColumns(
+            QuadPiece piece
+    ) {
+        int[] vertices = piece.vertices();
+        int minX = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE;
+        int minY = Integer.MAX_VALUE;
+        int maxY = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE;
+        int maxZ = Integer.MIN_VALUE;
+
+        for (int v = 0; v < 4; v++) {
+            int i = v * 3;
+            minX = Math.min(minX, vertices[i]);
+            maxX = Math.max(maxX, vertices[i]);
+            minY = Math.min(minY, vertices[i + 1]);
+            maxY = Math.max(maxY, vertices[i + 1]);
+            minZ = Math.min(minZ, vertices[i + 2]);
+            maxZ = Math.max(maxZ, vertices[i + 2]);
+        }
+
+        boolean horizontal = minY == maxY
+                && minX < maxX
+                && minZ < maxZ;
+        boolean xWall = minX == maxX
+                && minY < maxY
+                && minZ < maxZ;
+        boolean zWall = minZ == maxZ
+                && minY < maxY
+                && minX < maxX;
+
+        if (!horizontal && !xWall && !zWall) {
+            return List.of(piece);
+        }
+
+        List<QuadPiece> result = new ArrayList<>();
+
+        if (horizontal) {
+            int x0 = minX;
+            while (x0 < maxX) {
+                int x1 = Math.min(maxX, nextChunkBoundary(x0));
+                int z0 = minZ;
+
+                while (z0 < maxZ) {
+                    int z1 = Math.min(maxZ, nextChunkBoundary(z0));
+                    result.add(remapAxisAlignedPiece(
+                            piece,
+                            minX, maxX,
+                            minY, maxY,
+                            minZ, maxZ,
+                            x0, x1,
+                            minY, maxY,
+                            z0, z1
+                    ));
+                    z0 = z1;
+                }
+                x0 = x1;
+            }
+
+            return result;
+        }
+
+        if (xWall) {
+            int z0 = minZ;
+            while (z0 < maxZ) {
+                int z1 = Math.min(maxZ, nextChunkBoundary(z0));
+                result.add(remapAxisAlignedPiece(
+                        piece,
+                        minX, maxX,
+                        minY, maxY,
+                        minZ, maxZ,
+                        minX, maxX,
+                        minY, maxY,
+                        z0, z1
+                ));
+                z0 = z1;
+            }
+
+            return result;
+        }
+
+        int x0 = minX;
+        while (x0 < maxX) {
+            int x1 = Math.min(maxX, nextChunkBoundary(x0));
+            result.add(remapAxisAlignedPiece(
+                    piece,
+                    minX, maxX,
+                    minY, maxY,
+                    minZ, maxZ,
+                    x0, x1,
+                    minY, maxY,
+                    minZ, maxZ
+            ));
+            x0 = x1;
+        }
+
+        return result;
+    }
+
+    private static int nextChunkBoundary(int coordinate) {
+        return (Math.floorDiv(coordinate, 16) + 1) * 16;
+    }
+
+    private static QuadPiece remapAxisAlignedPiece(
+            QuadPiece source,
+            int oldMinX,
+            int oldMaxX,
+            int oldMinY,
+            int oldMaxY,
+            int oldMinZ,
+            int oldMaxZ,
+            int newMinX,
+            int newMaxX,
+            int newMinY,
+            int newMaxY,
+            int newMinZ,
+            int newMaxZ
+    ) {
+        int[] oldVertices = source.vertices();
+        int[] newVertices = new int[12];
+        int[] newColors = source.colors().clone();
+
+        for (int v = 0; v < 4; v++) {
+            int i = v * 3;
+            int x = oldVertices[i];
+            int y = oldVertices[i + 1];
+            int z = oldVertices[i + 2];
+
+            newVertices[i] = oldMinX == oldMaxX
+                    ? oldMinX
+                    : (x == oldMinX ? newMinX : newMaxX);
+            newVertices[i + 1] = oldMinY == oldMaxY
+                    ? oldMinY
+                    : (y == oldMinY ? newMinY : newMaxY);
+            newVertices[i + 2] = oldMinZ == oldMaxZ
+                    ? oldMinZ
+                    : (z == oldMinZ ? newMinZ : newMaxZ);
+        }
+
+        return new QuadPiece(newVertices, newColors);
     }
 
     private static List<QuadPiece> splitNearQuadBySection(
@@ -425,10 +583,12 @@ public final class EverviewGpuTileCache {
         return BatchKey.ALWAYS;
     }
 
-    private static BatchKey classifyUnderlayRegion(
+    private static BatchKey classifyUnderlayBatch(
             int[] vertices,
             int quadOffset
     ) {
+        BatchKey vanillaKey = classifyBatch(vertices, quadOffset);
+
         int minX = Integer.MAX_VALUE;
         int maxX = Integer.MIN_VALUE;
         int minZ = Integer.MAX_VALUE;
@@ -442,18 +602,16 @@ public final class EverviewGpuTileCache {
             maxZ = Math.max(maxZ, vertices[i + 2]);
         }
 
-        // L3 cells are aligned to 32/64-block sampling and therefore do not
-        // straddle a 128-block L2 ownership region. For zero-width wall axes,
-        // bias the sample one block inward so a boundary wall belongs to the
-        // region containing the geometry rather than the next tile.
         int sampleX = minX == maxX
-                ? minX - (Math.floorMod(minX, L3_UNDERLAY_REGION_SIZE) == 0 ? 1 : 0)
+                ? minX - (Math.floorMod(minX, L3_UNDERLAY_REGION_SIZE) == 0
+                        ? 1 : 0)
                 : minX + Math.max(0, (maxX - minX - 1) / 2);
         int sampleZ = minZ == maxZ
-                ? minZ - (Math.floorMod(minZ, L3_UNDERLAY_REGION_SIZE) == 0 ? 1 : 0)
+                ? minZ - (Math.floorMod(minZ, L3_UNDERLAY_REGION_SIZE) == 0
+                        ? 1 : 0)
                 : minZ + Math.max(0, (maxZ - minZ - 1) / 2);
 
-        return BatchKey.underlayRegion(
+        return vanillaKey.withUnderlayRegion(
                 Math.floorDiv(sampleX, L3_UNDERLAY_REGION_SIZE),
                 Math.floorDiv(sampleZ, L3_UNDERLAY_REGION_SIZE)
         );
@@ -553,6 +711,25 @@ public final class EverviewGpuTileCache {
                     false,
                     0,
                     0,
+                    true,
+                    regionTileX,
+                    regionTileZ
+            );
+        }
+
+        private BatchKey withUnderlayRegion(
+                int regionTileX,
+                int regionTileZ
+        ) {
+            return new BatchKey(
+                    vanillaSensitive,
+                    surface,
+                    chunkAX,
+                    chunkAZ,
+                    sectionY,
+                    boundary,
+                    chunkBX,
+                    chunkBZ,
                     true,
                     regionTileX,
                     regionTileZ
