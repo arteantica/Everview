@@ -27,10 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.7.1 keeps the block-column exact L1 geometry and lets it appear much
- * sooner. Front refinement now interleaves two 4b->2b upgrades with one
- * eligible 2b->1b exact upgrade, instead of finishing the whole 2b queue first.
- * Coverage priority and the M3.6.6 8:1 coverage/refine balance stay unchanged.
+ * M3.7.2 concentrates exact detail into a continuous inner belt. After front
+ * coverage/guard, the nearest exact-band tile is driven all the way 4b->2b->1b
+ * before moving outward. Only after that 64-block exact band is complete does
+ * the scheduler spend quality work on the wider 2-block intermediate band.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -45,7 +45,6 @@ public final class WorldgenSurfaceSampler {
     private static final int CACHE_LIMIT = 3_072;
     private static final int NEAR_RING_MAX_LEVEL = 2;
     private static final int REMAINING_COVERAGE_BURST = 8;
-    private static final int INTERMEDIATE_BEFORE_EXACT = 2;
     private static final int L1_PREFETCH_BLOCKS = 64;
     private static final int L2_PREFETCH_BLOCKS = 128;
     private static final int L1_BOOTSTRAP_SPACING = 4;
@@ -98,7 +97,6 @@ public final class WorldgenSurfaceSampler {
     private static long initialFillStartedNanos;
     private static long initialFillCompletedNanos;
     private static int balancedCoverageStep;
-    private static int frontRefineMixStep;
 
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
@@ -452,7 +450,6 @@ public final class WorldgenSurfaceSampler {
         initialFillStartedNanos = 0L;
         initialFillCompletedNanos = 0L;
         balancedCoverageStep = 0;
-        frontRefineMixStep = 0;
         adaptiveSliceBudgetNanos = BASE_SLICE_BUDGET_NANOS;
         serverTickMs = 0.0;
         clientFrameMs = 0.0;
@@ -755,14 +752,18 @@ public final class WorldgenSurfaceSampler {
 
         WantedTile remainingCoverage = firstMissingCoverage(pending);
 
-        // M3.7.1: do not drain the entire 4b -> 2b queue before showing the
-        // new block-column geometry. As soon as exact-band 2b tiles exist,
-        // interleave two intermediate upgrades with one 1b exact upgrade.
-        WantedTile intermediate = firstIntermediateNearRefinement(pending);
-        WantedTile exact = firstExactL1Refinement(pending);
-        boolean hasFrontQuality = intermediate != null || exact != null;
+        // M3.7.2: concentrate quality where the vanilla handoff is visible.
+        // firstExactBandRefinement() returns the nearest exact-band tile that
+        // has not reached 1b yet. Because nextGenerationSpacing() advances it
+        // 4b->2b->1b, the same tile is completed before the scheduler moves on.
+        WantedTile frontQuality = firstExactBandRefinement(pending);
+        if (frontQuality == null) {
+            frontQuality = firstIntermediateNearRefinement(pending);
+        }
+        boolean hasFrontQuality = frontQuality != null;
 
-        // Keep the M3.6.6 8:1 coverage/refinement balance unchanged.
+        // Keep the proven M3.6.6 8:1 coverage/refinement balance unchanged
+        // while total coverage is still incomplete.
         if (remainingCoverage != null && hasFrontQuality) {
             if (balancedCoverageStep < REMAINING_COVERAGE_BURST) {
                 balancedCoverageStep++;
@@ -770,7 +771,7 @@ public final class WorldgenSurfaceSampler {
             }
 
             balancedCoverageStep = 0;
-            return selectFrontQuality(intermediate, exact);
+            return frontQuality;
         }
 
         if (remainingCoverage != null) {
@@ -780,7 +781,7 @@ public final class WorldgenSurfaceSampler {
 
         if (hasFrontQuality) {
             balancedCoverageStep = 0;
-            return selectFrontQuality(intermediate, exact);
+            return frontQuality;
         }
 
         // Exact L2 and other low-value refinement only happen after coverage
@@ -870,30 +871,25 @@ public final class WorldgenSurfaceSampler {
         return null;
     }
 
-    private static WantedTile selectFrontQuality(
-            WantedTile intermediate,
-            WantedTile exact
+    private static WantedTile firstExactBandRefinement(
+            LodTileKey pending
     ) {
-        if (intermediate == null) {
-            frontRefineMixStep = 0;
-            return exact;
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || wanted.prefetch()
+                    || wanted.ring().lodLevel() != 1
+                    || !wanted.foreground()
+                    || wanted.targetSpacing() != L1_EXACT_SPACING) {
+                continue;
+            }
+
+            WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+            if (tile != null && tile.sampleSpacing() > L1_EXACT_SPACING) {
+                return wanted;
+            }
         }
 
-        if (exact == null) {
-            frontRefineMixStep = Math.min(
-                    INTERMEDIATE_BEFORE_EXACT,
-                    frontRefineMixStep + 1
-            );
-            return intermediate;
-        }
-
-        if (frontRefineMixStep >= INTERMEDIATE_BEFORE_EXACT) {
-            frontRefineMixStep = 0;
-            return exact;
-        }
-
-        frontRefineMixStep++;
-        return intermediate;
+        return null;
     }
 
     private static WantedTile firstIntermediateNearRefinement(
@@ -911,27 +907,6 @@ public final class WorldgenSurfaceSampler {
             if (tile != null
                     && wanted.targetSpacing() <= L1_INTERMEDIATE_SPACING
                     && tile.sampleSpacing() > L1_INTERMEDIATE_SPACING) {
-                return wanted;
-            }
-        }
-
-        return null;
-    }
-
-    private static WantedTile firstExactL1Refinement(LodTileKey pending) {
-        for (WantedTile wanted : wantedTiles) {
-            if (wanted.key().equals(pending)
-                    || wanted.prefetch()
-                    || wanted.ring().lodLevel() != 1
-                    || !wanted.foreground()
-                    || wanted.targetSpacing() != L1_EXACT_SPACING) {
-                continue;
-            }
-
-            WorldgenSurfaceTile tile = CACHE.get(wanted.key());
-            if (tile != null
-                    && tile.sampleSpacing() > L1_EXACT_SPACING
-                    && tile.sampleSpacing() <= L1_INTERMEDIATE_SPACING) {
                 return wanted;
             }
         }

@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.7.1 | EARLY EXACT L1");
+        lines.add("Everview M3.7.2 | EXACT BAND FIRST");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Refine: 2x intermediate -> 1x exact | exact L1 = 1x1 block columns");
+        lines.add("Refine: nearest inner64 tile 4b -> 2b -> 1b | then wider 2b band");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
