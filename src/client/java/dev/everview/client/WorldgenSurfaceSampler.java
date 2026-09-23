@@ -27,10 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.6.1 turns L1 into a three-stage stream: 4-block bootstrap for fast
- * coverage, 2-block visible intermediate detail, then low-priority 1-block
- * exact refinement. The conditional L2 underlay remains available underneath
- * so final fidelity never blocks world coverage.
+ * M3.6.2 localizes expensive L1 fidelity by distance. Visible L1 tiles within
+ * 64 blocks of the vanilla handoff target 1-block detail, the next 64 blocks
+ * target 2-block detail, and the rest stay at 4-block. The conditional L2
+ * underlay remains available underneath so detail never blocks coverage.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -51,6 +51,8 @@ public final class WorldgenSurfaceSampler {
     private static final int L1_BOOTSTRAP_SPACING = 4;
     private static final int L1_INTERMEDIATE_SPACING = 2;
     private static final int L1_EXACT_SPACING = 1;
+    private static final int L1_EXACT_BAND_BLOCKS = 64;
+    private static final int L1_INTERMEDIATE_BAND_BLOCKS = 128;
     private static final int EXACT_REFINE_COVERAGE_STEPS = 2;
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
@@ -532,7 +534,41 @@ public final class WorldgenSurfaceSampler {
 
                 if (inStreamGuard) {
                     LodTileKey key = new LodTileKey(ring.lodLevel(), tileX, tileZ);
-                    entries.add(new WantedTile(key, ring, !visibleNow));
+                    int targetSpacing = ring.sampleSpacing();
+
+                    if (ring.lodLevel() == 1) {
+                        if (!visibleNow) {
+                            targetSpacing = L1_BOOTSTRAP_SPACING;
+                        } else {
+                            double centerDistance = Math.sqrt(
+                                    tileCenterDistanceSq(
+                                            key,
+                                            ring,
+                                            centerX,
+                                            centerZ
+                                    )
+                            );
+                            double intoL1 = Math.max(
+                                    0.0,
+                                    centerDistance - ring.innerRadiusBlocks()
+                            );
+
+                            if (intoL1 <= L1_EXACT_BAND_BLOCKS) {
+                                targetSpacing = L1_EXACT_SPACING;
+                            } else if (intoL1 <= L1_INTERMEDIATE_BAND_BLOCKS) {
+                                targetSpacing = L1_INTERMEDIATE_SPACING;
+                            } else {
+                                targetSpacing = L1_BOOTSTRAP_SPACING;
+                            }
+                        }
+                    }
+
+                    entries.add(new WantedTile(
+                            key,
+                            ring,
+                            !visibleNow,
+                            targetSpacing
+                    ));
                 }
             }
         }
@@ -599,13 +635,19 @@ public final class WorldgenSurfaceSampler {
         WorldgenLodRing ring = wanted.ring();
 
         if (ring.lodLevel() == 1) {
+            int target = wanted.targetSpacing();
+
             if (existing == null) {
                 return L1_BOOTSTRAP_SPACING;
             }
-            if (existing.sampleSpacing() > L1_INTERMEDIATE_SPACING) {
+            if (existing.sampleSpacing() <= target) {
+                return existing.sampleSpacing();
+            }
+            if (existing.sampleSpacing() > L1_INTERMEDIATE_SPACING
+                    && target <= L1_INTERMEDIATE_SPACING) {
                 return L1_INTERMEDIATE_SPACING;
             }
-            return L1_EXACT_SPACING;
+            return target;
         }
 
         return existing == null
@@ -731,6 +773,7 @@ public final class WorldgenSurfaceSampler {
             }
 
             if (level == 1
+                    && wanted.targetSpacing() <= L1_INTERMEDIATE_SPACING
                     && tile.sampleSpacing() > L1_INTERMEDIATE_SPACING) {
                 return wanted;
             }
@@ -748,7 +791,8 @@ public final class WorldgenSurfaceSampler {
         for (WantedTile wanted : wantedTiles) {
             if (wanted.key().equals(pending)
                     || wanted.prefetch()
-                    || wanted.ring().lodLevel() != 1) {
+                    || wanted.ring().lodLevel() != 1
+                    || wanted.targetSpacing() != L1_EXACT_SPACING) {
                 continue;
             }
 
@@ -776,8 +820,12 @@ public final class WorldgenSurfaceSampler {
             }
 
             WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+            int desiredSpacing = wanted.ring().lodLevel() == 1
+                    ? wanted.targetSpacing()
+                    : wanted.ring().sampleSpacing();
+
             if (tile != null
-                    && tile.sampleSpacing() > wanted.ring().sampleSpacing()) {
+                    && tile.sampleSpacing() > desiredSpacing) {
                 return wanted;
             }
         }
@@ -1676,7 +1724,8 @@ public final class WorldgenSurfaceSampler {
     private record WantedTile(
             LodTileKey key,
             WorldgenLodRing ring,
-            boolean prefetch
+            boolean prefetch,
+            int targetSpacing
     ) {
     }
 

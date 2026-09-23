@@ -77,7 +77,8 @@
 - [x] suppress interior L2 underlay draws once resident L1 coverage is complete
 - [x] exact 1-block horizontal L1 refinement
 - [x] staged L1 streaming: 4b bootstrap -> 2b intermediate -> 1b low-priority exact
-- [ ] benchmark staged 1-block L1 generation / VRAM / roaming refinement cost
+- [x] distance-tiered L1 targets: inner 64b at 1-block, next 64b at 2-block, outer L1 at 4-block
+- [ ] benchmark distance-tiered L1 generation / VRAM / roaming refinement cost
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] view-direction / screen-space generation priority
 - [ ] texture-atlas / UV material rendering

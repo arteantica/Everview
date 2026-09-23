@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.6.1 | STAGED 1-BLOCK L1");
+        lines.add("Everview M3.6.2 | DISTANCE-TIERED L1");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Detail: L1 4b bootstrap -> 2b intermediate -> 1b exact | L2 safety net");
+        lines.add("Detail: L1 inner64 1b | next64 2b | outer 4b | conditional L2 safety net");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
@@ -141,7 +141,7 @@ public final class EverviewDebugHud {
             ));
 
             lines.add(String.format(
-                    "L1 stages: cover %d/%d | <=2b %d/%d | 1b %d/%d",
+                    "L1 actual: cover %d/%d | <=2b %d/%d | 1b %d/%d",
                     l1Covered,
                     l1Desired,
                     l1Intermediate,
