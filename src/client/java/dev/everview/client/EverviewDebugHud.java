@@ -37,10 +37,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M4.0 ALPHA | UNIFIED LOD ENGINE");
+        lines.add("Everview M4.1 ALPHA | DUAL-LANE LOD ENGINE");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Render: merged handoff ranges | uploads yield only after same-column vanilla is visible");
-        lines.add("Refine: coverage -> async 1b heights -> bounded appearance catch-up");
+        lines.add("Refine: outward coverage || detached 1b workers -> bounded appearance catch-up");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),

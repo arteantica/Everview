@@ -152,6 +152,8 @@ public final class WorldgenSurfaceSampler {
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
     private static GenerationJob currentJob;
+    private static volatile CompletableFuture<Void> detachedExactFuture;
+    private static volatile LodTileKey detachedExactKey;
 
     private WorldgenSurfaceSampler() {
     }
@@ -243,9 +245,10 @@ public final class WorldgenSurfaceSampler {
                 appearanceReady,
                 appearanceDesired,
                 provisionalExactTileCount(),
-                currentJob != null
-                        && currentJob.asyncHeightFuture != null
-                        && !currentJob.asyncHeightFuture.isDone(),
+                (detachedExactFuture != null && !detachedExactFuture.isDone())
+                        || (currentJob != null
+                                && currentJob.asyncHeightFuture != null
+                                && !currentJob.asyncHeightFuture.isDone()),
                 currentJob != null && currentJob.asyncExactDisabled
         );
     }
@@ -388,6 +391,27 @@ public final class WorldgenSurfaceSampler {
         if (!diskLoadReady) {
             rebuildSnapshot();
             return;
+        }
+
+        pollDetachedExact();
+
+        if (!highSpeedCoverageMode
+                && detachedExactFuture == null
+                && provisionalExactTileCount()
+                        < MAX_PROVISIONAL_EXACT_TILES) {
+            LodTileKey pending = currentJob == null
+                    ? null
+                    : currentJob.key;
+            WantedTile detached = firstExactBandRefinement(pending);
+
+            if (detached != null
+                    && !detached.key().equals(detachedExactKey)) {
+                startDetachedExact(
+                        server,
+                        clientLevel.dimension(),
+                        detached
+                );
+            }
         }
 
         if (currentJob != null
@@ -789,6 +813,11 @@ public final class WorldgenSurfaceSampler {
         diskFileMiB = 0.0;
         diskCacheStatus = "OFF";
         cancelCurrentJob();
+        if (detachedExactFuture != null) {
+            detachedExactFuture.cancel(true);
+        }
+        detachedExactFuture = null;
+        detachedExactKey = null;
         activeSliceId = 0L;
     }
 
@@ -817,6 +846,10 @@ public final class WorldgenSurfaceSampler {
 
             if (currentJob != null && currentJob.key.equals(completed.key())) {
                 currentJob = null;
+            }
+            if (detachedExactKey != null
+                    && detachedExactKey.equals(completed.key())) {
+                detachedExactKey = null;
             }
         }
 
@@ -1210,8 +1243,22 @@ public final class WorldgenSurfaceSampler {
             return emergencyUnderlay;
         }
 
-        // 1) Never allow a farther ring, prediction, or refinement to jump over
-        // a currently visible L1/L2 hole. This is the true outward frontier.
+        // 1) Detached exact geometry is allowed to run beside coverage, but
+        // once its provisional backlog reaches the cap the server lane spends
+        // enough time on appearance to stop temporary green exact tiles from
+        // spreading indefinitely.
+        if (!highSpeedCoverageMode
+                && provisionalExactTileCount()
+                        >= MAX_PROVISIONAL_EXACT_TILES) {
+            WantedTile appearance =
+                    firstExactAppearanceRefinement(pending);
+            if (appearance != null) {
+                return appearance;
+            }
+        }
+
+        // 2) Never allow a farther ring or prediction to jump over a currently
+        // visible L1/L2 hole. This remains the outward coverage frontier.
         WantedTile nearCoverage =
                 firstMissingCurrentNearCoverage(pending);
         if (nearCoverage != null) {
@@ -1602,6 +1649,7 @@ public final class WorldgenSurfaceSampler {
     ) {
         for (WantedTile wanted : wantedTiles) {
             if (wanted.key().equals(pending)
+                    || wanted.key().equals(detachedExactKey)
                     || wanted.prefetch()
                     || wanted.ring().lodLevel() != 1
                     || !wanted.foreground()
@@ -1669,7 +1717,8 @@ public final class WorldgenSurfaceSampler {
             boolean nearOnly
     ) {
         for (WantedTile wanted : wantedTiles) {
-            if (wanted.key().equals(pending)) {
+            if (wanted.key().equals(pending)
+                    || wanted.key().equals(detachedExactKey)) {
                 continue;
             }
             if (nearOnly && wanted.ring().lodLevel() > NEAR_RING_MAX_LEVEL) {
@@ -1688,6 +1737,265 @@ public final class WorldgenSurfaceSampler {
         }
 
         return null;
+    }
+
+    private static void pollDetachedExact() {
+        if (detachedExactFuture == null
+                || !detachedExactFuture.isDone()) {
+            return;
+        }
+
+        try {
+            detachedExactFuture.join();
+        } catch (RuntimeException exception) {
+            EverviewClient.LOGGER.warn(
+                    "Everview detached exact-height job failed",
+                    exception
+            );
+        } finally {
+            detachedExactFuture = null;
+            if (detachedExactKey != null
+                    && !containsWantedKey(detachedExactKey)) {
+                detachedExactKey = null;
+            }
+        }
+    }
+
+    private static void startDetachedExact(
+            MinecraftServer server,
+            ResourceKey<Level> dimension,
+            WantedTile wanted
+    ) {
+        LodTileKey key = wanted.key();
+        WorldgenSurfaceTile existing = CACHE.get(key);
+        if (existing == null
+                || existing.sampleSpacing() <= L1_EXACT_SPACING) {
+            return;
+        }
+
+        L1SampleGrid grid = L1_SAMPLE_CACHE.get(key);
+        if (grid == null || !grid.hasAnyAppearance()) {
+            return;
+        }
+
+        GenerationJob job = new GenerationJob(
+                key,
+                wanted.ring(),
+                L1_EXACT_SPACING,
+                true,
+                grid,
+                false
+        );
+
+        detachedExactKey = key;
+        long taskEpoch = epoch;
+
+        CompletableFuture<Void> launcher = new CompletableFuture<>();
+        detachedExactFuture = launcher;
+
+        server.execute(() -> {
+            ServerLevel level = server.getLevel(dimension);
+            if (level == null
+                    || taskEpoch != epoch
+                    || !key.equals(detachedExactKey)) {
+                launcher.complete(null);
+                return;
+            }
+
+            try {
+                launchDetachedExactWorkers(
+                        level,
+                        job,
+                        taskEpoch,
+                        launcher
+                );
+            } catch (Throwable throwable) {
+                launcher.completeExceptionally(throwable);
+            }
+        });
+    }
+
+    private static void launchDetachedExactWorkers(
+            ServerLevel level,
+            GenerationJob job,
+            long taskEpoch,
+            CompletableFuture<Void> launcher
+    ) {
+        ServerChunkCache chunks = level.getChunkSource();
+        var generator = chunks.getGenerator();
+        var randomState = chunks.randomState();
+
+        List<Integer> missing = new ArrayList<>();
+        for (int sampleIndex = 0;
+                sampleIndex < job.totalSamples;
+                sampleIndex++) {
+            int gx = sampleIndex % job.samplesAcross;
+            int gz = sampleIndex / job.samplesAcross;
+            int fineIndex = job.fineGridIndex(gx, gz);
+
+            if (fineIndex >= 0
+                    && job.sampleGrid.heightSampled[fineIndex]) {
+                int y = job.sampleGrid.heights[fineIndex];
+                job.heights[sampleIndex] = y;
+                job.minY = Math.min(job.minY, y);
+                job.maxY = Math.max(job.maxY, y);
+                job.reusedSamples++;
+            } else {
+                missing.add(sampleIndex);
+            }
+        }
+
+        int[] missingIndices = missing.stream()
+                .mapToInt(Integer::intValue)
+                .toArray();
+        int split = (missingIndices.length + 1) / 2;
+        long started = System.nanoTime();
+
+        CompletableFuture<HeightPart> first =
+                CompletableFuture.supplyAsync(
+                        () -> computeHeightPart(
+                                level,
+                                generator,
+                                randomState,
+                                job,
+                                missingIndices,
+                                0,
+                                split
+                        ),
+                        EXACT_HEIGHT_EXECUTOR
+                );
+        CompletableFuture<HeightPart> second =
+                CompletableFuture.supplyAsync(
+                        () -> computeHeightPart(
+                                level,
+                                generator,
+                                randomState,
+                                job,
+                                missingIndices,
+                                split,
+                                missingIndices.length
+                        ),
+                        EXACT_HEIGHT_EXECUTOR
+                );
+
+        first.thenCombine(second, HeightBatchResult::combine)
+                .thenAcceptAsync(
+                        result -> finishDetachedExact(
+                                level,
+                                job,
+                                taskEpoch,
+                                started,
+                                missingIndices.length,
+                                result
+                        ),
+                        EXACT_HEIGHT_EXECUTOR
+                )
+                .whenComplete((ignored, throwable) -> {
+                    if (throwable != null) {
+                        launcher.completeExceptionally(throwable);
+                    } else {
+                        launcher.complete(null);
+                    }
+                });
+    }
+
+    private static void finishDetachedExact(
+            ServerLevel level,
+            GenerationJob job,
+            long taskEpoch,
+            long started,
+            int expectedMissing,
+            HeightBatchResult result
+    ) {
+        if (taskEpoch != epoch
+                || !job.key.equals(detachedExactKey)
+                || result.sampleIndices().length != expectedMissing) {
+            return;
+        }
+
+        for (int i = 0; i < result.sampleIndices().length; i++) {
+            int sampleIndex = result.sampleIndices()[i];
+            int y = result.heights()[i];
+            int gx = sampleIndex % job.samplesAcross;
+            int gz = sampleIndex / job.samplesAcross;
+            int fineIndex = job.fineGridIndex(gx, gz);
+
+            job.heights[sampleIndex] = y;
+            if (fineIndex >= 0) {
+                job.sampleGrid.heights[fineIndex] = y;
+                job.sampleGrid.heightSampled[fineIndex] = true;
+            }
+            job.minY = Math.min(job.minY, y);
+            job.maxY = Math.max(job.maxY, y);
+            job.generatedSamples++;
+        }
+
+        for (int sampleIndex = 0;
+                sampleIndex < job.totalSamples;
+                sampleIndex++) {
+            int gx = sampleIndex % job.samplesAcross;
+            int gz = sampleIndex / job.samplesAcross;
+            int fineIndex = job.fineGridIndex(gx, gz);
+
+            if (fineIndex >= 0
+                    && job.sampleGrid.appearanceSampled[fineIndex]) {
+                job.sampleColors[sampleIndex] =
+                        job.sampleGrid.colors[fineIndex];
+                job.sampleMaterials[sampleIndex] =
+                        job.sampleGrid.materials[fineIndex];
+                continue;
+            }
+
+            int borrowed =
+                    job.sampleGrid.nearestAppearanceIndex(gx, gz);
+            if (borrowed < 0) {
+                throw new IllegalStateException(
+                        "Exact L1 tile has no bootstrap appearance anchor"
+                );
+            }
+
+            job.sampleColors[sampleIndex] =
+                    job.sampleGrid.colors[borrowed];
+            job.sampleMaterials[sampleIndex] =
+                    job.sampleGrid.materials[borrowed];
+            job.provisionalAppearanceSamples++;
+        }
+
+        job.sampleGrid.requiresAppearanceRefinement =
+                job.provisionalAppearanceSamples > 0;
+        job.nextSample = job.totalSamples;
+
+        MeshData mesh = buildMesh(job, level.getSeaLevel());
+        job.accumulatedNanos = System.nanoTime() - started;
+
+        WorldgenSurfaceTile tile = new WorldgenSurfaceTile(
+                job.ring.lodLevel(),
+                job.key.tileX(),
+                job.key.tileZ(),
+                job.ring.tileSize(),
+                job.sampleSpacing,
+                job.sampleGrid.requiresAppearanceRefinement
+                        ? WorldgenTileStage.EXACT_GEOMETRY
+                        : WorldgenTileStage.EXACT_APPEARANCE,
+                mesh.vertices(),
+                mesh.colors(),
+                mesh.materials(),
+                mesh.quadCount(),
+                job.minY,
+                job.maxY,
+                level.getSeaLevel(),
+                job.accumulatedNanos
+        );
+
+        COMPLETED.add(new CompletedTile(
+                taskEpoch,
+                job.key,
+                tile,
+                job.reusedSamples,
+                job.generatedSamples,
+                0,
+                job.provisionalAppearanceSamples
+        ));
     }
 
     private static void scheduleSlice(
@@ -3123,6 +3431,10 @@ public final class WorldgenSurfaceSampler {
             if (currentJob != null && currentJob.key.equals(entry.getKey())) {
                 continue;
             }
+            if (detachedExactKey != null
+                    && detachedExactKey.equals(entry.getKey())) {
+                continue;
+            }
             if (containsWantedKey(entry.getKey())) {
                 continue;
             }
@@ -3179,7 +3491,10 @@ public final class WorldgenSurfaceSampler {
                 wantedTiles.size(),
                 CACHE.size(),
                 true,
-                currentJob != null || activeSliceId != 0L,
+                currentJob != null
+                        || activeSliceId != 0L
+                        || (detachedExactFuture != null
+                                && !detachedExactFuture.isDone()),
                 lastGenerationMs,
                 generatedTileCount,
                 adaptiveSliceBudgetNanos / 1_000_000.0,

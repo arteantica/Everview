@@ -164,3 +164,10 @@
 - [ ] in-game M4 stress validation: stationary / normal flight / x7 FlySpeed / reload
 
 - [x] automatic server-thread fallback if async exact-height sampling is rejected
+
+
+## M4.1 dual-lane streaming
+- [x] detach exact L1 height refinement from the outward coverage job
+- [x] keep server coverage streaming while two exact-height workers refine nearest L1
+- [x] cap detached provisional geometry and force appearance catch-up at the backlog limit
+- [x] keep detached exact tiles out of duplicate refinement selection
