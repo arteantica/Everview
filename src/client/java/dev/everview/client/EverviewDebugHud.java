@@ -37,9 +37,9 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.5.3 | ROAMING PREFETCH");
+        lines.add("Everview M3.5.4 | COARSE UNDERLAY");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Stream: visible holes first | L1 +64b guard | L2 +128b guard | L1 2b");
+        lines.add("Stream: L2 underlay first | L2 spans handoff->1024 | L1 overlays at 2b");
         lines.add("Handoff: " + WorldgenSurfaceSampler.HANDOFF_OVERLAP_BLOCKS + "-block vanilla overlap");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",

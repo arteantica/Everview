@@ -27,10 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.5.3 adds roaming prefetch on top of near-first progressive streaming.
- * L1/L2 keep a small generated guard band just inside/outside their current
- * annuli so a 32-block camera-anchor shift does not immediately expose empty
- * terrain. Newly visible holes always outrank refinement work.
+ * M3.5.4 adds a persistent coarse underlay beneath the entire L1 band.
+ * L2 now begins at the vanilla handoff radius instead of only after L1 ends,
+ * so moving the camera can reveal coarse terrain immediately while 2-block L1
+ * catches up. Missing visible L2 fallback tiles outrank all other generation.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -359,15 +359,16 @@ public final class WorldgenSurfaceSampler {
                 2
         ));
 
-        if (ultraNearOuter < 1_024) {
-            rings.add(new WorldgenLodRing(
-                    2,
-                    ultraNearOuter,
-                    1_024,
-                    128,
-                    8
-            ));
-        }
+        // M3.5.4: L2 deliberately overlaps the entire L1 annulus. It acts as
+        // a persistent 8-block fallback surface underneath 2-block L1 so
+        // roaming never depends on L1 finishing before terrain can be shown.
+        rings.add(new WorldgenLodRing(
+                2,
+                innerRadius,
+                1_024,
+                128,
+                8
+        ));
 
         rings.add(new WorldgenLodRing(3, 1_024, 2_048, 256, 32));
         rings.add(new WorldgenLodRing(4, 2_048, 4_096, 512, 64));
@@ -593,6 +594,15 @@ public final class WorldgenSurfaceSampler {
 
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
+
+        // M3.5.4 priority zero: establish the L2 fallback underlay first.
+        // If L1 is absent after camera motion, this coarse surface is what
+        // prevents sky/white holes from becoming visible.
+        WantedTile fallback = firstMissingFallbackCoverage(pending);
+        if (fallback != null) {
+            return fallback;
+        }
+
         WantedTile coverage = firstMissingCoverage(pending);
 
         if (coverage == null) {
@@ -628,6 +638,22 @@ public final class WorldgenSurfaceSampler {
         }
 
         return coverage;
+    }
+
+    private static WantedTile firstMissingFallbackCoverage(LodTileKey pending) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || wanted.ring().lodLevel() != 2
+                    || wanted.prefetch()) {
+                continue;
+            }
+
+            if (!CACHE.containsKey(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
     }
 
     private static WantedTile firstMissingCoverage(LodTileKey pending) {
