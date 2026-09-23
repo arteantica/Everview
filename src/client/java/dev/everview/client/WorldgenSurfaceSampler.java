@@ -592,7 +592,9 @@ public final class WorldgenSurfaceSampler {
             return;
         }
 
-        List<WorldgenSurfaceTile> tiles = List.copyOf(CACHE.values());
+        List<WorldgenSurfaceTile> tiles = CACHE.values().stream()
+                .filter(tile -> tile.stage().diskSafe())
+                .toList();
         Path path = diskCachePath;
         long seed = diskCacheSeed;
         String dimension = diskCacheDimension;
@@ -609,7 +611,9 @@ public final class WorldgenSurfaceSampler {
             return;
         }
 
-        List<WorldgenSurfaceTile> tiles = List.copyOf(CACHE.values());
+        List<WorldgenSurfaceTile> tiles = CACHE.values().stream()
+                .filter(tile -> tile.stage().diskSafe())
+                .toList();
         Path path = diskCachePath;
         long seed = diskCacheSeed;
         String dimension = diskCacheDimension;
@@ -1783,12 +1787,22 @@ public final class WorldgenSurfaceSampler {
             job.accumulatedNanos += meshElapsed;
             sliceElapsed += meshElapsed;
 
+            WorldgenTileStage tileStage = WorldgenTileStage.COVERAGE;
+            if (job.ring.lodLevel() == 1
+                    && job.sampleSpacing == L1_EXACT_SPACING) {
+                tileStage = job.sampleGrid != null
+                        && job.sampleGrid.requiresAppearanceRefinement
+                        ? WorldgenTileStage.EXACT_GEOMETRY
+                        : WorldgenTileStage.EXACT_APPEARANCE;
+            }
+
             WorldgenSurfaceTile tile = new WorldgenSurfaceTile(
                     job.ring.lodLevel(),
                     job.key.tileX(),
                     job.key.tileZ(),
                     job.ring.tileSize(),
                     job.sampleSpacing,
+                    tileStage,
                     mesh.vertices(),
                     mesh.colors(),
                     mesh.materials(),

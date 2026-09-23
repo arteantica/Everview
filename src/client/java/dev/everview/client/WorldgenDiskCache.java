@@ -28,7 +28,7 @@ import java.util.zip.GZIPOutputStream;
  */
 public final class WorldgenDiskCache {
     private static final int MAGIC = 0x45564C31; // EVL1
-    private static final int VERSION = 19;
+    private static final int VERSION = 20;
     private static final int MAX_TILES = 100_000;
     private static final int MAX_VERTEX_INTS = 1_000_000;
 
@@ -43,7 +43,7 @@ public final class WorldgenDiskCache {
 
         return server.getWorldPath(LevelResource.ROOT)
                 .resolve("everview")
-                .resolve("lod-cache-v19")
+                .resolve("lod-cache-v20")
                 .resolve(dimensionId + ".evc.gz");
     }
 
@@ -93,6 +93,7 @@ public final class WorldgenDiskCache {
                 int tileZ = input.readInt();
                 int tileSize = input.readInt();
                 int sampleSpacing = input.readInt();
+                int stageOrdinal = input.readInt();
                 int cellCount = input.readInt();
                 int minY = input.readInt();
                 int maxY = input.readInt();
@@ -102,6 +103,8 @@ public final class WorldgenDiskCache {
                 if (lodLevel < 1
                         || tileSize <= 0
                         || sampleSpacing <= 0
+                        || stageOrdinal < 0
+                        || stageOrdinal >= WorldgenTileStage.values().length
                         || cellCount < 0
                         || vertexLength < 0
                         || vertexLength > MAX_VERTEX_INTS
@@ -138,6 +141,7 @@ public final class WorldgenDiskCache {
                         tileZ,
                         tileSize,
                         sampleSpacing,
+                        WorldgenTileStage.values()[stageOrdinal],
                         vertices,
                         colors,
                         materials,
@@ -191,6 +195,7 @@ public final class WorldgenDiskCache {
                     output.writeInt(tile.tileZ());
                     output.writeInt(tile.tileSize());
                     output.writeInt(tile.sampleSpacing());
+                    output.writeInt(tile.stage().ordinal());
                     output.writeInt(tile.cellCount());
                     output.writeInt(tile.minY());
                     output.writeInt(tile.maxY());

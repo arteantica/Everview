@@ -10,6 +10,7 @@ public record WorldgenSurfaceTile(
         int tileZ,
         int tileSize,
         int sampleSpacing,
+        WorldgenTileStage stage,
         int[] vertices,
         int[] colors,
         byte[] materials,
@@ -20,6 +21,10 @@ public record WorldgenSurfaceTile(
         long generationNanos
 ) {
     public WorldgenSurfaceTile {
+        if (stage == null) {
+            throw new IllegalArgumentException("stage must not be null");
+        }
+
         int vertexCount = vertices.length / 3;
 
         if (colors.length != vertexCount) {

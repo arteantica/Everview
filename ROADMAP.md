@@ -150,3 +150,13 @@
 - [ ] world-scale horizon mode
 - [ ] fixed RAM/VRAM budgets
 - [ ] standardized comparison scenes and frame-time captures
+
+
+## M4 unified LOD engine
+- [x] explicit tile lifecycle: coverage / exact geometry / exact appearance
+- [x] invalidate M3 cache format and persist only disk-safe tile states
+- [ ] unified hierarchical ownership: vanilla > L1 > L2 > L3
+- [ ] stage-priority scheduler: coverage > exact geometry > exact appearance
+- [ ] high-throughput exact L1 generation
+- [ ] remove coarse/green fallback slabs during finer ownership
+- [ ] integrated stress pass before first M4 test jar

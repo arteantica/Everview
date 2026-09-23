@@ -37,7 +37,7 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M3.11 | GEOMETRY-FIRST EXACT L1");
+        lines.add("Everview M4 DEV | EXPLICIT TILE STAGES");
         lines.add("26.3 Fabric | Sodium " + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Render: merged handoff ranges | uploads yield only after same-column vanilla is visible");
         lines.add("Refine: exact 1b heights first -> full biome/material appearance second");
@@ -76,7 +76,8 @@ public final class EverviewDebugHud {
             int l1Desired = 0;
             int l1Covered = 0;
             int l1Intermediate = 0;
-            int l1Exact = 0;
+            int l1ExactGeometry = 0;
+            int l1ExactAppearance = 0;
 
             for (WorldgenRingStatus status : far.rings()) {
                 if (status.ring().lodLevel() <= 2) {
@@ -103,8 +104,11 @@ public final class EverviewDebugHud {
                     if (tile.sampleSpacing() <= 2) {
                         l1Intermediate++;
                     }
-                    if (tile.sampleSpacing() <= 1) {
-                        l1Exact++;
+                    if (tile.stage().exactGeometry()) {
+                        l1ExactGeometry++;
+                    }
+                    if (tile.stage().exactAppearance()) {
+                        l1ExactAppearance++;
                     }
                 }
             }
@@ -141,12 +145,14 @@ public final class EverviewDebugHud {
             ));
 
             lines.add(String.format(
-                    "L1 actual: cover %d/%d | <=2b %d/%d | 1b %d/%d",
+                    "L1 actual: cover %d/%d | <=2b %d/%d | geom %d/%d | final %d/%d",
                     l1Covered,
                     l1Desired,
                     l1Intermediate,
                     l1Desired,
-                    l1Exact,
+                    l1ExactGeometry,
+                    l1Desired,
+                    l1ExactAppearance,
                     l1Desired
             ));
 
