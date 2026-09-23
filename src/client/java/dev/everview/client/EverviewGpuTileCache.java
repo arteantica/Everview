@@ -21,9 +21,10 @@ import java.util.Map;
  * Render-thread-owned persistent GPU storage for generated LOD tiles.
  *
  * Tile geometry is uploaded once as POSITION_COLOR data in tile-local X/Z.
- * M3.7.4.3 groups L1/L2 quads into chunk/section-sized draw batches at upload
- * time. Vanilla ownership is decided live at draw time, so camera motion or
- * vanilla chunk streaming never destructively edits/rebuilds an LOD buffer.
+ * M3.7.4.4 splits tall L1/L2 vertical faces at 16-block section boundaries,
+ * then groups the resulting pieces into chunk/section-sized draw batches.
+ * Vanilla ownership stays live at draw time, so no visibility change ever
+ * destructively edits or rebuilds an LOD tile.
  */
 public final class EverviewGpuTileCache {
     private static final int MAX_GPU_TILES = 3_072;
@@ -142,26 +143,35 @@ public final class EverviewGpuTileCache {
 
     private static GpuTile upload(WorldgenSurfaceTile tile) {
         VertexFormat format = DefaultVertexFormat.POSITION_COLOR;
-        int vertexCount = tile.vertexCount();
-        int bytes = Math.multiplyExact(format.getVertexSize(), vertexCount);
-
         int[] vertices = tile.vertices();
         int[] colors = tile.colors();
         int originX = tile.minX();
         int originZ = tile.minZ();
 
-        Map<BatchKey, List<Integer>> groupedQuads = new LinkedHashMap<>();
+        Map<BatchKey, List<QuadPiece>> groupedQuads = new LinkedHashMap<>();
+        int emittedQuadCount = 0;
 
         for (int quadOffset = 0; quadOffset < vertices.length; quadOffset += 12) {
-            BatchKey key = tile.lodLevel() <= 2
-                    ? classifyBatch(vertices, quadOffset)
-                    : BatchKey.ALWAYS;
-            groupedQuads.computeIfAbsent(
-                    key,
-                    ignored -> new ArrayList<>()
-            ).add(quadOffset);
+            List<QuadPiece> pieces = tile.lodLevel() <= 2
+                    ? splitNearQuadBySection(vertices, colors, quadOffset)
+                    : List.of(copyQuad(vertices, colors, quadOffset));
+
+            emittedQuadCount += pieces.size();
+
+            for (QuadPiece piece : pieces) {
+                BatchKey key = tile.lodLevel() <= 2
+                        ? classifyBatch(piece.vertices(), 0)
+                        : BatchKey.ALWAYS;
+
+                groupedQuads.computeIfAbsent(
+                        key,
+                        ignored -> new ArrayList<>()
+                ).add(piece);
+            }
         }
 
+        int vertexCount = emittedQuadCount * 4;
+        int bytes = Math.multiplyExact(format.getVertexSize(), vertexCount);
         List<DrawBatch> drawBatches = new ArrayList<>(groupedQuads.size());
 
         try (ByteBufferBuilder byteBuffer = ByteBufferBuilder.exactlySized(bytes)) {
@@ -173,21 +183,22 @@ public final class EverviewGpuTileCache {
 
             int firstIndex = 0;
 
-            for (Map.Entry<BatchKey, List<Integer>> entry : groupedQuads.entrySet()) {
+            for (Map.Entry<BatchKey, List<QuadPiece>> entry : groupedQuads.entrySet()) {
                 BatchKey key = entry.getKey();
-                List<Integer> quadOffsets = entry.getValue();
+                List<QuadPiece> pieces = entry.getValue();
 
-                for (int quadOffset : quadOffsets) {
-                    int firstVertex = quadOffset / 3;
+                for (QuadPiece piece : pieces) {
+                    int[] quadVertices = piece.vertices();
+                    int[] quadColors = piece.colors();
 
                     for (int v = 0; v < 4; v++) {
-                        int i = quadOffset + v * 3;
-                        int rgb = colors[firstVertex + v];
+                        int i = v * 3;
+                        int rgb = quadColors[v];
 
                         builder.addVertex(
-                                        vertices[i] - originX,
-                                        vertices[i + 1],
-                                        vertices[i + 2] - originZ
+                                        quadVertices[i] - originX,
+                                        quadVertices[i + 1],
+                                        quadVertices[i + 2] - originZ
                                 )
                                 .setColor(
                                         (rgb >> 16) & 0xFF,
@@ -198,7 +209,7 @@ public final class EverviewGpuTileCache {
                     }
                 }
 
-                int indexCount = quadOffsets.size() * 6;
+                int indexCount = pieces.size() * 6;
                 drawBatches.add(new DrawBatch(
                         firstIndex,
                         indexCount,
@@ -230,6 +241,93 @@ public final class EverviewGpuTileCache {
                 );
             }
         }
+    }
+
+    private static List<QuadPiece> splitNearQuadBySection(
+            int[] vertices,
+            int[] colors,
+            int quadOffset
+    ) {
+        int minY = Integer.MAX_VALUE;
+        int maxY = Integer.MIN_VALUE;
+
+        for (int v = 0; v < 4; v++) {
+            int y = vertices[quadOffset + v * 3 + 1];
+            minY = Math.min(minY, y);
+            maxY = Math.max(maxY, y);
+        }
+
+        // Horizontal faces already belong to one vertical section.
+        if (minY == maxY) {
+            return List.of(copyQuad(vertices, colors, quadOffset));
+        }
+
+        // Only axis-aligned vertical faces need splitting. Defensive fallback
+        // keeps any unexpected quad intact instead of changing its geometry.
+        int minX = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE;
+        int maxZ = Integer.MIN_VALUE;
+
+        for (int v = 0; v < 4; v++) {
+            int i = quadOffset + v * 3;
+            minX = Math.min(minX, vertices[i]);
+            maxX = Math.max(maxX, vertices[i]);
+            minZ = Math.min(minZ, vertices[i + 2]);
+            maxZ = Math.max(maxZ, vertices[i + 2]);
+        }
+
+        if (minX != maxX && minZ != maxZ) {
+            return List.of(copyQuad(vertices, colors, quadOffset));
+        }
+
+        List<QuadPiece> pieces = new ArrayList<>();
+        int sliceBottom = minY;
+
+        while (sliceBottom < maxY) {
+            int sectionTop = (Math.floorDiv(sliceBottom, 16) + 1) * 16;
+            int sliceTop = Math.min(maxY, sectionTop);
+
+            int[] pieceVertices = new int[12];
+            int[] pieceColors = new int[4];
+
+            for (int v = 0; v < 4; v++) {
+                int source = quadOffset + v * 3;
+                int target = v * 3;
+                int sourceY = vertices[source + 1];
+
+                pieceVertices[target] = vertices[source];
+                pieceVertices[target + 1] =
+                        sourceY == minY ? sliceBottom : sliceTop;
+                pieceVertices[target + 2] = vertices[source + 2];
+                pieceColors[v] = colors[quadOffset / 3 + v];
+            }
+
+            pieces.add(new QuadPiece(pieceVertices, pieceColors));
+            sliceBottom = sliceTop;
+        }
+
+        return pieces;
+    }
+
+    private static QuadPiece copyQuad(
+            int[] vertices,
+            int[] colors,
+            int quadOffset
+    ) {
+        int[] pieceVertices = new int[12];
+        int[] pieceColors = new int[4];
+
+        System.arraycopy(vertices, quadOffset, pieceVertices, 0, 12);
+        System.arraycopy(colors, quadOffset / 3, pieceColors, 0, 4);
+
+        return new QuadPiece(pieceVertices, pieceColors);
+    }
+
+    private record QuadPiece(
+            int[] vertices,
+            int[] colors
+    ) {
     }
 
     private static BatchKey classifyBatch(int[] vertices, int quadOffset) {

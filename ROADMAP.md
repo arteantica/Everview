@@ -94,6 +94,7 @@
 - [x] contiguous radial L1 ownership: tile intersection promotes the full inner belt to 1b
 - [x] live renderer-visible handoff batches: persistent L1/L2 geometry, no destructive clipping
 - [x] suppress handoff boundary walls when either adjacent vanilla section is renderer-visible
+- [x] split tall near-LOD vertical faces at vanilla 16-block section boundaries
 - [ ] block-faithful 2-block intermediate geometry
 - [ ] exact GPU-side ring clipping + final seam stitching / geomorphing
 - [ ] screen-space error driven detail selection
