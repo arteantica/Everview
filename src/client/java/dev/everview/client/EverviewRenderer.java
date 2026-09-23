@@ -8,16 +8,21 @@ import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
 import net.minecraft.world.phys.AABB;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
 
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
 /**
- * M3.3 persistent-GPU distant terrain renderer.
+ * M3.7.4.3 persistent-GPU distant terrain renderer. Near LOD geometry stays
+ * permanently resident; renderer-visible vanilla sections suppress small GPU
+ * draw batches live instead of triggering destructive tile re-uploads.
  *
  * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
  * Minecraft's opaque terrain RenderPass is still open. Everview therefore
@@ -86,6 +91,7 @@ public final class EverviewRenderer {
 
         WorldgenLodRing l1Ring = snapshot.ringForLevel(1);
         Set<Long> residentL1Tiles = new HashSet<>();
+        Map<SectionKey, Boolean> vanillaVisibility = new HashMap<>();
 
         if (l1Ring != null) {
             for (WorldgenSurfaceTile tile : snapshot.tiles()) {
@@ -138,7 +144,6 @@ public final class EverviewRenderer {
                 continue;
             }
 
-            EverviewMetrics.recordSubmission(tile.lodLevel());
             long started = System.nanoTime();
 
             GpuBuffer indexBuffer = quadIndices.getBuffer(gpuTile.indexCount());
@@ -163,7 +168,38 @@ public final class EverviewRenderer {
             renderPass.setVertexBuffer(0, gpuTile.vertexBuffer().slice());
             renderPass.setIndexBuffer(indexBuffer, quadIndices.type());
             renderPass.setUniform("DynamicTransforms", dynamicTransforms);
-            renderPass.drawIndexed(gpuTile.indexCount(), 1, 0, 0, 0);
+
+            boolean drewAny = false;
+            int drawnQuads = 0;
+
+            for (EverviewGpuTileCache.DrawBatch batch : gpuTile.drawBatches()) {
+                if (batch.vanillaSensitive()
+                        && vanillaOwnsBatch(
+                                client,
+                                batch,
+                                vanillaVisibility
+                        )) {
+                    continue;
+                }
+
+                if (!drewAny) {
+                    EverviewMetrics.recordSubmission(tile.lodLevel());
+                    drewAny = true;
+                }
+
+                renderPass.drawIndexed(
+                        batch.indexCount(),
+                        1,
+                        batch.firstIndex(),
+                        0,
+                        0
+                );
+                drawnQuads += batch.indexCount() / 6;
+            }
+
+            if (!drewAny) {
+                continue;
+            }
 
             double centerX = (tile.minX() + tile.maxX()) * 0.5;
             double centerZ = (tile.minZ() + tile.maxZ()) * 0.5;
@@ -172,10 +208,74 @@ public final class EverviewRenderer {
             EverviewMetrics.recordTileDraw(
                     tile.lodLevel(),
                     System.nanoTime() - started,
-                    tile.vertices().length / 12,
+                    drawnQuads,
                     distance
             );
         }
+    }
+
+    private static boolean vanillaOwnsBatch(
+            Minecraft client,
+            EverviewGpuTileCache.DrawBatch batch,
+            Map<SectionKey, Boolean> visibility
+    ) {
+        boolean aVisible = vanillaSectionVisible(
+                client,
+                batch.chunkAX(),
+                batch.sectionY(),
+                batch.chunkAZ(),
+                visibility
+        );
+
+        if (!batch.boundary()) {
+            return aVisible;
+        }
+
+        boolean bVisible = vanillaSectionVisible(
+                client,
+                batch.chunkBX(),
+                batch.sectionY(),
+                batch.chunkBZ(),
+                visibility
+        );
+
+        // Boundary walls are the artifact we saw in M3.7.4.2. Once either
+        // adjacent vanilla side is renderer-ready, the wall is no longer
+        // needed as a safety face and is suppressed.
+        return aVisible || bVisible;
+    }
+
+    private static boolean vanillaSectionVisible(
+            Minecraft client,
+            int chunkX,
+            int sectionY,
+            int chunkZ,
+            Map<SectionKey, Boolean> visibility
+    ) {
+        SectionKey key = new SectionKey(chunkX, sectionY, chunkZ);
+        Boolean cached = visibility.get(key);
+
+        if (cached != null) {
+            return cached;
+        }
+
+        boolean visible = client.levelRenderer.isSectionCompiledAndVisible(
+                new BlockPos(
+                        chunkX * 16 + 8,
+                        sectionY * 16 + 8,
+                        chunkZ * 16 + 8
+                ),
+                0L
+        );
+        visibility.put(key, visible);
+        return visible;
+    }
+
+    private record SectionKey(
+            int chunkX,
+            int sectionY,
+            int chunkZ
+    ) {
     }
 
     private static boolean fullyCoveredByResidentL1(
