@@ -113,6 +113,10 @@
 - [x] suppress emergency L3 tiles once the overlapping L2 region is fully resident
 - [x] split L3 GPU geometry into 128x128 L2 ownership regions
 - [x] retire each emergency underlay region independently as matching L2 becomes resident
+- [x] retain L1 worldgen samples on a persistent 1-block hierarchy across 4b/2b/1b passes
+- [x] preserve partial refinement samples when a moving player cancels a detail job
+- [x] allow exact-target L1 tiles to refine directly from 4b to 1b
+- [x] expose L1 sample-reuse telemetry in the debug HUD
 - [x] prioritize current/predictive emergency underlay before L2/L1 detail coverage
 - [ ] benchmark emergency-underlay continuity at x7 FlySpeed and normal elytra speeds
 - [ ] benchmark fallback-safe handoff CPU cost at full 1b residency

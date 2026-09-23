@@ -27,9 +27,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * Progressive distant-worldgen sampler.
  *
- * M3.9.1 adds a persistent emergency underlay beneath the near field. L3 now
- * overlaps L1/L2 and bootstraps at 64-block sampling, giving the outward
- * scheduler a very cheap safety floor before 16b/8b L2 and 4b/2b/1b L1 arrive.
+ * M3.10 adds a persistent fine-sample hierarchy for L1 refinement. Worldgen
+ * samples gathered by 4b/2b/1b passes are retained on a fixed 1-block grid and
+ * reused by later refinement (including cancelled jobs). Exact-target tiles
+ * may jump directly from 4b to 1b without an unnecessary intermediate mesh.
  */
 public final class WorldgenSurfaceSampler {
     public static final int MIN_INNER_RADIUS = 256;
@@ -57,6 +58,8 @@ public final class WorldgenSurfaceSampler {
     private static final int L1_BOOTSTRAP_SPACING = 4;
     private static final int L1_INTERMEDIATE_SPACING = 2;
     private static final int L1_EXACT_SPACING = 1;
+    private static final int L1_FINE_GRID_SAMPLES = 33;
+    private static final int L1_SAMPLE_CACHE_LIMIT = 2_048;
     private static final int L1_EXACT_BAND_BLOCKS = 64;
     private static final int L1_INTERMEDIATE_BAND_BLOCKS = 128;
     private static final int VIEW_SECTOR_COUNT = 16;
@@ -64,6 +67,8 @@ public final class WorldgenSurfaceSampler {
     private static final int COVERAGE_FRONTIER_BUCKET_BLOCKS = 64;
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
+            new LinkedHashMap<>(512, 0.75F, true);
+    private static final Map<LodTileKey, L1SampleGrid> L1_SAMPLE_CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
     private static final ConcurrentLinkedQueue<CompletedTile> COMPLETED =
             new ConcurrentLinkedQueue<>();
@@ -109,6 +114,10 @@ public final class WorldgenSurfaceSampler {
     private static int predictiveLeadBlocks;
     private static boolean highSpeedCoverageMode;
     private static int staleJobsCancelled;
+    private static int lastRefineReusedSamples;
+    private static int lastRefineGeneratedSamples;
+    private static long totalRefineReusedSamples;
+    private static long totalRefineGeneratedSamples;
 
     private static long epoch;
     private static long nextSliceId;
@@ -175,6 +184,16 @@ public final class WorldgenSurfaceSampler {
                 outwardFrontierBlocks,
                 nearCoverageComplete,
                 staleJobsCancelled
+        );
+    }
+
+    public static RefinementReuseStatus refinementReuseStatus() {
+        return new RefinementReuseStatus(
+                lastRefineReusedSamples,
+                lastRefineGeneratedSamples,
+                totalRefineReusedSamples,
+                totalRefineGeneratedSamples,
+                L1_SAMPLE_CACHE.size()
         );
     }
 
@@ -344,11 +363,21 @@ public final class WorldgenSurfaceSampler {
 
                 int sampleSpacing = nextGenerationSpacing(next, existing);
 
+                L1SampleGrid sampleGrid = null;
+                if (next.ring().lodLevel() == 1) {
+                    sampleGrid = L1_SAMPLE_CACHE.computeIfAbsent(
+                            next.key(),
+                            ignored -> new L1SampleGrid(next.ring().tileSize())
+                    );
+                    trimL1SampleCache();
+                }
+
                 currentJob = new GenerationJob(
                         next.key(),
                         next.ring(),
                         sampleSpacing,
-                        existing != null
+                        existing != null,
+                        sampleGrid
                 );
             }
         }
@@ -630,6 +659,7 @@ public final class WorldgenSurfaceSampler {
         scheduleDetachedSaveIfDirty();
         epoch++;
         CACHE.clear();
+        L1_SAMPLE_CACHE.clear();
         COMPLETED.clear();
         activeRings = List.of();
         wantedTiles = List.of();
@@ -650,6 +680,10 @@ public final class WorldgenSurfaceSampler {
         predictiveLeadBlocks = 0;
         highSpeedCoverageMode = false;
         staleJobsCancelled = 0;
+        lastRefineReusedSamples = 0;
+        lastRefineGeneratedSamples = 0;
+        totalRefineReusedSamples = 0L;
+        totalRefineGeneratedSamples = 0L;
         lastGenerationMs = 0.0;
         lastSliceMs = 0.0;
         lastSliceSamples = 0;
@@ -689,6 +723,13 @@ public final class WorldgenSurfaceSampler {
             lastGenerationMs = completed.tile().generationMs();
             generatedTileCount++;
             cacheDirty = true;
+
+            if (completed.tile().lodLevel() == 1) {
+                lastRefineReusedSamples = completed.reusedSamples();
+                lastRefineGeneratedSamples = completed.generatedSamples();
+                totalRefineReusedSamples += completed.reusedSamples();
+                totalRefineGeneratedSamples += completed.generatedSamples();
+            }
 
             if (currentJob != null && currentJob.key.equals(completed.key())) {
                 currentJob = null;
@@ -1052,6 +1093,14 @@ public final class WorldgenSurfaceSampler {
             if (existing.sampleSpacing() <= target) {
                 return existing.sampleSpacing();
             }
+
+            // Exact-target tiles no longer spend a whole pass producing an
+            // intermediate mesh that will immediately be replaced. The fixed
+            // fine-sample cache preserves any 4b/2b points already known.
+            if (target == L1_EXACT_SPACING) {
+                return L1_EXACT_SPACING;
+            }
+
             if (existing.sampleSpacing() > L1_INTERMEDIATE_SPACING
                     && target <= L1_INTERMEDIATE_SPACING) {
                 return L1_INTERMEDIATE_SPACING;
@@ -1534,6 +1583,25 @@ public final class WorldgenSurfaceSampler {
             int worldX = job.originX + gx * job.sampleSpacing;
             int worldZ = job.originZ + gz * job.sampleSpacing;
 
+            int fineIndex = job.fineGridIndex(gx, gz);
+            if (fineIndex >= 0 && job.sampleGrid.sampled[fineIndex]) {
+                int y = job.sampleGrid.heights[fineIndex];
+                job.heights[sampleIndex] = y;
+                job.sampleColors[sampleIndex] = job.sampleGrid.colors[fineIndex];
+                job.sampleMaterials[sampleIndex] = job.sampleGrid.materials[fineIndex];
+                job.minY = Math.min(job.minY, y);
+                job.maxY = Math.max(job.maxY, y);
+                job.nextSample = sampleIndex + 1;
+                job.reusedSamples++;
+
+                // Cached points should be nearly free, but still respect the
+                // slice clock if an entire job is already populated.
+                if (System.nanoTime() - sliceStart >= sliceBudgetNanos) {
+                    break;
+                }
+                continue;
+            }
+
             int y = generator.getBaseHeight(
                     worldX,
                     worldZ,
@@ -1556,9 +1624,17 @@ public final class WorldgenSurfaceSampler {
             job.sampleColors[sampleIndex] = appearance.rgb();
             job.sampleMaterials[sampleIndex] = appearance.material();
 
+            if (fineIndex >= 0) {
+                job.sampleGrid.heights[fineIndex] = y;
+                job.sampleGrid.colors[fineIndex] = appearance.rgb();
+                job.sampleGrid.materials[fineIndex] = appearance.material();
+                job.sampleGrid.sampled[fineIndex] = true;
+            }
+
             job.minY = Math.min(job.minY, y);
             job.maxY = Math.max(job.maxY, y);
             job.nextSample = sampleIndex + 1;
+            job.generatedSamples++;
             processed++;
 
             if (System.nanoTime() - sliceStart >= sliceBudgetNanos) {
@@ -1594,7 +1670,13 @@ public final class WorldgenSurfaceSampler {
                     job.accumulatedNanos
             );
 
-            COMPLETED.add(new CompletedTile(taskEpoch, job.key, tile));
+            COMPLETED.add(new CompletedTile(
+                    taskEpoch,
+                    job.key,
+                    tile,
+                    job.reusedSamples,
+                    job.generatedSamples
+            ));
         }
 
         lastSliceSamples = processed;
@@ -2505,6 +2587,29 @@ public final class WorldgenSurfaceSampler {
         }
     }
 
+    private static void trimL1SampleCache() {
+        if (L1_SAMPLE_CACHE.size() <= L1_SAMPLE_CACHE_LIMIT) {
+            return;
+        }
+
+        Iterator<Map.Entry<LodTileKey, L1SampleGrid>> iterator =
+                L1_SAMPLE_CACHE.entrySet().iterator();
+
+        while (L1_SAMPLE_CACHE.size() > L1_SAMPLE_CACHE_LIMIT
+                && iterator.hasNext()) {
+            Map.Entry<LodTileKey, L1SampleGrid> entry = iterator.next();
+
+            if (currentJob != null && currentJob.key.equals(entry.getKey())) {
+                continue;
+            }
+            if (containsWantedKey(entry.getKey())) {
+                continue;
+            }
+
+            iterator.remove();
+        }
+    }
+
     private static void rebuildSnapshot() {
         List<WorldgenSurfaceTile> active = new ArrayList<>();
         Map<Integer, Integer> desiredByLevel = new HashMap<>();
@@ -2589,8 +2694,11 @@ public final class WorldgenSurfaceSampler {
         private final int[] sampleColors;
         private final byte[] sampleMaterials;
         private final boolean refinement;
+        private final L1SampleGrid sampleGrid;
 
         private volatile int nextSample;
+        private int reusedSamples;
+        private int generatedSamples;
         private volatile boolean failed;
         private int minY = Integer.MAX_VALUE;
         private int maxY = Integer.MIN_VALUE;
@@ -2600,7 +2708,8 @@ public final class WorldgenSurfaceSampler {
                 LodTileKey key,
                 WorldgenLodRing ring,
                 int sampleSpacing,
-                boolean refinement
+                boolean refinement,
+                L1SampleGrid sampleGrid
         ) {
             if (sampleSpacing <= 0 || ring.tileSize() % sampleSpacing != 0) {
                 throw new IllegalArgumentException(
@@ -2614,6 +2723,7 @@ public final class WorldgenSurfaceSampler {
             this.originZ = key.tileZ() * ring.tileSize();
             this.sampleSpacing = sampleSpacing;
             this.refinement = refinement;
+            this.sampleGrid = sampleGrid;
             this.samplesAcross = ring.tileSize() / sampleSpacing + 1;
             this.cellsAcross = samplesAcross - 1;
             this.totalSamples = samplesAcross * samplesAcross;
@@ -2623,8 +2733,48 @@ public final class WorldgenSurfaceSampler {
             this.sampleMaterials = new byte[totalSamples];
         }
 
+        private int fineGridIndex(int gx, int gz) {
+            if (sampleGrid == null) {
+                return -1;
+            }
+
+            int fineX = gx * sampleSpacing;
+            int fineZ = gz * sampleSpacing;
+
+            if (fineX < 0 || fineZ < 0
+                    || fineX >= sampleGrid.samplesAcross
+                    || fineZ >= sampleGrid.samplesAcross) {
+                return -1;
+            }
+
+            return fineZ * sampleGrid.samplesAcross + fineX;
+        }
+
         private double progressPercent() {
             return nextSample * 100.0 / totalSamples;
+        }
+    }
+
+    private static final class L1SampleGrid {
+        private final int samplesAcross;
+        private final int[] heights;
+        private final int[] colors;
+        private final byte[] materials;
+        private final boolean[] sampled;
+
+        private L1SampleGrid(int tileSize) {
+            if (tileSize + 1 != L1_FINE_GRID_SAMPLES) {
+                throw new IllegalArgumentException(
+                        "L1 sample hierarchy expects 32-block tiles"
+                );
+            }
+
+            this.samplesAcross = tileSize + 1;
+            int total = samplesAcross * samplesAcross;
+            this.heights = new int[total];
+            this.colors = new int[total];
+            this.materials = new byte[total];
+            this.sampled = new boolean[total];
         }
     }
 
@@ -2720,6 +2870,15 @@ public final class WorldgenSurfaceSampler {
     ) {
     }
 
+    public record RefinementReuseStatus(
+            int lastReusedSamples,
+            int lastGeneratedSamples,
+            long totalReusedSamples,
+            long totalGeneratedSamples,
+            int cachedL1Grids
+    ) {
+    }
+
     public record StreamingStatus(
             double speedBlocksPerSecond,
             int predictiveLeadBlocks,
@@ -2754,7 +2913,9 @@ public final class WorldgenSurfaceSampler {
     private record CompletedTile(
             long epoch,
             LodTileKey key,
-            WorldgenSurfaceTile tile
+            WorldgenSurfaceTile tile,
+            int reusedSamples,
+            int generatedSamples
     ) {
     }
 }
