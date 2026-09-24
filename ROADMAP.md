@@ -389,3 +389,19 @@
 - [x] invalidate cache with v29 for cold-start comparison
 - [ ] validate exact workers remain fed while appearance jobs remain active
 - [ ] compare 45-60s far silhouette against M6.8 and watch server tick time during biome snapshots
+
+
+## M7.0 render stability
+- [x] remove GPU tiles that are no longer in the current wanted snapshot instead of waiting for LRU pressure
+- [x] hierarchically prune fully covered L2-L6 GPU buffers once stable finer residency owns their complete footprint
+- [x] keep a 128-block ring-boundary fallback belt so pruning cannot create motion holes
+- [x] stop blindly carrying coarse nested disks on the GPU after their finer replacement is resident
+- [x] add FULL/PARTIAL/NONE finer-coverage classification in the renderer
+- [x] skip fully covered coarse tiles before transform allocation, batch ownership checks and draw submission
+- [x] split L4-L6 geometry exactly on immediate-finer ownership-region boundaries
+- [x] increase inter-LOD depth separation from 0.75b to 1.25b as an additional anti-z-fighting guard
+- [x] expose stale removals, hierarchical prunes and forced LRU evictions in the debug HUD
+- [ ] verify settled 90-95% coverage no longer performs continuous GPU uploads/evictions
+- [ ] verify camera rotation no longer produces widespread ownership flashes
+- [ ] profile settled draw calls, GPU MiB and FPS before raising zoom-direction geometry fidelity
+- [ ] add screen-space / zoom-aware refinement so distant terrain sharpens when magnified without globally doubling L5/L6 density

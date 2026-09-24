@@ -51,7 +51,7 @@ public final class EverviewRenderer {
     // cracks and scattered square pixels seen in M5.5. Keep each coarser layer
     // meaningfully below the finer one instead.
     private static final double BASE_TERRAIN_BIAS = 0.35D;
-    private static final double RING_LAYER_BIAS = 0.75D;
+    private static final double RING_LAYER_BIAS = 1.25D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
     private static final long VANILLA_HANDOFF_GRACE_NANOS = 250_000_000L;
     private static final int VANILLA_EDGE_NEIGHBORHOOD_BLOCKS = 160;
@@ -91,7 +91,13 @@ public final class EverviewRenderer {
 
             WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
             if (!snapshot.tiles().isEmpty()) {
-                EverviewGpuTileCache.prepareFrame(client.level, snapshot);
+                var cameraPos = client.gameRenderer.mainCamera().position();
+                EverviewGpuTileCache.prepareFrame(
+                        client.level,
+                        snapshot,
+                        cameraPos.x(),
+                        cameraPos.z()
+                );
             }
         });
     }
@@ -244,67 +250,33 @@ public final class EverviewRenderer {
                             vanillaRadius
                     );
 
-            boolean finerLodMask = false;
-            if (tile.lodLevel() == 2 && l1Ring != null) {
-                finerLodMask = hasCoveredL2Batch(
-                        gpuTile,
-                        l1Ring,
-                        residentL1Tiles,
-                        cameraX,
-                        cameraZ
-                );
-            } else if (tile.lodLevel() == 3 && l2Ring != null) {
-                finerLodMask = hasCoveredUnderlayRegion(
-                        gpuTile,
-                        l2Ring,
-                        residentL2Tiles,
-                        cameraX,
-                        cameraZ
-                );
-            } else if (tile.lodLevel() >= 4) {
-                // M6.3: once L3 owns a coarse world region, every lower-quality
-                // fallback beneath it retires immediately. M5/M6.2 only checked
-                // the immediate finer level, so L6 could remain visible through
-                // caves, rivers and vegetation until L4/L5 happened to exist.
-                finerLodMask = l3Ring != null
-                        && hasCoveredByL3Region(
-                                gpuTile,
-                                tile.lodLevel(),
-                                l3Ring,
-                                residentL3Tiles,
-                                cameraX,
-                                cameraZ
-                        );
+            FinerCoverage finerCoverage = classifyFinerCoverage(
+                    gpuTile,
+                    tile.lodLevel(),
+                    l1Ring,
+                    l2Ring,
+                    l3Ring,
+                    l4Ring,
+                    l5Ring,
+                    residentL1Tiles,
+                    residentL2Tiles,
+                    residentL3Tiles,
+                    residentL4Tiles,
+                    residentL5Tiles,
+                    cameraX,
+                    cameraZ
+            );
 
-                if (!finerLodMask) {
-                    WorldgenLodRing immediateRing = switch (tile.lodLevel()) {
-                        case 4 -> l3Ring;
-                        case 5 -> l4Ring;
-                        case 6 -> l5Ring;
-                        default -> null;
-                    };
-                    Set<Long> immediateTiles = switch (tile.lodLevel()) {
-                        case 4 -> residentL3Tiles;
-                        case 5 -> residentL4Tiles;
-                        case 6 -> residentL5Tiles;
-                        default -> Set.of();
-                    };
-
-                    finerLodMask = immediateRing != null
-                            && hasCoveredUnderlayRegion(
-                                    gpuTile,
-                                    immediateRing,
-                                    immediateTiles,
-                                    cameraX,
-                                    cameraZ
-                            );
-                }
+            if (finerCoverage == FinerCoverage.FULL) {
+                finerOwnedBatches += gpuTile.drawBatches().size();
+                continue;
             }
 
             boolean drewAny = false;
             int drawnQuads = 0;
 
-            if (!vanillaOwnership && !finerLodMask) {
+            if (!vanillaOwnership
+                    && finerCoverage == FinerCoverage.NONE) {
                 EverviewMetrics.recordSubmission(tile.lodLevel());
                 renderPass.drawIndexed(
                         gpuTile.indexCount(),
@@ -323,56 +295,22 @@ public final class EverviewRenderer {
 
                 for (EverviewGpuTileCache.DrawBatch batch
                         : gpuTile.drawBatches()) {
-                    boolean ownedByFinerLod = false;
-
-                    if (tile.lodLevel() == 2 && l1Ring != null) {
-                        ownedByFinerLod = l1OwnsL2Batch(
-                                batch,
-                                l1Ring,
-                                residentL1Tiles,
-                                cameraX,
-                                cameraZ
-                        );
-                    } else if (tile.lodLevel() >= 3
-                            && batch.underlayRegion()) {
-                        if (tile.lodLevel() >= 4 && l3Ring != null) {
-                            ownedByFinerLod = l3OwnsCoarseRegion(
-                                    batch,
-                                    tile.lodLevel(),
-                                    l3Ring,
-                                    residentL3Tiles,
-                                    cameraX,
-                                    cameraZ
-                            );
-                        }
-
-                        if (!ownedByFinerLod) {
-                            WorldgenLodRing finerRing = switch (tile.lodLevel()) {
-                                case 3 -> l2Ring;
-                                case 4 -> l3Ring;
-                                case 5 -> l4Ring;
-                                case 6 -> l5Ring;
-                                default -> null;
-                            };
-                            Set<Long> finerTiles = switch (tile.lodLevel()) {
-                                case 3 -> residentL2Tiles;
-                                case 4 -> residentL3Tiles;
-                                case 5 -> residentL4Tiles;
-                                case 6 -> residentL5Tiles;
-                                default -> Set.of();
-                            };
-
-                            ownedByFinerLod = finerRing != null
-                                    && finerRingOwnsRegion(
-                                            batch.regionTileX(),
-                                            batch.regionTileZ(),
-                                            finerRing,
-                                            finerTiles,
-                                            cameraX,
-                                            cameraZ
-                                    );
-                        }
-                    }
+                    boolean ownedByFinerLod = finerOwnsBatch(
+                            batch,
+                            tile.lodLevel(),
+                            l1Ring,
+                            l2Ring,
+                            l3Ring,
+                            l4Ring,
+                            l5Ring,
+                            residentL1Tiles,
+                            residentL2Tiles,
+                            residentL3Tiles,
+                            residentL4Tiles,
+                            residentL5Tiles,
+                            cameraX,
+                            cameraZ
+                    );
 
                     ColumnOwnershipResult vanillaResult =
                             vanillaOwnership && batch.vanillaSensitive()
@@ -956,6 +894,133 @@ public final class EverviewRenderer {
             int sectionY,
             int chunkZ
     ) {
+    }
+
+    private static FinerCoverage classifyFinerCoverage(
+            EverviewGpuTileCache.GpuTile gpuTile,
+            int lodLevel,
+            WorldgenLodRing l1Ring,
+            WorldgenLodRing l2Ring,
+            WorldgenLodRing l3Ring,
+            WorldgenLodRing l4Ring,
+            WorldgenLodRing l5Ring,
+            Set<Long> residentL1Tiles,
+            Set<Long> residentL2Tiles,
+            Set<Long> residentL3Tiles,
+            Set<Long> residentL4Tiles,
+            Set<Long> residentL5Tiles,
+            double cameraX,
+            double cameraZ
+    ) {
+        boolean anyOwned = false;
+        boolean anyVisible = false;
+
+        for (EverviewGpuTileCache.DrawBatch batch
+                : gpuTile.drawBatches()) {
+            boolean owned = finerOwnsBatch(
+                    batch,
+                    lodLevel,
+                    l1Ring,
+                    l2Ring,
+                    l3Ring,
+                    l4Ring,
+                    l5Ring,
+                    residentL1Tiles,
+                    residentL2Tiles,
+                    residentL3Tiles,
+                    residentL4Tiles,
+                    residentL5Tiles,
+                    cameraX,
+                    cameraZ
+            );
+
+            anyOwned |= owned;
+            anyVisible |= !owned;
+
+            if (anyOwned && anyVisible) {
+                return FinerCoverage.PARTIAL;
+            }
+        }
+
+        if (anyOwned && !anyVisible) {
+            return FinerCoverage.FULL;
+        }
+
+        return FinerCoverage.NONE;
+    }
+
+    private static boolean finerOwnsBatch(
+            EverviewGpuTileCache.DrawBatch batch,
+            int lodLevel,
+            WorldgenLodRing l1Ring,
+            WorldgenLodRing l2Ring,
+            WorldgenLodRing l3Ring,
+            WorldgenLodRing l4Ring,
+            WorldgenLodRing l5Ring,
+            Set<Long> residentL1Tiles,
+            Set<Long> residentL2Tiles,
+            Set<Long> residentL3Tiles,
+            Set<Long> residentL4Tiles,
+            Set<Long> residentL5Tiles,
+            double cameraX,
+            double cameraZ
+    ) {
+        if (lodLevel == 2 && l1Ring != null) {
+            return l1OwnsL2Batch(
+                    batch,
+                    l1Ring,
+                    residentL1Tiles,
+                    cameraX,
+                    cameraZ
+            );
+        }
+
+        if (lodLevel < 3 || !batch.underlayRegion()) {
+            return false;
+        }
+
+        if (lodLevel >= 4 && l3Ring != null
+                && l3OwnsCoarseRegion(
+                        batch,
+                        lodLevel,
+                        l3Ring,
+                        residentL3Tiles,
+                        cameraX,
+                        cameraZ
+                )) {
+            return true;
+        }
+
+        WorldgenLodRing finerRing = switch (lodLevel) {
+            case 3 -> l2Ring;
+            case 4 -> l3Ring;
+            case 5 -> l4Ring;
+            case 6 -> l5Ring;
+            default -> null;
+        };
+        Set<Long> finerTiles = switch (lodLevel) {
+            case 3 -> residentL2Tiles;
+            case 4 -> residentL3Tiles;
+            case 5 -> residentL4Tiles;
+            case 6 -> residentL5Tiles;
+            default -> Set.of();
+        };
+
+        return finerRing != null
+                && finerRingOwnsRegion(
+                        batch.regionTileX(),
+                        batch.regionTileZ(),
+                        finerRing,
+                        finerTiles,
+                        cameraX,
+                        cameraZ
+                );
+    }
+
+    private enum FinerCoverage {
+        NONE,
+        PARTIAL,
+        FULL
     }
 
     private static boolean hasCoveredL2Batch(

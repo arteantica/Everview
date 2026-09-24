@@ -12,10 +12,13 @@ import dev.everview.core.LodTileKey;
 import net.minecraft.client.multiplayer.ClientLevel;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Render-thread-owned persistent GPU storage for generated LOD tiles.
@@ -28,6 +31,7 @@ import java.util.Map;
 public final class EverviewGpuTileCache {
     private static final int MAX_GPU_TILES = 3_072;
     private static final int MAX_UPLOADS_PER_FRAME = 8;
+    private static final int PRUNE_RING_MARGIN_BLOCKS = 128;
     private static final int L3_UNDERLAY_REGION_SIZE = 128;
     private static final int L4_UNDERLAY_REGION_SIZE = 256;
     private static final int L5_UNDERLAY_REGION_SIZE = 512;
@@ -40,6 +44,9 @@ public final class EverviewGpuTileCache {
     private static int uploadsRemaining;
     private static int uploadsThisFrame;
     private static long uploadNanosThisFrame;
+    private static int staleRemovedThisFrame;
+    private static int coveredPrunedThisFrame;
+    private static int forcedEvictionsThisFrame;
     private static long residentBytes;
 
     private EverviewGpuTileCache() {
@@ -52,7 +59,9 @@ public final class EverviewGpuTileCache {
      */
     public static void prepareFrame(
             ClientLevel level,
-            WorldgenSurfaceSnapshot snapshot
+            WorldgenSurfaceSnapshot snapshot,
+            double cameraX,
+            double cameraZ
     ) {
         if (level != lastLevel) {
             clear();
@@ -62,6 +71,52 @@ public final class EverviewGpuTileCache {
         uploadsRemaining = MAX_UPLOADS_PER_FRAME;
         uploadsThisFrame = 0;
         uploadNanosThisFrame = 0L;
+        staleRemovedThisFrame = 0;
+        coveredPrunedThisFrame = 0;
+        forcedEvictionsThisFrame = 0;
+        staleRemovedThisFrame = 0;
+        coveredPrunedThisFrame = 0;
+        forcedEvictionsThisFrame = 0;
+
+        Map<LodTileKey, WorldgenSurfaceTile> active = new HashMap<>(
+                Math.max(16, snapshot.tiles().size() * 2)
+        );
+        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+            active.put(
+                    new LodTileKey(
+                            tile.lodLevel(),
+                            tile.tileX(),
+                            tile.tileZ()
+                    ),
+                    tile
+            );
+        }
+
+        // Old camera-area tiles used to sit in the access-order cache until the
+        // 3072-tile cap happened to evict them. At high coverage that meant the
+        // cache permanently uploaded eight tiles, evicted eight tiles, then did
+        // the same work again next frame. Remove tiles that are no longer part
+        // of the current wanted snapshot immediately.
+        Iterator<Map.Entry<LodTileKey, GpuTile>> staleIterator =
+                TILES.entrySet().iterator();
+        while (staleIterator.hasNext()) {
+            Map.Entry<LodTileKey, GpuTile> entry = staleIterator.next();
+            if (active.containsKey(entry.getKey())) {
+                continue;
+            }
+
+            removeResident(entry.getValue());
+            staleIterator.remove();
+            staleRemovedThisFrame++;
+        }
+
+        // Free coarse buffers that are already completely replaced by stable,
+        // current finer GPU coverage before uploading anything new.
+        coveredPrunedThisFrame += pruneCoveredCoarse(
+                snapshot,
+                cameraX,
+                cameraZ
+        );
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
             if (uploadsRemaining <= 0) {
@@ -88,15 +143,219 @@ public final class EverviewGpuTileCache {
             uploadsRemaining--;
 
             if (existing != null) {
-                residentBytes -= existing.bytes();
-                existing.close();
+                removeResident(existing);
             }
 
             TILES.put(key, uploaded);
             residentBytes += uploaded.bytes();
         }
 
+        // Newly uploaded finer tiles may make another large coarse buffer
+        // redundant in this same frame.
+        coveredPrunedThisFrame += pruneCoveredCoarse(
+                snapshot,
+                cameraX,
+                cameraZ
+        );
+
         trim();
+    }
+
+    private static int pruneCoveredCoarse(
+            WorldgenSurfaceSnapshot snapshot,
+            double cameraX,
+            double cameraZ
+    ) {
+        Map<Integer, Set<Long>> residentByLevel = new HashMap<>();
+        Map<LodTileKey, WorldgenSurfaceTile> active = new HashMap<>(
+                Math.max(16, snapshot.tiles().size() * 2)
+        );
+
+        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+            LodTileKey key = new LodTileKey(
+                    tile.lodLevel(),
+                    tile.tileX(),
+                    tile.tileZ()
+            );
+            active.put(key, tile);
+            GpuTile resident = TILES.get(key);
+
+            if (resident != null
+                    && resident.source() == tile
+                    && !resident.vertexBuffer().isClosed()) {
+                residentByLevel
+                        .computeIfAbsent(
+                                tile.lodLevel(),
+                                ignored -> new HashSet<>()
+                        )
+                        .add(packTile(tile.tileX(), tile.tileZ()));
+            }
+        }
+
+        int removed = 0;
+        Iterator<Map.Entry<LodTileKey, GpuTile>> iterator =
+                TILES.entrySet().iterator();
+
+        while (iterator.hasNext()) {
+            Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
+            GpuTile gpuTile = entry.getValue();
+            WorldgenSurfaceTile tile = gpuTile.source();
+
+            if (tile.lodLevel() <= 1
+                    || active.get(entry.getKey()) != tile
+                    || !isFullyCoveredByFiner(
+                            tile,
+                            snapshot,
+                            residentByLevel,
+                            cameraX,
+                            cameraZ
+                    )) {
+                continue;
+            }
+
+            Set<Long> ownLevel = residentByLevel.get(tile.lodLevel());
+            if (ownLevel != null) {
+                ownLevel.remove(packTile(tile.tileX(), tile.tileZ()));
+            }
+
+            removeResident(gpuTile);
+            iterator.remove();
+            removed++;
+        }
+
+        return removed;
+    }
+
+    private static boolean isFullyCoveredByFiner(
+            WorldgenSurfaceTile coarse,
+            WorldgenSurfaceSnapshot snapshot,
+            Map<Integer, Set<Long>> residentByLevel,
+            double cameraX,
+            double cameraZ
+    ) {
+        int level = coarse.lodLevel();
+
+        // L4-L6 may be retired directly by the L3 shield, mirroring the
+        // renderer's ownership rule. This is the largest residency win once
+        // coverage is nearly complete.
+        if (level >= 4) {
+            WorldgenLodRing l3 = snapshot.ringForLevel(3);
+            Set<Long> l3Tiles = residentByLevel.get(3);
+            if (l3 != null
+                    && l3Tiles != null
+                    && fullyCoveredByRing(
+                            coarse,
+                            l3,
+                            l3Tiles,
+                            cameraX,
+                            cameraZ
+                    )) {
+                return true;
+            }
+        }
+
+        WorldgenLodRing finer = snapshot.ringForLevel(level - 1);
+        Set<Long> finerTiles = residentByLevel.get(level - 1);
+
+        return finer != null
+                && finerTiles != null
+                && fullyCoveredByRing(
+                        coarse,
+                        finer,
+                        finerTiles,
+                        cameraX,
+                        cameraZ
+                );
+    }
+
+    private static boolean fullyCoveredByRing(
+            WorldgenSurfaceTile coarse,
+            WorldgenLodRing finer,
+            Set<Long> residentFiner,
+            double cameraX,
+            double cameraZ
+    ) {
+        int size = finer.tileSize();
+        int minTileX = Math.floorDiv(coarse.minX(), size);
+        int minTileZ = Math.floorDiv(coarse.minZ(), size);
+        int maxTileX = Math.floorDiv(coarse.maxX() - 1, size);
+        int maxTileZ = Math.floorDiv(coarse.maxZ() - 1, size);
+
+        for (int tileZ = minTileZ; tileZ <= maxTileZ; tileZ++) {
+            for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
+                if (!stableRingOwnership(
+                        tileX,
+                        tileZ,
+                        finer,
+                        cameraX,
+                        cameraZ
+                )
+                        || !residentFiner.contains(
+                                packTile(tileX, tileZ)
+                        )) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static boolean stableRingOwnership(
+            int tileX,
+            int tileZ,
+            WorldgenLodRing ring,
+            double cameraX,
+            double cameraZ
+    ) {
+        double minX = tileX * (double) ring.tileSize();
+        double minZ = tileZ * (double) ring.tileSize();
+        double maxX = minX + ring.tileSize();
+        double maxZ = minZ + ring.tileSize();
+
+        double nearestX = Math.max(minX, Math.min(cameraX, maxX));
+        double nearestZ = Math.max(minZ, Math.min(cameraZ, maxZ));
+        double nearest = Math.hypot(
+                nearestX - cameraX,
+                nearestZ - cameraZ
+        );
+
+        double farthest = Math.max(
+                Math.max(
+                        Math.hypot(minX - cameraX, minZ - cameraZ),
+                        Math.hypot(maxX - cameraX, minZ - cameraZ)
+                ),
+                Math.max(
+                        Math.hypot(minX - cameraX, maxZ - cameraZ),
+                        Math.hypot(maxX - cameraX, maxZ - cameraZ)
+                )
+        );
+
+        double inner = ring.innerRadiusBlocks();
+        double outer = ring.outerRadiusBlocks();
+
+        // Leave a fallback belt at moving ring boundaries so residency pruning
+        // never turns into visible pop/sky while the camera crosses a tier.
+        boolean outsideInner = inner <= 0.0D
+                || nearest
+                        >= inner + PRUNE_RING_MARGIN_BLOCKS;
+        boolean insideOuter = farthest
+                <= Math.max(
+                        0.0D,
+                        outer - PRUNE_RING_MARGIN_BLOCKS
+                );
+
+        return outsideInner && insideOuter;
+    }
+
+    private static long packTile(int tileX, int tileZ) {
+        return ((long) tileX << 32)
+                ^ (tileZ & 0xFFFF_FFFFL);
+    }
+
+    private static void removeResident(GpuTile tile) {
+        residentBytes -= tile.bytes();
+        tile.close();
     }
 
     public static GpuTile getResident(WorldgenSurfaceTile tile) {
@@ -117,7 +376,10 @@ public final class EverviewGpuTileCache {
                 TILES.size(),
                 residentBytes,
                 uploadsThisFrame,
-                uploadNanosThisFrame / 1_000_000.0
+                uploadNanosThisFrame / 1_000_000.0,
+                staleRemovedThisFrame,
+                coveredPrunedThisFrame,
+                forcedEvictionsThisFrame
         );
     }
 
@@ -138,9 +400,9 @@ public final class EverviewGpuTileCache {
 
         while (TILES.size() > MAX_GPU_TILES && iterator.hasNext()) {
             GpuTile tile = iterator.next().getValue();
-            residentBytes -= tile.bytes();
-            tile.close();
+            removeResident(tile);
             iterator.remove();
+            forcedEvictionsThisFrame++;
         }
     }
 
@@ -155,9 +417,34 @@ public final class EverviewGpuTileCache {
         int emittedQuadCount = 0;
 
         for (int quadOffset = 0; quadOffset < vertices.length; quadOffset += 12) {
-            List<QuadPiece> pieces = tile.lodLevel() <= 3
-                    ? splitQuadForOwnership(vertices, colors, quadOffset)
-                    : List.of(copyQuad(vertices, colors, quadOffset));
+            int regionSize = switch (tile.lodLevel()) {
+                case 4 -> L4_UNDERLAY_REGION_SIZE;
+                case 5 -> L5_UNDERLAY_REGION_SIZE;
+                case 6 -> L6_UNDERLAY_REGION_SIZE;
+                default -> 0;
+            };
+
+            List<QuadPiece> pieces;
+            if (tile.lodLevel() <= 3) {
+                pieces = splitQuadForOwnership(
+                        vertices,
+                        colors,
+                        quadOffset
+                );
+            } else if (regionSize > 0) {
+                pieces = splitQuadForUnderlayRegion(
+                        vertices,
+                        colors,
+                        quadOffset,
+                        regionSize
+                );
+            } else {
+                pieces = List.of(copyQuad(
+                        vertices,
+                        colors,
+                        quadOffset
+                ));
+            }
 
             emittedQuadCount += pieces.size();
 
@@ -296,6 +583,139 @@ public final class EverviewGpuTileCache {
         }
 
         return ownedPieces;
+    }
+
+    private static List<QuadPiece> splitQuadForUnderlayRegion(
+            int[] vertices,
+            int[] colors,
+            int quadOffset,
+            int regionSize
+    ) {
+        return splitPieceByRegionGrid(
+                copyQuad(vertices, colors, quadOffset),
+                regionSize
+        );
+    }
+
+    private static List<QuadPiece> splitPieceByRegionGrid(
+            QuadPiece piece,
+            int regionSize
+    ) {
+        int[] vertices = piece.vertices();
+        int minX = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE;
+        int minY = Integer.MAX_VALUE;
+        int maxY = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE;
+        int maxZ = Integer.MIN_VALUE;
+
+        for (int v = 0; v < 4; v++) {
+            int i = v * 3;
+            minX = Math.min(minX, vertices[i]);
+            maxX = Math.max(maxX, vertices[i]);
+            minY = Math.min(minY, vertices[i + 1]);
+            maxY = Math.max(maxY, vertices[i + 1]);
+            minZ = Math.min(minZ, vertices[i + 2]);
+            maxZ = Math.max(maxZ, vertices[i + 2]);
+        }
+
+        boolean surface = minX < maxX && minZ < maxZ;
+        boolean xWall = minX == maxX
+                && minY < maxY
+                && minZ < maxZ;
+        boolean zWall = minZ == maxZ
+                && minY < maxY
+                && minX < maxX;
+
+        if (!surface && !xWall && !zWall) {
+            return List.of(piece);
+        }
+
+        List<QuadPiece> result = new ArrayList<>();
+
+        if (surface) {
+            int x0 = minX;
+            while (x0 < maxX) {
+                int x1 = Math.min(
+                        maxX,
+                        nextGridBoundary(x0, regionSize)
+                );
+                int z0 = minZ;
+
+                while (z0 < maxZ) {
+                    int z1 = Math.min(
+                            maxZ,
+                            nextGridBoundary(z0, regionSize)
+                    );
+                    result.add(splitSurfacePiece(
+                            piece,
+                            minX,
+                            maxX,
+                            minZ,
+                            maxZ,
+                            x0,
+                            x1,
+                            z0,
+                            z1
+                    ));
+                    z0 = z1;
+                }
+
+                x0 = x1;
+            }
+
+            return result;
+        }
+
+        if (xWall) {
+            int z0 = minZ;
+            while (z0 < maxZ) {
+                int z1 = Math.min(
+                        maxZ,
+                        nextGridBoundary(z0, regionSize)
+                );
+                result.add(remapAxisAlignedPiece(
+                        piece,
+                        minX, maxX,
+                        minY, maxY,
+                        minZ, maxZ,
+                        minX, maxX,
+                        minY, maxY,
+                        z0, z1
+                ));
+                z0 = z1;
+            }
+
+            return result;
+        }
+
+        int x0 = minX;
+        while (x0 < maxX) {
+            int x1 = Math.min(
+                    maxX,
+                    nextGridBoundary(x0, regionSize)
+            );
+            result.add(remapAxisAlignedPiece(
+                    piece,
+                    minX, maxX,
+                    minY, maxY,
+                    minZ, maxZ,
+                    x0, x1,
+                    minY, maxY,
+                    minZ, maxZ
+            ));
+            x0 = x1;
+        }
+
+        return result;
+    }
+
+    private static int nextGridBoundary(
+            int coordinate,
+            int gridSize
+    ) {
+        return (Math.floorDiv(coordinate, gridSize) + 1)
+                * gridSize;
     }
 
     private static List<QuadPiece> splitPieceByChunkColumns(
@@ -912,7 +1332,10 @@ public final class EverviewGpuTileCache {
             int bufferCount,
             long residentBytes,
             int uploadsThisFrame,
-            double uploadMs
+            double uploadMs,
+            int staleRemovedThisFrame,
+            int coveredPrunedThisFrame,
+            int forcedEvictionsThisFrame
     ) {
         public double residentMiB() {
             return residentBytes / (1024.0 * 1024.0);
