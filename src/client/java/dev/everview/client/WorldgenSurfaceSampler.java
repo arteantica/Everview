@@ -118,8 +118,8 @@ public final class WorldgenSurfaceSampler {
     private static final int L1_BOOTSTRAP_SPACING = 4;
     private static final int L1_INTERMEDIATE_SPACING = 2;
     private static final int L1_EXACT_SPACING = 1;
-    private static final int L1_FINE_GRID_SAMPLES = 65;
-    private static final int L1_SAMPLE_CACHE_LIMIT = 1_536;
+    private static final int L1_FINE_GRID_SAMPLES = 129;
+    private static final int L1_SAMPLE_CACHE_LIMIT = 640;
     // M9 keeps a wide all-direction exact core and extends true 1-block terrain
     // through the current view all the way to the outer L1 boundary.
     private static final int L1_EXACT_BAND_BLOCKS = 896;
@@ -1002,7 +1002,7 @@ public final class WorldgenSurfaceSampler {
                 1,
                 innerRadius,
                 ultraNearOuter,
-                64,
+                128,
                 1
         ));
 
@@ -5218,7 +5218,7 @@ public final class WorldgenSurfaceSampler {
         private L1SampleGrid(int tileSize) {
             if (tileSize + 1 != L1_FINE_GRID_SAMPLES) {
                 throw new IllegalArgumentException(
-                        "L1 sample hierarchy expects 64-block tiles"
+                        "L1 sample hierarchy expects 128-block tiles"
                 );
             }
 
