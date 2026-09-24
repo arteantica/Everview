@@ -2998,7 +2998,8 @@ public final class WorldgenSurfaceSampler {
         var generator = chunks.getGenerator();
         var randomState = chunks.randomState();
 
-        List<Integer> missing = new ArrayList<>();
+        int[] missingScratch = new int[job.totalSamples];
+        int missingCount = 0;
         for (int sampleIndex = 0;
                 sampleIndex < job.totalSamples;
                 sampleIndex++) {
@@ -3014,13 +3015,14 @@ public final class WorldgenSurfaceSampler {
                 job.maxY = Math.max(job.maxY, y);
                 job.reusedSamples++;
             } else {
-                missing.add(sampleIndex);
+                missingScratch[missingCount++] = sampleIndex;
             }
         }
 
-        int[] missingIndices = missing.stream()
-                .mapToInt(Integer::intValue)
-                .toArray();
+        int[] missingIndices = Arrays.copyOf(
+                missingScratch,
+                missingCount
+        );
         long started = System.nanoTime();
 
         int workersForTile = exactWorkersPerTile();
@@ -3603,7 +3605,8 @@ public final class WorldgenSurfaceSampler {
             long sliceStart
     ) {
         if (job.asyncHeightFuture == null) {
-            List<Integer> missing = new ArrayList<>();
+            int[] missingScratch = new int[job.totalSamples];
+            int missingCount = 0;
 
             for (int sampleIndex = 0;
                     sampleIndex < job.totalSamples;
@@ -3620,13 +3623,14 @@ public final class WorldgenSurfaceSampler {
                     job.maxY = Math.max(job.maxY, y);
                     job.reusedSamples++;
                 } else {
-                    missing.add(sampleIndex);
+                    missingScratch[missingCount++] = sampleIndex;
                 }
             }
 
-            int[] missingIndices = missing.stream()
-                    .mapToInt(Integer::intValue)
-                    .toArray();
+            int[] missingIndices = Arrays.copyOf(
+                    missingScratch,
+                    missingCount
+            );
             job.asyncMissingSampleIndices = missingIndices;
             job.asyncStartedNanos = System.nanoTime();
 
