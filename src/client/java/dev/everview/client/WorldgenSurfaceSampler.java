@@ -899,29 +899,44 @@ public final class WorldgenSurfaceSampler {
                 diskFileMiB = result.bytes() / (1024.0 * 1024.0);
                 diskCacheStatus = result.status();
 
-                if (!"SAVED".equals(result.status())) {
-                    cacheDirty = true;
-                    dirtyTilesSinceSave = Math.max(
-                            dirtyTilesSinceSave,
-                            DISK_AUTOSAVE_MIN_DIRTY_TILES
-                    );
+                if (!"SAVED".equals(result.status())
+                        && !"IDLE".equals(result.status())) {
+                    for (WorldgenSurfaceTile tile : diskSaveBatch) {
+                        DISK_DIRTY_TILES.put(
+                                new LodTileKey(
+                                        tile.lodLevel(),
+                                        tile.tileX(),
+                                        tile.tileZ()
+                                ),
+                                tile
+                        );
+                    }
                 }
             } catch (RuntimeException exception) {
                 diskCacheStatus = "SAVE_ERROR";
-                cacheDirty = true;
-                dirtyTilesSinceSave = Math.max(
-                        dirtyTilesSinceSave,
-                        DISK_AUTOSAVE_MIN_DIRTY_TILES
+                for (WorldgenSurfaceTile tile : diskSaveBatch) {
+                    DISK_DIRTY_TILES.put(
+                            new LodTileKey(
+                                    tile.lodLevel(),
+                                    tile.tileX(),
+                                    tile.tileZ()
+                            ),
+                            tile
+                    );
+                }
+                EverviewClient.LOGGER.warn(
+                        "Everview regional LOD cache save task failed",
+                        exception
                 );
-                EverviewClient.LOGGER.warn("Everview LOD cache save task failed", exception);
             } finally {
                 diskSaveFuture = null;
+                diskSaveBatch = List.of();
             }
         }
     }
 
     private static void maybeScheduleDiskSave() {
-        if (!cacheDirty
+        if (DISK_DIRTY_TILES.isEmpty()
                 || diskCachePath == null
                 || diskSaveFuture != null
                 || !diskLoadReady) {
@@ -930,7 +945,7 @@ public final class WorldgenSurfaceSampler {
 
         long now = System.nanoTime();
         boolean enoughNewTiles =
-                dirtyTilesSinceSave >= DISK_AUTOSAVE_MIN_DIRTY_TILES;
+                DISK_DIRTY_TILES.size() >= DISK_AUTOSAVE_MIN_DIRTY_TILES;
         boolean intervalElapsed =
                 lastDiskSaveStartedNanos == 0L
                         || now - lastDiskSaveStartedNanos
@@ -941,47 +956,68 @@ public final class WorldgenSurfaceSampler {
             return;
         }
 
-        List<WorldgenSurfaceTile> tiles = CACHE.values().stream()
-                .filter(tile -> tile.stage().diskSafe())
-                .toList();
+        diskSaveBatch = List.copyOf(DISK_DIRTY_TILES.values());
+        DISK_DIRTY_TILES.clear();
+
         Path path = diskCachePath;
         long seed = diskCacheSeed;
         String dimension = diskCacheDimension;
+        List<WorldgenSurfaceTile> batch = diskSaveBatch;
 
-        cacheDirty = false;
-        dirtyTilesSinceSave = 0;
         lastDiskSaveStartedNanos = now;
         diskCacheStatus = "SAVING";
         diskSaveFuture = CompletableFuture.supplyAsync(
-                () -> WorldgenDiskCache.save(path, seed, dimension, tiles)
+                () -> WorldgenDiskCache.save(
+                        path,
+                        seed,
+                        dimension,
+                        batch
+                )
         );
     }
 
     private static void scheduleDetachedSaveIfDirty() {
-        if (!cacheDirty || diskCachePath == null || CACHE.isEmpty()) {
+        if (diskCachePath == null
+                || (DISK_DIRTY_TILES.isEmpty()
+                        && diskSaveFuture == null)) {
             return;
         }
 
-        List<WorldgenSurfaceTile> tiles = CACHE.values().stream()
-                .filter(tile -> tile.stage().diskSafe())
-                .toList();
+        List<WorldgenSurfaceTile> pending =
+                new ArrayList<>(DISK_DIRTY_TILES.values());
+        List<WorldgenSurfaceTile> inFlightBatch =
+                List.copyOf(diskSaveBatch);
         Path path = diskCachePath;
         long seed = diskCacheSeed;
         String dimension = diskCacheDimension;
         CompletableFuture<WorldgenDiskCache.SaveResult> inFlight =
                 diskSaveFuture;
 
-        // If an autosave is already writing, chain the final world-exit snapshot
-        // behind it. This avoids two writers fighting over the same cache temp
-        // file and guarantees the newest snapshot wins.
+        DISK_DIRTY_TILES.clear();
+
+        // Serialize the final world-exit write behind an in-flight regional
+        // save. If that save failed, merge its batch back into the final write.
         CompletableFuture.runAsync(() -> {
             if (inFlight != null) {
                 try {
-                    inFlight.join();
-                } catch (RuntimeException ignored) {
+                    WorldgenDiskCache.SaveResult result = inFlight.join();
+                    if (!"SAVED".equals(result.status())
+                            && !"IDLE".equals(result.status())) {
+                        pending.addAll(inFlightBatch);
+                    }
+                } catch (RuntimeException exception) {
+                    pending.addAll(inFlightBatch);
                 }
             }
-            WorldgenDiskCache.save(path, seed, dimension, tiles);
+
+            if (!pending.isEmpty()) {
+                WorldgenDiskCache.save(
+                        path,
+                        seed,
+                        dimension,
+                        pending
+                );
+            }
         });
     }
 
@@ -1147,8 +1183,8 @@ public final class WorldgenSurfaceSampler {
         diskCacheSeed = 0L;
         diskCacheDimension = "";
         diskLoadReady = false;
-        cacheDirty = false;
-        dirtyTilesSinceSave = 0;
+        DISK_DIRTY_TILES.clear();
+        diskSaveBatch = List.of();
         lastDiskSaveStartedNanos = 0L;
         diskLoadedTiles = 0;
         diskLoadMs = 0.0;
@@ -1176,8 +1212,12 @@ public final class WorldgenSurfaceSampler {
             putCacheTile(completed.key(), completed.tile());
             lastGenerationMs = completed.tile().generationMs();
             generatedTileCount++;
-            cacheDirty = true;
-            dirtyTilesSinceSave++;
+            if (completed.tile().stage().diskSafe()) {
+                DISK_DIRTY_TILES.put(
+                        completed.key(),
+                        completed.tile()
+                );
+            }
 
             if (completed.tile().lodLevel() == 1) {
                 lastRefineReusedSamples = completed.reusedSamples();
