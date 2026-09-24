@@ -22,6 +22,10 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * M9.5 spatial residency + region-buffer architecture.
@@ -57,6 +61,27 @@ public final class EverviewGpuRegionCache {
     private static final int MAX_REGION_REBUILDS_PER_FRAME = 2;
     private static final long TARGET_REGION_UPLOAD_BYTES_PER_FRAME =
             64L * 1024L * 1024L;
+    private static final int REGION_PREP_WORKERS = Math.max(
+            1,
+            Math.min(
+                    2,
+                    Runtime.getRuntime().availableProcessors() / 8
+            )
+    );
+    private static final int MAX_PENDING_REGION_PREP = 4;
+    private static final ExecutorService REGION_PREP_EXECUTOR =
+            Executors.newFixedThreadPool(
+                    REGION_PREP_WORKERS,
+                    runnable -> {
+                        Thread thread = new Thread(
+                                runnable,
+                                "Everview-RegionPrep"
+                        );
+                        thread.setDaemon(true);
+                        thread.setPriority(Thread.NORM_PRIORITY - 1);
+                        return thread;
+                    }
+            );
 
     private static final Map<RegionKey, GpuRegion> REGIONS =
             new LinkedHashMap<>();
@@ -64,6 +89,8 @@ public final class EverviewGpuRegionCache {
             new HashMap<>();
     private static final Set<LodTileKey> RESIDENCY_WANTED =
             new HashSet<>();
+    private static final Map<RegionKey, PendingRegion> PENDING_REGIONS =
+            new HashMap<>();
 
     private static ClientLevel lastLevel;
     private static WorldgenSurfaceSnapshot lastSnapshotReference;
@@ -73,6 +100,7 @@ public final class EverviewGpuRegionCache {
 
     private static long residentBytes;
     private static long residencyRevision;
+    private static long epoch;
 
     private static int regionRebuildsThisFrame;
     private static int tileUploadsThisFrame;
@@ -151,25 +179,92 @@ public final class EverviewGpuRegionCache {
                 .thenComparingDouble(region ->
                         region.distanceTo(cameraX, cameraZ)));
 
-        long uploadBudget = TARGET_REGION_UPLOAD_BYTES_PER_FRAME;
+        cancelObsoletePending(desiredRegions, dirty);
+
+        // Ownership splitting, decompression, and CPU vertex assembly are
+        // intentionally prepared off the render thread. Only the final
+        // BufferBuilder/GPU allocation happens here.
         for (DesiredRegion desired : dirty) {
-            if (regionRebuildsThisFrame >= MAX_REGION_REBUILDS_PER_FRAME) {
+            if (PENDING_REGIONS.size()
+                    >= MAX_PENDING_REGION_PREP) {
                 break;
             }
 
-            long estimate = desired.estimatedBytes();
+            PendingRegion existingPending =
+                    PENDING_REGIONS.get(desired.key());
+            if (existingPending != null) {
+                continue;
+            }
+
+            long taskEpoch = epoch;
+            CompletableFuture<PreparedRegionCpu> future =
+                    CompletableFuture.supplyAsync(
+                            () -> prepareRegionCpu(desired),
+                            REGION_PREP_EXECUTOR
+                    );
+            PENDING_REGIONS.put(
+                    desired.key(),
+                    new PendingRegion(
+                            taskEpoch,
+                            desired,
+                            future
+                    )
+            );
+        }
+
+        long uploadBudget = TARGET_REGION_UPLOAD_BYTES_PER_FRAME;
+        for (DesiredRegion desired : dirty) {
+            if (regionRebuildsThisFrame
+                    >= MAX_REGION_REBUILDS_PER_FRAME) {
+                break;
+            }
+
+            PendingRegion pending =
+                    PENDING_REGIONS.get(desired.key());
+            if (pending == null
+                    || pending.epoch() != epoch
+                    || !pending.matches(desired)
+                    || !pending.future().isDone()) {
+                continue;
+            }
+
+            PreparedRegionCpu prepared;
+            try {
+                prepared = pending.future().join();
+            } catch (CompletionException exception) {
+                PENDING_REGIONS.remove(desired.key(), pending);
+                EverviewClient.LOGGER.warn(
+                        "Everview region preparation failed for {}",
+                        desired.key(),
+                        exception.getCause()
+                );
+                continue;
+            }
+
+            if (pending.epoch() != epoch
+                    || !pending.matches(desired)) {
+                PENDING_REGIONS.remove(desired.key(), pending);
+                continue;
+            }
+
+            long estimate = prepared.vertexBytes();
             if (regionRebuildsThisFrame > 0
                     && estimate > uploadBudget) {
                 continue;
             }
 
             long uploadStarted = System.nanoTime();
-            GpuRegion replacement = buildRegion(desired);
-            uploadNanosThisFrame += System.nanoTime() - uploadStarted;
+            GpuRegion replacement = uploadPreparedRegion(prepared);
+            uploadNanosThisFrame += System.nanoTime()
+                    - uploadStarted;
             regionRebuildsThisFrame++;
             tileUploadsThisFrame += desired.tiles().size();
-            uploadBudget = Math.max(0L, uploadBudget - replacement.bytes());
+            uploadBudget = Math.max(
+                    0L,
+                    uploadBudget - replacement.bytes()
+            );
 
+            PENDING_REGIONS.remove(desired.key(), pending);
             replaceRegion(replacement);
         }
 
@@ -458,6 +553,34 @@ public final class EverviewGpuRegionCache {
         return result;
     }
 
+    private static void cancelObsoletePending(
+            Map<RegionKey, DesiredRegion> desiredRegions,
+            List<DesiredRegion> dirty
+    ) {
+        Set<RegionKey> dirtyKeys = new HashSet<>();
+        for (DesiredRegion desired : dirty) {
+            dirtyKeys.add(desired.key());
+        }
+
+        List<RegionKey> remove = new ArrayList<>();
+        for (Map.Entry<RegionKey, PendingRegion> entry
+                : PENDING_REGIONS.entrySet()) {
+            DesiredRegion desired =
+                    desiredRegions.get(entry.getKey());
+            if (desired == null
+                    || !dirtyKeys.contains(entry.getKey())
+                    || !entry.getValue().matches(desired)
+                    || entry.getValue().epoch() != epoch) {
+                entry.getValue().future().cancel(true);
+                remove.add(entry.getKey());
+            }
+        }
+
+        for (RegionKey key : remove) {
+            PENDING_REGIONS.remove(key);
+        }
+    }
+
     private static void removeUndesiredRegions(
             Set<RegionKey> desired
     ) {
@@ -485,7 +608,7 @@ public final class EverviewGpuRegionCache {
         }
     }
 
-    private static GpuRegion buildRegion(
+    private static PreparedRegionCpu prepareRegionCpu(
             DesiredRegion desired
     ) {
         RegionKey key = desired.key();
@@ -518,6 +641,31 @@ public final class EverviewGpuRegionCache {
                 format.getVertexSize(),
                 totalVertices
         );
+
+        return new PreparedRegionCpu(
+                desired,
+                originX,
+                originZ,
+                List.copyOf(prepared),
+                totalIndices,
+                totalVertices,
+                bytes
+        );
+    }
+
+    private static GpuRegion uploadPreparedRegion(
+            PreparedRegionCpu preparedRegion
+    ) {
+        DesiredRegion desired = preparedRegion.desired();
+        RegionKey key = desired.key();
+        int originX = preparedRegion.originX();
+        int originZ = preparedRegion.originZ();
+        List<EverviewGpuTileCache.PreparedGeometry> prepared =
+                preparedRegion.tiles();
+        int totalVertices = preparedRegion.totalVertices();
+
+        VertexFormat format = DefaultVertexFormat.POSITION_COLOR;
+        int bytes = preparedRegion.vertexBytes();
 
         List<GpuTile> tileViews = new ArrayList<>(prepared.size());
 
@@ -765,6 +913,12 @@ public final class EverviewGpuRegionCache {
         TILES.clear();
         RESIDENCY_WANTED.clear();
 
+        epoch++;
+        for (PendingRegion pending : PENDING_REGIONS.values()) {
+            pending.future().cancel(true);
+        }
+        PENDING_REGIONS.clear();
+
         residentBytes = 0L;
         residencyRevision++;
         lastLevel = null;
@@ -951,6 +1105,38 @@ public final class EverviewGpuRegionCache {
     ) {
         public double residentMiB() {
             return residentBytes / (1024.0 * 1024.0);
+        }
+    }
+
+    private record PreparedRegionCpu(
+            DesiredRegion desired,
+            int originX,
+            int originZ,
+            List<EverviewGpuTileCache.PreparedGeometry> tiles,
+            int totalIndices,
+            int totalVertices,
+            int vertexBytes
+    ) {
+    }
+
+    private record PendingRegion(
+            long epoch,
+            DesiredRegion desired,
+            CompletableFuture<PreparedRegionCpu> future
+    ) {
+        private boolean matches(DesiredRegion candidate) {
+            if (!desired.key().equals(candidate.key())
+                    || desired.tiles().size()
+                            != candidate.tiles().size()) {
+                return false;
+            }
+            for (int i = 0; i < desired.tiles().size(); i++) {
+                if (desired.tiles().get(i)
+                        != candidate.tiles().get(i)) {
+                    return false;
+                }
+            }
+            return true;
         }
     }
 
