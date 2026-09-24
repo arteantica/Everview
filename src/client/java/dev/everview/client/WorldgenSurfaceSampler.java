@@ -610,7 +610,7 @@ public final class WorldgenSurfaceSampler {
         if (!highSpeedCoverageMode) {
             int appearanceLaunches = 0;
             while (DETACHED_APPEARANCE_JOBS.size()
-                    < MAX_DETACHED_APPEARANCE_JOBS
+                    < activeAppearanceJobBudget()
                     && appearanceLaunches < 2) {
                 WantedTile appearance =
                         firstExactAppearanceRefinement(null);
@@ -641,7 +641,7 @@ public final class WorldgenSurfaceSampler {
                     : currentJob.key;
 
             while (DETACHED_EXACT_JOBS.size()
-                    < MAX_DETACHED_EXACT_JOBS) {
+                    < activeExactJobBudget()) {
                 WantedTile detached =
                         firstExactBandRefinement(pending);
 
@@ -667,7 +667,7 @@ public final class WorldgenSurfaceSampler {
             pollDetachedCoverage();
 
             while (DETACHED_COVERAGE_JOBS.size()
-                    < MAX_DETACHED_COVERAGE_JOBS) {
+                    < activeCoverageJobBudget()) {
                 WantedTile coverage =
                         firstDetachedCoverageCandidate();
 
@@ -2329,7 +2329,12 @@ public final class WorldgenSurfaceSampler {
             }
 
             WorldgenSurfaceTile tile = CACHE.get(wanted.key());
-            if (tile != null && tile.sampleSpacing() > L1_EXACT_SPACING) {
+            L1SampleGrid grid = L1_SAMPLE_CACHE.get(wanted.key());
+            if (tile != null
+                    && tile.sampleSpacing() > L1_EXACT_SPACING
+                    && grid != null
+                    && grid.hasAnyAppearance()
+                    && !DETACHED_COVERAGE_JOBS.containsKey(wanted.key())) {
                 return wanted;
             }
         }
