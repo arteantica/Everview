@@ -91,12 +91,11 @@ public final class EverviewRenderer {
 
             WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
             if (!snapshot.tiles().isEmpty()) {
-                var cameraPos = client.gameRenderer.mainCamera().position();
+                Camera camera = client.gameRenderer.mainCamera();
                 EverviewGpuTileCache.prepareFrame(
                         client.level,
                         snapshot,
-                        cameraPos.x(),
-                        cameraPos.z()
+                        camera
                 );
             }
         });

@@ -428,3 +428,17 @@
 - [x] expose total GPU prepare-frame CPU time separately from geometry submission CPU
 - [ ] verify stationary 100% coverage reaches prepare <0.5ms, uploads 0, rebuild 0
 - [ ] compare FPS against M6.9/M7.0/M7.1 before any horizon expansion
+
+
+## M7.3 view-aware residency
+- [x] diagnose remaining 100% coverage churn: 3072 resident tiles, 8 uploads/frame and 6 hard evictions/frame
+- [x] stop uploading offscreen refined snapshot tiles that cannot contribute to the current frame
+- [x] keep a GPU working set of the frustum with a 192b prefetch margin plus a 768b all-direction near safety radius
+- [x] rebuild the view working set only on snapshot changes, 128b movement cells, or 12deg/10deg view sectors
+- [x] retain global CPU/disk LOD coverage while making GPU residency view-local
+- [x] trim old offscreen buffers toward a 2304-tile soft target before hard-cap eviction
+- [x] remove access-order LRU behavior because ownership discovery touched every resident tile
+- [x] expose wanted residency, view rebuilds, offscreen trims and hard evictions independently
+- [ ] stationary 95-100% refinement should settle at upload 0 and hard-evict 0
+- [ ] turning should prefetch the next view without widespread terrain flashing
+- [ ] once stable, attack the remaining 1000+ draw calls with GPU-side batch consolidation

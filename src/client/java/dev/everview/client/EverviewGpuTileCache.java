@@ -9,7 +9,9 @@ import com.mojang.renderpearl.api.buffers.GpuBuffer;
 import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import com.mojang.renderpearl.api.vertex.VertexFormat;
 import dev.everview.core.LodTileKey;
+import net.minecraft.client.Camera;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.world.phys.AABB;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -30,15 +32,23 @@ import java.util.Set;
  */
 public final class EverviewGpuTileCache {
     private static final int MAX_GPU_TILES = 3_072;
+    private static final int TARGET_GPU_TILES = 2_304;
     private static final int MAX_UPLOADS_PER_FRAME = 8;
     private static final int PRUNE_RING_MARGIN_BLOCKS = 128;
+    private static final int RESIDENCY_NEAR_RADIUS_BLOCKS = 768;
+    private static final double RESIDENCY_FRUSTUM_MARGIN_BLOCKS = 192.0D;
+    private static final int VIEW_YAW_QUANTUM_DEGREES = 12;
+    private static final int VIEW_PITCH_QUANTUM_DEGREES = 10;
     private static final int L3_UNDERLAY_REGION_SIZE = 128;
     private static final int L4_UNDERLAY_REGION_SIZE = 256;
     private static final int L5_UNDERLAY_REGION_SIZE = 512;
     private static final int L6_UNDERLAY_REGION_SIZE = 1_024;
 
+    // Insertion order is deliberate. M7.3 no longer relies on accidental
+    // access-order LRU behavior; ownership discovery touches every resident
+    // tile and used to make access order meaningless.
     private static final Map<LodTileKey, GpuTile> TILES =
-            new LinkedHashMap<>(256, 0.75F, true);
+            new LinkedHashMap<>(256, 0.75F, false);
 
     private static ClientLevel lastLevel;
     private static int uploadsRemaining;
@@ -48,16 +58,23 @@ public final class EverviewGpuTileCache {
     private static int coveredPrunedThisFrame;
     private static int forcedEvictionsThisFrame;
     private static int suppressionRebuildsThisFrame;
+    private static int residencySelectionRebuildsThisFrame;
+    private static int offscreenEvictionsThisFrame;
     private static long prepareNanosThisFrame;
     private static long residentBytes;
 
     private static final Set<LodTileKey> ACTIVE_KEYS = new HashSet<>();
+    private static final Set<LodTileKey> RESIDENCY_WANTED =
+            new HashSet<>();
     private static final Set<LodTileKey> SUPPRESSED_COARSE =
             new HashSet<>();
     private static WorldgenSurfaceSnapshot lastSnapshotReference;
     private static long lastSnapshotFingerprint = Long.MIN_VALUE;
     private static int lastPruneCellX = Integer.MIN_VALUE;
     private static int lastPruneCellZ = Integer.MIN_VALUE;
+    private static int lastViewYawSector = Integer.MIN_VALUE;
+    private static int lastViewPitchSector = Integer.MIN_VALUE;
+    private static boolean residencySelectionDirty = true;
     private static boolean suppressionDirty = true;
     private static boolean residencyComplete;
 
@@ -72,8 +89,7 @@ public final class EverviewGpuTileCache {
     public static void prepareFrame(
             ClientLevel level,
             WorldgenSurfaceSnapshot snapshot,
-            double cameraX,
-            double cameraZ
+            Camera camera
     ) {
         long prepareStarted = System.nanoTime();
 
@@ -89,6 +105,12 @@ public final class EverviewGpuTileCache {
         coveredPrunedThisFrame = 0;
         forcedEvictionsThisFrame = 0;
         suppressionRebuildsThisFrame = 0;
+        residencySelectionRebuildsThisFrame = 0;
+        offscreenEvictionsThisFrame = 0;
+
+        var cameraPos = camera.position();
+        double cameraX = cameraPos.x();
+        double cameraZ = cameraPos.z();
 
         int pruneCellX = Math.floorDiv(
                 (int) Math.floor(cameraX),
@@ -97,6 +119,20 @@ public final class EverviewGpuTileCache {
         int pruneCellZ = Math.floorDiv(
                 (int) Math.floor(cameraZ),
                 PRUNE_RING_MARGIN_BLOCKS
+        );
+        int viewYawSector = Math.floorMod(
+                (int) Math.floor(
+                        (camera.getYRot()
+                                + VIEW_YAW_QUANTUM_DEGREES * 0.5F)
+                                / VIEW_YAW_QUANTUM_DEGREES
+                ),
+                Math.max(1, 360 / VIEW_YAW_QUANTUM_DEGREES)
+        );
+        int viewPitchSector = (int) Math.floor(
+                (camera.getXRot()
+                        + 90.0F
+                        + VIEW_PITCH_QUANTUM_DEGREES * 0.5F)
+                        / VIEW_PITCH_QUANTUM_DEGREES
         );
 
         boolean newSnapshotObject = snapshot != lastSnapshotReference;
@@ -107,6 +143,7 @@ public final class EverviewGpuTileCache {
                 rebuildActiveKeys(snapshot);
                 removeStaleResidents();
                 lastSnapshotFingerprint = fingerprint;
+                residencySelectionDirty = true;
                 suppressionDirty = true;
                 residencyComplete = false;
             }
@@ -118,8 +155,28 @@ public final class EverviewGpuTileCache {
                 || pruneCellZ != lastPruneCellZ) {
             lastPruneCellX = pruneCellX;
             lastPruneCellZ = pruneCellZ;
+            residencySelectionDirty = true;
             suppressionDirty = true;
             residencyComplete = false;
+        }
+
+        if (viewYawSector != lastViewYawSector
+                || viewPitchSector != lastViewPitchSector) {
+            lastViewYawSector = viewYawSector;
+            lastViewPitchSector = viewPitchSector;
+            residencySelectionDirty = true;
+            residencyComplete = false;
+        }
+
+        if (residencySelectionDirty) {
+            rebuildResidencyWanted(snapshot, camera);
+            residencySelectionDirty = false;
+            residencySelectionRebuildsThisFrame++;
+
+            offscreenEvictionsThisFrame += trimOffscreenToTarget();
+            if (offscreenEvictionsThisFrame > 0) {
+                suppressionDirty = true;
+            }
         }
 
         if (suppressionDirty) {
@@ -137,10 +194,6 @@ public final class EverviewGpuTileCache {
             residencyComplete = false;
         }
 
-        // The settled fast path is intentionally boring: no snapshot change,
-        // no camera prune-cell change, and every unsuppressed tile already has
-        // the correct GPU buffer. M7.1 still walked ~3600 tiles and performed
-        // the full hierarchical coverage analysis every render frame.
         if (!residencyComplete) {
             boolean sawMissing = false;
 
@@ -151,7 +204,8 @@ public final class EverviewGpuTileCache {
                         tile.tileZ()
                 );
 
-                if (SUPPRESSED_COARSE.contains(key)) {
+                if (!RESIDENCY_WANTED.contains(key)
+                        || SUPPRESSED_COARSE.contains(key)) {
                     continue;
                 }
 
@@ -181,9 +235,6 @@ public final class EverviewGpuTileCache {
                 residentBytes += uploaded.bytes();
             }
 
-            // A new finer upload can make coarse residency redundant. Do not
-            // re-run the expensive coverage walk in the same frame; mark it
-            // dirty once and resolve it on the next frame.
             if (uploadsThisFrame > 0
                     || staleRemovedThisFrame > 0) {
                 suppressionDirty = true;
@@ -192,14 +243,133 @@ public final class EverviewGpuTileCache {
             residencyComplete = !sawMissing;
         }
 
-        trim();
+        offscreenEvictionsThisFrame += trimOffscreenToTarget();
+        trimHardLimit();
 
-        if (forcedEvictionsThisFrame > 0) {
+        if (offscreenEvictionsThisFrame > 0
+                || forcedEvictionsThisFrame > 0) {
             suppressionDirty = true;
             residencyComplete = false;
         }
 
         prepareNanosThisFrame = System.nanoTime() - prepareStarted;
+    }
+
+    private static void rebuildResidencyWanted(
+            WorldgenSurfaceSnapshot snapshot,
+            Camera camera
+    ) {
+        RESIDENCY_WANTED.clear();
+
+        var cameraPos = camera.position();
+        double cameraX = cameraPos.x();
+        double cameraZ = cameraPos.z();
+        var frustum = camera.getCullFrustum();
+
+        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+            double nearestX = Math.max(
+                    tile.minX(),
+                    Math.min(cameraX, tile.maxX())
+            );
+            double nearestZ = Math.max(
+                    tile.minZ(),
+                    Math.min(cameraZ, tile.maxZ())
+            );
+            double nearest = Math.hypot(
+                    nearestX - cameraX,
+                    nearestZ - cameraZ
+            );
+
+            if (nearest <= RESIDENCY_NEAR_RADIUS_BLOCKS) {
+                RESIDENCY_WANTED.add(new LodTileKey(
+                        tile.lodLevel(),
+                        tile.tileX(),
+                        tile.tileZ()
+                ));
+                continue;
+            }
+
+            AABB bounds = new AABB(
+                    tile.minX(),
+                    tile.minY() - 8.0,
+                    tile.minZ(),
+                    tile.maxX(),
+                    tile.maxY() + 8.0,
+                    tile.maxZ()
+            ).inflate(
+                    RESIDENCY_FRUSTUM_MARGIN_BLOCKS,
+                    64.0D,
+                    RESIDENCY_FRUSTUM_MARGIN_BLOCKS
+            );
+
+            if (frustum.isVisible(bounds)) {
+                RESIDENCY_WANTED.add(new LodTileKey(
+                        tile.lodLevel(),
+                        tile.tileX(),
+                        tile.tileZ()
+                ));
+            }
+        }
+    }
+
+    private static int trimOffscreenToTarget() {
+        if (TILES.size() <= TARGET_GPU_TILES) {
+            return 0;
+        }
+
+        int removed = 0;
+        Iterator<Map.Entry<LodTileKey, GpuTile>> iterator =
+                TILES.entrySet().iterator();
+
+        while (TILES.size() > TARGET_GPU_TILES
+                && iterator.hasNext()) {
+            Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
+
+            if (RESIDENCY_WANTED.contains(entry.getKey())) {
+                continue;
+            }
+
+            removeResident(entry.getValue());
+            iterator.remove();
+            removed++;
+        }
+
+        return removed;
+    }
+
+    private static void trimHardLimit() {
+        if (TILES.size() <= MAX_GPU_TILES) {
+            return;
+        }
+
+        Iterator<Map.Entry<LodTileKey, GpuTile>> iterator =
+                TILES.entrySet().iterator();
+
+        while (TILES.size() > MAX_GPU_TILES
+                && iterator.hasNext()) {
+            Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
+
+            if (RESIDENCY_WANTED.contains(entry.getKey())) {
+                continue;
+            }
+
+            removeResident(entry.getValue());
+            iterator.remove();
+            forcedEvictionsThisFrame++;
+        }
+
+        if (TILES.size() <= MAX_GPU_TILES) {
+            return;
+        }
+
+        iterator = TILES.entrySet().iterator();
+        while (TILES.size() > MAX_GPU_TILES
+                && iterator.hasNext()) {
+            Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
+            removeResident(entry.getValue());
+            iterator.remove();
+            forcedEvictionsThisFrame++;
+        }
     }
 
     private static long snapshotFingerprint(
@@ -483,7 +653,10 @@ public final class EverviewGpuTileCache {
                 coveredPrunedThisFrame,
                 forcedEvictionsThisFrame,
                 suppressionRebuildsThisFrame,
+                residencySelectionRebuildsThisFrame,
+                offscreenEvictionsThisFrame,
                 SUPPRESSED_COARSE.size(),
+                RESIDENCY_WANTED.size(),
                 residencyComplete
         );
     }
@@ -495,11 +668,15 @@ public final class EverviewGpuTileCache {
 
         TILES.clear();
         ACTIVE_KEYS.clear();
+        RESIDENCY_WANTED.clear();
         SUPPRESSED_COARSE.clear();
         lastSnapshotReference = null;
         lastSnapshotFingerprint = Long.MIN_VALUE;
         lastPruneCellX = Integer.MIN_VALUE;
         lastPruneCellZ = Integer.MIN_VALUE;
+        lastViewYawSector = Integer.MIN_VALUE;
+        lastViewPitchSector = Integer.MIN_VALUE;
+        residencySelectionDirty = true;
         suppressionDirty = true;
         residencyComplete = false;
         residentBytes = 0L;
@@ -508,17 +685,8 @@ public final class EverviewGpuTileCache {
         uploadNanosThisFrame = 0L;
         prepareNanosThisFrame = 0L;
         suppressionRebuildsThisFrame = 0;
-    }
-
-    private static void trim() {
-        Iterator<Map.Entry<LodTileKey, GpuTile>> iterator = TILES.entrySet().iterator();
-
-        while (TILES.size() > MAX_GPU_TILES && iterator.hasNext()) {
-            GpuTile tile = iterator.next().getValue();
-            removeResident(tile);
-            iterator.remove();
-            forcedEvictionsThisFrame++;
-        }
+        residencySelectionRebuildsThisFrame = 0;
+        offscreenEvictionsThisFrame = 0;
     }
 
     private static GpuTile upload(WorldgenSurfaceTile tile) {
@@ -1453,7 +1621,10 @@ public final class EverviewGpuTileCache {
             int coveredPrunedThisFrame,
             int forcedEvictionsThisFrame,
             int suppressionRebuildsThisFrame,
+            int residencySelectionRebuildsThisFrame,
+            int offscreenEvictionsThisFrame,
             int suppressedCoarseTiles,
+            int residencyWantedTiles,
             boolean residencyComplete
     ) {
         public double residentMiB() {

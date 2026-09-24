@@ -68,7 +68,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSnapshot far
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M7.2 | F8 details");
+        lines.add("Everview M7.3 | F8 details");
 
         if (!far.available()) {
             lines.add("LOD worldgen unavailable");
@@ -113,10 +113,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M7.2 DEV | CACHED RESIDENCY");
+        lines.add("Everview M7.3 DEV | VIEW-AWARE RESIDENCY");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Renderer: cached residency analysis | settled-frame fast path | hierarchical pruning | seam shield");
+        lines.add("Renderer: frustum/near working set | no offscreen refinement uploads | cached pruning | seam shield");
         lines.add("Handoff: 64b overlap | upload grace | chunk fade forced OFF");
         lines.add("LOD targets: L1 1b | L2 2b | L3 2b | L4 4b | L5 8b | L6 16b");
         lines.add("First-visible: L1 4b | L2 4b | L3 4b | L4 8b | L5 8b | L6 16b");
@@ -384,13 +384,19 @@ public final class EverviewDebugHud {
                 gpu.prepareMs()
         ));
         lines.add(String.format(
-                "Residency: suppressed %d | rebuild %d | prune %d | stale %d | evict %d | %s",
+                "Residency: wanted %d | suppressed %d | view rebuild %d | hierarchy %d | %s",
+                gpu.residencyWantedTiles(),
                 gpu.suppressedCoarseTiles(),
+                gpu.residencySelectionRebuildsThisFrame(),
                 gpu.suppressionRebuildsThisFrame(),
+                gpu.residencyComplete() ? "SETTLED" : "STREAMING"
+        ));
+        lines.add(String.format(
+                "GPU churn: prune %d | stale %d | offscreen %d | hard-evict %d",
                 gpu.coveredPrunedThisFrame(),
                 gpu.staleRemovedThisFrame(),
-                gpu.forcedEvictionsThisFrame(),
-                gpu.residencyComplete() ? "SETTLED" : "STREAMING"
+                gpu.offscreenEvictionsThisFrame(),
+                gpu.forcedEvictionsThisFrame()
         ));
         lines.add("Frame c/s/d: " + metrics.tilesCulled() + "/"
                 + metrics.submissions() + "/" + metrics.tilesDrawn());
