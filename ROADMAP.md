@@ -442,3 +442,18 @@
 - [ ] stationary 95-100% refinement should settle at upload 0 and hard-evict 0
 - [ ] turning should prefetch the next view without widespread terrain flashing
 - [ ] once stable, attack the remaining 1000+ draw calls with GPU-side batch consolidation
+
+
+## M7.4 persistent view + far focus
+- [x] diagnose M7.3 360-turn unloads as aggressive 2304-tile offscreen trimming plus exact source-identity residency
+- [x] raise persistent GPU soft/hard residency to 3840/4096 so a full current 360-degree snapshot can remain warm
+- [x] keep view-aware uploads while retaining already-uploaded offscreen directions instead of immediately discarding them
+- [x] allow same-key stale GPU geometry to remain visible until its refined replacement upload is ready
+- [x] count stale same-key finer geometry as valid coverage for hierarchical coarse suppression
+- [x] add forward-view far refinement without globally doubling the entire L5/L6 world
+- [x] refine visible foreground L5 from 8b to 4b and L6 from 16b to 8b after normal coverage exists
+- [x] prioritize focused L6/L5 refinement before ordinary far-fidelity work
+- [x] preserve refined far tiles once generated so repeated 360-degree viewing progressively sharpens the world
+- [ ] verify repeated 360s show no unload/reload holes and settle without hard eviction
+- [ ] verify zoomed far mountains lose the 16b rounded silhouette in viewed directions
+- [ ] profile draw calls after stable 360 residency before adding L7/L8 horizon shells

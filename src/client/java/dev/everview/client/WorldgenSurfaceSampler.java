@@ -100,6 +100,9 @@ public final class WorldgenSurfaceSampler {
     private static final int INITIAL_COVERAGE_CYCLE = 7;
     private static final int EXACT_GEOMETRY_BURST = 2;
     private static final int MAX_PROVISIONAL_EXACT_TILES = 32;
+    private static final int FOCUSED_L5_SAMPLE_SPACING = 4;
+    private static final int FOCUSED_L6_SAMPLE_SPACING = 8;
+    private static final double FAR_FOCUS_DOT_THRESHOLD = 0.20D;
     private static final int APPEARANCE_SERVICE_THRESHOLD = 4;
     private static final int APPEARANCE_COVERAGE_BURST = 4;
     private static final int SHARED_HEIGHT_CACHE_LIMIT = 1_250_000;
@@ -1350,6 +1353,28 @@ public final class WorldgenSurfaceSampler {
                                 targetSpacing = L1_BOOTSTRAP_SPACING;
                             }
                         }
+                    } else if (visibleNow && ring.lodLevel() >= 5) {
+                        double tileCenterX =
+                                tileX * (double) tileSize
+                                        + tileSize * 0.5;
+                        double tileCenterZ =
+                                tileZ * (double) tileSize
+                                        + tileSize * 0.5;
+                        double dx = tileCenterX - centerX;
+                        double dz = tileCenterZ - centerZ;
+                        double distance = Math.hypot(dx, dz);
+                        double facing = distance <= 1.0D
+                                ? 1.0D
+                                : (dx * forwardX + dz * forwardZ)
+                                        / distance;
+
+                        foreground = facing >= FAR_FOCUS_DOT_THRESHOLD;
+
+                        if (foreground) {
+                            targetSpacing = ring.lodLevel() == 5
+                                    ? FOCUSED_L5_SAMPLE_SPACING
+                                    : FOCUSED_L6_SAMPLE_SPACING;
+                        }
                     }
 
                     entries.add(new WantedTile(
@@ -1477,9 +1502,9 @@ public final class WorldgenSurfaceSampler {
         }
 
         if (existing == null) {
-            // M6.9 removes the last visibly coarse emergency tier. L5/L6 are
-            // born at their final 8b/16b density; L2-L4 still get one cheap
-            // 2x bootstrap step before their final target.
+            // Coverage still appears at the stable all-direction ring target.
+            // View-focus refinement is a second pass so turning never waits on
+            // 4b/8b far generation before any terrain can appear.
             int bootstrapMultiplier = ring.lodLevel() >= 5 ? 1 : 2;
             return Math.min(
                     ring.tileSize(),
@@ -1487,9 +1512,10 @@ public final class WorldgenSurfaceSampler {
             );
         }
 
-        if (existing.sampleSpacing() > ring.sampleSpacing()) {
+        int target = wanted.targetSpacing();
+        if (existing.sampleSpacing() > target) {
             return Math.max(
-                    ring.sampleSpacing(),
+                    target,
                     existing.sampleSpacing() / 2
             );
         }
@@ -1764,6 +1790,11 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile firstDetachedFarRefinementCandidate(
             LodTileKey pending
     ) {
+        WantedTile focused = firstFocusedFarRefinement(pending);
+        if (focused != null) {
+            return focused;
+        }
+
         for (int attempt = 0; attempt < 4; attempt++) {
             int level = 3 + (detachedFarRefineLevelStep % 4);
             detachedFarRefineLevelStep =
@@ -1780,7 +1811,7 @@ public final class WorldgenSurfaceSampler {
                 WorldgenSurfaceTile tile = CACHE.get(wanted.key());
                 if (tile != null
                         && tile.sampleSpacing()
-                                > wanted.ring().sampleSpacing()) {
+                                > wanted.targetSpacing()) {
                     return wanted;
                 }
             }
@@ -2102,12 +2133,45 @@ public final class WorldgenSurfaceSampler {
             return intermediate;
         }
 
+        WantedTile focusedFar = firstFocusedFarRefinement(pending);
+        if (focusedFar != null) {
+            return focusedFar;
+        }
+
         WantedTile farRefinement = firstFarFidelityRefinement(pending);
         if (farRefinement != null) {
             return farRefinement;
         }
 
         return firstRefinement(pending, false);
+    }
+
+    private static WantedTile firstFocusedFarRefinement(
+            LodTileKey pending
+    ) {
+        // Sharpen only the distant terrain in the current forward view. Once a
+        // tile reaches this quality it remains cached; repeated 360s therefore
+        // progressively sharpen the world instead of globally quadrupling L6.
+        for (int level = 6; level >= 5; level--) {
+            for (WantedTile wanted : wantedTiles) {
+                if (wanted.key().equals(pending)
+                        || wanted.prefetch()
+                        || !wanted.foreground()
+                        || wanted.ring().lodLevel() != level
+                        || DETACHED_COVERAGE_JOBS.containsKey(wanted.key())) {
+                    continue;
+                }
+
+                WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+                if (tile != null
+                        && tile.sampleSpacing()
+                                > wanted.targetSpacing()) {
+                    return wanted;
+                }
+            }
+        }
+
+        return null;
     }
 
     private static WantedTile firstFarFidelityRefinement(
@@ -2124,7 +2188,7 @@ public final class WorldgenSurfaceSampler {
                 WorldgenSurfaceTile tile = CACHE.get(wanted.key());
                 if (tile != null
                         && tile.sampleSpacing()
-                                > wanted.ring().sampleSpacing()) {
+                                > wanted.targetSpacing()) {
                     return wanted;
                 }
             }
@@ -2233,9 +2297,7 @@ public final class WorldgenSurfaceSampler {
             }
 
             WorldgenSurfaceTile tile = CACHE.get(wanted.key());
-            int desiredSpacing = wanted.ring().lodLevel() == 1
-                    ? wanted.targetSpacing()
-                    : wanted.ring().sampleSpacing();
+            int desiredSpacing = wanted.targetSpacing();
 
             if (tile != null
                     && tile.sampleSpacing() > desiredSpacing) {
@@ -2288,7 +2350,7 @@ public final class WorldgenSurfaceSampler {
         }
         if (existing != null
                 && existing.sampleSpacing()
-                        <= wanted.ring().sampleSpacing()) {
+                        <= wanted.targetSpacing()) {
             return false;
         }
 

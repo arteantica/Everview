@@ -31,8 +31,8 @@ import java.util.Set;
  * fallback-region ownership, so no emergency surface can leak through vanilla.
  */
 public final class EverviewGpuTileCache {
-    private static final int MAX_GPU_TILES = 3_072;
-    private static final int TARGET_GPU_TILES = 2_304;
+    private static final int MAX_GPU_TILES = 4_096;
+    private static final int TARGET_GPU_TILES = 3_840;
     private static final int MAX_UPLOADS_PER_FRAME = 8;
     private static final int PRUNE_RING_MARGIN_BLOCKS = 128;
     private static final int RESIDENCY_NEAR_RADIUS_BLOCKS = 768;
@@ -439,7 +439,6 @@ public final class EverviewGpuTileCache {
             GpuTile resident = TILES.get(key);
 
             if (resident != null
-                    && resident.source() == tile
                     && !resident.vertexBuffer().isClosed()) {
                 residentByLevel
                         .computeIfAbsent(
@@ -634,11 +633,14 @@ public final class EverviewGpuTileCache {
         GpuTile existing = TILES.get(key);
 
         if (existing == null
-                || existing.source() != tile
                 || existing.vertexBuffer().isClosed()) {
             return null;
         }
 
+        // M7.4 deliberately allows a same-key older GPU mesh to remain visible
+        // while the current CPU tile waits for its view-aware replacement
+        // upload. M7.3 treated source-identity mismatch as "not resident",
+        // producing a visible unload/reload flash after a 180/360-degree turn.
         return existing;
     }
 
