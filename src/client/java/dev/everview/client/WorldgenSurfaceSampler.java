@@ -88,9 +88,13 @@ public final class WorldgenSurfaceSampler {
     private static final int MAX_DETACHED_APPEARANCE_JOBS =
             APPEARANCE_WORKERS;
 
-    private static final int CACHE_LIMIT = 6_144;
+    // M9.5 keeps logical tile metadata broad, but raw/compact CPU mesh
+    // residency is bounded independently from the generated-world extent.
+    // Geometry is compacted eagerly after publication; the disk cache remains
+    // the durable backing store.
+    private static final int CACHE_LIMIT = 4_096;
     private static final long MAX_CPU_MESH_BYTES =
-            1_300L * 1024L * 1024L;
+            896L * 1024L * 1024L;
     private static final int NEAR_RING_MAX_LEVEL = 2;
     private static final int EMERGENCY_UNDERLAY_LEVEL = 3;
     private static final int GLOBAL_SAFETY_FLOOR_LEVEL = 6;
@@ -126,6 +130,10 @@ public final class WorldgenSurfaceSampler {
     // through the current view all the way to the outer L1 boundary.
     private static final int L1_EXACT_BAND_BLOCKS = 896;
     private static final int L1_INTERMEDIATE_BAND_BLOCKS = 1_280;
+    // Near quality is a spatial target, not a camera-facing target. Within
+    // this radius every direction requests true 1b L1; view direction only
+    // affects scheduling priority beyond it.
+    private static final int L1_SPATIAL_EXACT_RADIUS_BLOCKS = 1_536;
     private static final double L1_FOCUS_DOT_THRESHOLD = 0.35D;
     private static final int L1_OUTER_RADIUS_BLOCKS = 2_048;
 
@@ -1274,6 +1282,13 @@ public final class WorldgenSurfaceSampler {
                         completed.key(),
                         completed.tile()
                 );
+                // Do not retain a full raw int[] mesh merely because the tile
+                // remains logically wanted. Region uploads can expand the
+                // compact representation on demand while persistent storage
+                // remains the durable source of truth.
+                scheduleMeshCompaction(
+                        List.of(completed.tile())
+                );
             }
 
             if (completed.tile().lodLevel() == 1) {
@@ -1502,29 +1517,44 @@ public final class WorldgenSurfaceSampler {
                                 : (dx * forwardX + dz * forwardZ) / distance;
                         foreground = facing >= L1_FOCUS_DOT_THRESHOLD;
 
-                        if (!visibleNow) {
+                        int spatialExactOuter = Math.min(
+                                ring.outerRadiusBlocks(),
+                                L1_SPATIAL_EXACT_RADIUS_BLOCKS
+                        );
+                        boolean inSpatialExact = tileIntersectsAnnulus(
+                                tileX,
+                                tileZ,
+                                centerX,
+                                centerZ,
+                                ring.innerRadiusBlocks(),
+                                spatialExactOuter,
+                                tileSize
+                        );
+
+                        if (inSpatialExact) {
+                            // M9.5: stationary camera rotation cannot change
+                            // the desired quality of nearby generated terrain.
+                            targetSpacing = L1_EXACT_SPACING;
+                        } else if (!visibleNow) {
                             targetSpacing = L1_BOOTSTRAP_SPACING;
                         } else {
                             int exactOuter = Math.min(
                                     ring.outerRadiusBlocks(),
-                                    ring.innerRadiusBlocks()
-                                            + L1_EXACT_BAND_BLOCKS
+                                    Math.max(
+                                            spatialExactOuter,
+                                            ring.innerRadiusBlocks()
+                                                    + L1_EXACT_BAND_BLOCKS
+                                    )
                             );
                             int intermediateOuter = Math.min(
                                     ring.outerRadiusBlocks(),
-                                    ring.innerRadiusBlocks()
-                                            + L1_INTERMEDIATE_BAND_BLOCKS
+                                    Math.max(
+                                            exactOuter,
+                                            ring.innerRadiusBlocks()
+                                                    + L1_INTERMEDIATE_BAND_BLOCKS
+                                    )
                             );
 
-                            boolean inExactCore = tileIntersectsAnnulus(
-                                    tileX,
-                                    tileZ,
-                                    centerX,
-                                    centerZ,
-                                    ring.innerRadiusBlocks(),
-                                    exactOuter,
-                                    tileSize
-                            );
                             boolean inFocusedExact = foreground
                                     && tileIntersectsAnnulus(
                                             tileX,
@@ -1536,7 +1566,7 @@ public final class WorldgenSurfaceSampler {
                                             tileSize
                                     );
 
-                            if (inExactCore || inFocusedExact) {
+                            if (inFocusedExact) {
                                 targetSpacing = L1_EXACT_SPACING;
                             } else if (tileIntersectsAnnulus(
                                     tileX,

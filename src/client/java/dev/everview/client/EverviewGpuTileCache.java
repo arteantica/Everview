@@ -830,6 +830,162 @@ public final class EverviewGpuTileCache {
         offscreenEvictionsThisFrame = 0;
     }
 
+    /**
+     * M9.5 region batching reuses the exact M9.4 ownership-splitting path.
+     * The returned vertices are relative to the caller's spatial region
+     * origin, so several logical tiles can share one persistent GPU buffer
+     * without changing terrain topology or vanilla/finer ownership metadata.
+     */
+    static PreparedGeometry prepareRegionGeometry(
+            WorldgenSurfaceTile tile,
+            int regionOriginX,
+            int regionOriginZ,
+            int firstIndexBase
+    ) {
+        WorldgenSurfaceTile.Geometry geometry = tile.geometry();
+        int[] vertices = geometry.vertices();
+        int[] colors = geometry.colors();
+
+        Map<BatchKey, List<QuadPiece>> groupedQuads =
+                new LinkedHashMap<>();
+        int emittedQuadCount = 0;
+
+        for (int quadOffset = 0;
+                quadOffset < vertices.length;
+                quadOffset += 12) {
+            int regionSize = switch (tile.lodLevel()) {
+                case 4 -> L4_UNDERLAY_REGION_SIZE;
+                case 5 -> L5_UNDERLAY_REGION_SIZE;
+                case 6 -> L6_UNDERLAY_REGION_SIZE;
+                default -> 0;
+            };
+
+            List<QuadPiece> pieces;
+            if (tile.lodLevel() <= 3) {
+                pieces = splitQuadForOwnership(
+                        vertices,
+                        colors,
+                        quadOffset
+                );
+            } else if (regionSize > 0) {
+                pieces = splitQuadForUnderlayRegion(
+                        vertices,
+                        colors,
+                        quadOffset,
+                        regionSize
+                );
+            } else {
+                pieces = List.of(copyQuad(
+                        vertices,
+                        colors,
+                        quadOffset
+                ));
+            }
+
+            emittedQuadCount += pieces.size();
+
+            for (QuadPiece piece : pieces) {
+                BatchKey key;
+
+                if (tile.lodLevel() <= 2) {
+                    key = classifyBatch(piece.vertices(), 0);
+                } else if (tile.lodLevel() == 3) {
+                    key = classifyUnderlayBatch(
+                            piece.vertices(),
+                            0,
+                            L3_UNDERLAY_REGION_SIZE,
+                            true
+                    );
+                } else if (tile.lodLevel() == 4) {
+                    key = classifyUnderlayBatch(
+                            piece.vertices(),
+                            0,
+                            L4_UNDERLAY_REGION_SIZE,
+                            false
+                    );
+                } else if (tile.lodLevel() == 5) {
+                    key = classifyUnderlayBatch(
+                            piece.vertices(),
+                            0,
+                            L5_UNDERLAY_REGION_SIZE,
+                            false
+                    );
+                } else if (tile.lodLevel() == 6) {
+                    key = classifyUnderlayBatch(
+                            piece.vertices(),
+                            0,
+                            L6_UNDERLAY_REGION_SIZE,
+                            false
+                    );
+                } else {
+                    key = BatchKey.ALWAYS;
+                }
+
+                groupedQuads.computeIfAbsent(
+                        key,
+                        ignored -> new ArrayList<>()
+                ).add(piece);
+            }
+        }
+
+        int[] outVertices = new int[emittedQuadCount * 12];
+        int[] outColors = new int[emittedQuadCount * 4];
+        List<DrawBatch> drawBatches =
+                new ArrayList<>(groupedQuads.size());
+
+        int vertexInt = 0;
+        int vertex = 0;
+        int firstIndex = firstIndexBase;
+
+        for (Map.Entry<BatchKey, List<QuadPiece>> entry
+                : groupedQuads.entrySet()) {
+            BatchKey key = entry.getKey();
+            List<QuadPiece> pieces = entry.getValue();
+
+            for (QuadPiece piece : pieces) {
+                int[] quadVertices = piece.vertices();
+                int[] quadColors = piece.colors();
+
+                for (int v = 0; v < 4; v++) {
+                    int i = v * 3;
+                    outVertices[vertexInt++] =
+                            quadVertices[i] - regionOriginX;
+                    outVertices[vertexInt++] =
+                            quadVertices[i + 1];
+                    outVertices[vertexInt++] =
+                            quadVertices[i + 2] - regionOriginZ;
+                    outColors[vertex++] = quadColors[v];
+                }
+            }
+
+            int indexCount = pieces.size() * 6;
+            drawBatches.add(new DrawBatch(
+                    firstIndex,
+                    indexCount,
+                    key.vanillaSensitive(),
+                    key.surface(),
+                    key.chunkAX(),
+                    key.chunkAZ(),
+                    key.sectionY(),
+                    key.boundary(),
+                    key.chunkBX(),
+                    key.chunkBZ(),
+                    key.underlayRegion(),
+                    key.regionTileX(),
+                    key.regionTileZ()
+            ));
+            firstIndex += indexCount;
+        }
+
+        return new PreparedGeometry(
+                tile,
+                outVertices,
+                outColors,
+                emittedQuadCount * 6,
+                List.copyOf(drawBatches)
+        );
+    }
+
     private static GpuTile upload(WorldgenSurfaceTile tile) {
         VertexFormat format = DefaultVertexFormat.POSITION_COLOR;
         WorldgenSurfaceTile.Geometry geometry = tile.geometry();
@@ -1788,6 +1944,15 @@ public final class EverviewGpuTileCache {
             boolean underlayRegion,
             int regionTileX,
             int regionTileZ
+    ) {
+    }
+
+    static record PreparedGeometry(
+            WorldgenSurfaceTile source,
+            int[] vertices,
+            int[] colors,
+            int indexCount,
+            List<DrawBatch> drawBatches
     ) {
     }
 

@@ -68,7 +68,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSnapshot far
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M9.4 | F8 details");
+        lines.add("Everview M9.5 | F8 details");
 
         if (!far.available()) {
             lines.add("LOD worldgen unavailable");
@@ -113,10 +113,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M9.4 DEV | RESIDENT BUDGET PASS");
+        lines.add("Everview M9.5 DEV | SPATIAL RESIDENCY + REGION MULTIDRAW");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Renderer: 128b L1 | turn-stable safety layers | owned-mask cache | byte budget");
+        lines.add("Renderer: 2x2 region buffers | 360 spatial residency | real multi-draw | artifact-safe masks");
         lines.add("Handoff: 64b overlap | 350ms visible-stability gate | chunk fade forced OFF");
         lines.add("LOD targets: L1 1b | L2 2b | L3 2b | L4 4b | L5 8b | L6 16b");
         lines.add("First-visible: L1 4b -> 1b | L2 4b | L3 4b | L4 8b | L5 8b | L6 16b");
@@ -377,7 +377,8 @@ public final class EverviewDebugHud {
                 ownership.loadedWaitingBatches()
         ));
 
-        EverviewGpuTileCache.Stats gpu = EverviewGpuTileCache.stats();
+        EverviewGpuRegionCache.Stats gpu =
+                EverviewGpuRegionCache.stats();
         Runtime runtime = Runtime.getRuntime();
         double heapUsedMiB = (runtime.totalMemory() - runtime.freeMemory())
                 / (1024.0 * 1024.0);
@@ -390,27 +391,26 @@ public final class EverviewDebugHud {
                 gpu.residentMiB()
         ));
         lines.add(String.format(
-                "GPU tiles: %d | %.2f MiB | upload %d / %.3f ms | prepare %.3f ms",
-                gpu.bufferCount(),
+                "GPU regions: %d | tiles %d | %.2f MiB | rebuild %d (%d tiles) / %.3f ms | prepare %.3f ms",
+                gpu.regionCount(),
+                gpu.tileCount(),
                 gpu.residentMiB(),
-                gpu.uploadsThisFrame(),
+                gpu.regionRebuildsThisFrame(),
+                gpu.tileUploadsThisFrame(),
                 gpu.uploadMs(),
                 gpu.prepareMs()
         ));
         lines.add(String.format(
-                "Residency: wanted %d | suppressed %d | view rebuild %d | hierarchy %d | %s",
+                "Spatial residency: wanted %d | degraded %d | rebuild %d | %s",
                 gpu.residencyWantedTiles(),
-                gpu.suppressedCoarseTiles(),
+                gpu.degradedFineTilesThisFrame(),
                 gpu.residencySelectionRebuildsThisFrame(),
-                gpu.suppressionRebuildsThisFrame(),
                 gpu.residencyComplete() ? "SETTLED" : "STREAMING"
         ));
         lines.add(String.format(
-                "GPU churn: prune %d | stale %d | offscreen %d | hard-evict %d",
-                gpu.coveredPrunedThisFrame(),
-                gpu.staleRemovedThisFrame(),
-                gpu.offscreenEvictionsThisFrame(),
-                gpu.forcedEvictionsThisFrame()
+                "GPU churn: stale-regions %d | hard-evict %d | yaw/pitch eviction OFF",
+                gpu.staleRegionsThisFrame(),
+                gpu.hardEvictionsThisFrame()
         ));
         lines.add("Frame c/s/d: " + metrics.tilesCulled() + "/"
                 + metrics.submissions() + "/" + metrics.tilesDrawn());

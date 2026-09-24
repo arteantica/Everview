@@ -92,7 +92,12 @@ public final class WorldgenSurfaceTile {
         long originalBytes = residentMeshBytes();
         try {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-            Deflater deflater = new Deflater(Deflater.BEST_SPEED);
+            // M9.5 treats the CPU copy as a compact backing representation,
+            // not the primary render representation. A single low-priority
+            // worker pays moderate compression once so large exact meshes do
+            // not consume multiple GiB of Java heap while GPU regions own the
+            // hot render copy.
+            Deflater deflater = new Deflater(Deflater.DEFAULT_COMPRESSION);
             try (DataOutputStream output = new DataOutputStream(
                     new DeflaterOutputStream(bytes, deflater))) {
                 for (int vertex : vertices) {
@@ -106,7 +111,10 @@ public final class WorldgenSurfaceTile {
                 deflater.end();
             }
             byte[] compressed = bytes.toByteArray();
-            if (compressed.length >= originalBytes * 3L / 4L) {
+            // Keep compact storage whenever it produces a meaningful saving.
+            // M9.4 rejected 25-30% savings and therefore retained many large
+            // raw arrays even after persistence.
+            if (compressed.length >= originalBytes * 95L / 100L) {
                 return 0L;
             }
             compressedGeometry = compressed;
