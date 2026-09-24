@@ -40,7 +40,11 @@ public final class EverviewGpuTileCache {
             1_000L * 1024L * 1024L;
     private static final long MAX_GPU_BYTES =
             1_280L * 1024L * 1024L;
-    private static final int MAX_UPLOADS_PER_FRAME = 12;
+    // M9.3 L1/L2 macro tiles are much larger uploads. A small count budget
+    // prevents one burst of freshly generated exact tiles from monopolizing
+    // the render thread, while still clearing the queue far faster than
+    // worldgen can produce 256b tiles.
+    private static final int MAX_UPLOADS_PER_FRAME = 4;
     private static final int PRUNE_RING_MARGIN_BLOCKS = 128;
     // M9.1 separates "what is currently in the frustum" from "what should
     // remain turn-stable". A full 360-degree near belt plus the L3 safety
@@ -536,11 +540,15 @@ public final class EverviewGpuTileCache {
         while (iterator.hasNext()) {
             Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
 
-            if (!covered.contains(entry.getKey())
-                    || RESIDENCY_WANTED.contains(entry.getKey())) {
+            if (!covered.contains(entry.getKey())) {
                 continue;
             }
 
+            // M9.3 lets fully covered L2/L4/L5/L6 leave GPU memory even when
+            // the camera would normally want them resident. L3 is excluded
+            // from the covered set and remains the permanent 360-degree safety
+            // shield. If finer coverage later disappears, suppression is
+            // rebuilt and the coarse tile can be uploaded again from CPU cache.
             removeResident(entry.getValue());
             iterator.remove();
             removed++;
