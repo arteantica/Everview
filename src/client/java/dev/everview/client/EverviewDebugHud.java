@@ -68,7 +68,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSnapshot far
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M6.5 | F8 details");
+        lines.add("Everview M6.6 | F8 details");
 
         if (!far.available()) {
             lines.add("LOD worldgen unavailable");
@@ -113,10 +113,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M6.5 DEV | SATURATED DETAIL PIPELINE");
+        lines.add("Everview M6.6 DEV | MULTI-TILE STREAMING");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Streaming: saturated exact lane | shared cross-LOD heights | progressive far bootstrap");
+        lines.add("Streaming: multi-tile L2-L6 height jobs | saturated L1 exact lane | seam shield");
         lines.add("Handoff: 64b overlap | upload grace | chunk fade forced OFF");
         lines.add("LOD targets: L1 1b | L2 2b | L3 4b | L4 8b | L5 16b | L6 32b");
         lines.add(String.format(
@@ -330,7 +330,11 @@ public final class EverviewDebugHud {
                     + reuse.exactJobsActive()
                     + "/"
                     + WorldgenSurfaceSampler.exactWorkerCount()
-                    + " | coverage "
+                    + " | coverage jobs "
+                    + WorldgenSurfaceSampler.detachedCoverageJobsActive()
+                    + "/"
+                    + WorldgenSurfaceSampler.detachedCoverageJobsMax()
+                    + " | workers "
                     + WorldgenSurfaceSampler.coverageWorkerCount()
                     + (reuse.serverExactFallback()
                             ? " | SERVER FALLBACK"

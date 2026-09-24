@@ -333,3 +333,17 @@
 - [ ] benchmark shared-height hit rate as L3/L6 bootstrap refines
 - [ ] detach multiple L2-L6 tile-height jobs concurrently instead of parallelizing only one coverage tile at a time
 - [ ] move appearance/mesh finishing into its own bounded pipeline after thread-safety validation
+
+
+## M6.6 multi-tile streaming + seam shield
+- [x] detach up to six L2-L6 tile-height jobs concurrently instead of parallelizing only one tile
+- [x] use one coverage worker per detached tile so the pool advances several world regions simultaneously
+- [x] reserve in-flight coverage keys so the normal scheduler does not duplicate detached work
+- [x] promote completed detached height jobs back to the server lane only for biome/material/mesh finishing
+- [x] keep L1 bootstrap/appearance production available while coarse height jobs run independently
+- [x] avoid global height-cache insertion for odd exact-L1 columns that no coarser LOD can reuse
+- [x] require a stable 3x3 vanilla surface neighborhood before retiring LOD near the moving vanilla edge
+- [x] extend fresh-upload overlap grace from 120ms to 250ms
+- [x] invalidate cache with v26 for cold-start comparison
+- [ ] benchmark 30s / 60s / 120s coverage against M6.4 and M6.5
+- [ ] validate no sky slits while moving sideways along the vanilla/LOD boundary

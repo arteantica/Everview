@@ -53,7 +53,8 @@ public final class EverviewRenderer {
     private static final double BASE_TERRAIN_BIAS = 0.35D;
     private static final double RING_LAYER_BIAS = 0.75D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
-    private static final long VANILLA_HANDOFF_GRACE_NANOS = 120_000_000L;
+    private static final long VANILLA_HANDOFF_GRACE_NANOS = 250_000_000L;
+    private static final int VANILLA_EDGE_NEIGHBORHOOD_BLOCKS = 160;
     private static final double VANILLA_OWNERSHIP_MARGIN_BLOCKS = 64.0D;
     private static final double VANILLA_3D_HANDOFF_MARGIN_BLOCKS = 96.0D;
     private static final double MAX_VANILLA_VERTICAL_HANDOFF_BLOCKS = 512.0D;
@@ -733,6 +734,30 @@ public final class EverviewRenderer {
                 visibility
         );
 
+        // A single renderer-visible chunk is not enough to retire the LOD at
+        // the moving vanilla edge. The neighboring chunk can still be absent,
+        // which leaves a thin sky slit between the two presentations. Erode
+        // vanilla ownership by one chunk near the edge: only a locally stable
+        // 3x3 surface neighborhood may remove Everview there.
+        int vanillaRadius =
+                client.options.getEffectiveRenderDistance() * 16;
+        double horizontalDistance = Math.hypot(dx, dz);
+        boolean nearVanillaEdge = horizontalDistance
+                >= Math.max(
+                        0.0D,
+                        vanillaRadius - VANILLA_EDGE_NEIGHBORHOOD_BLOCKS
+                );
+
+        if (visible && nearVanillaEdge) {
+            visible = vanillaNeighborhoodSurfaceReady(
+                    client,
+                    chunkX,
+                    hintSectionY,
+                    chunkZ,
+                    visibility
+            );
+        }
+
         // Keep the LOD under a freshly uploaded vanilla column for a tiny
         // overlap window. Vanilla is already opaque and wins depth, but this
         // prevents a one-frame sky crack while moving across the handoff edge.
@@ -747,6 +772,39 @@ public final class EverviewRenderer {
                 : new ColumnOwnershipResult(false, true);
         columns.put(key, result);
         return result;
+    }
+
+    private static boolean vanillaNeighborhoodSurfaceReady(
+            Minecraft client,
+            int chunkX,
+            int hintSectionY,
+            int chunkZ,
+            Map<SectionKey, Boolean> visibility
+    ) {
+        if (client.level == null) {
+            return false;
+        }
+
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                LevelChunk neighbor = client.level.getChunkSource()
+                        .getChunkNow(chunkX + dx, chunkZ + dz);
+
+                if (neighbor == null
+                        || !vanillaSurfaceColumnVisible(
+                                client,
+                                neighbor,
+                                chunkX + dx,
+                                hintSectionY,
+                                chunkZ + dz,
+                                visibility
+                        )) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
     private static boolean recentlyCompiledColumn(

@@ -68,6 +68,10 @@ public final class WorldgenSurfaceSampler {
             )
     );
     private static final int MAX_DETACHED_EXACT_JOBS = EXACT_HEIGHT_WORKERS;
+    private static final int MAX_DETACHED_COVERAGE_JOBS = Math.max(
+            2,
+            Math.min(6, COVERAGE_HEIGHT_WORKERS)
+    );
 
     private static final int CACHE_LIMIT = 6_144;
     private static final int NEAR_RING_MAX_LEVEL = 2;
@@ -203,6 +207,9 @@ public final class WorldgenSurfaceSampler {
     private static GenerationJob currentJob;
     private static final Map<LodTileKey, CompletableFuture<Void>>
             DETACHED_EXACT_JOBS = new ConcurrentHashMap<>();
+    private static final Map<LodTileKey, GenerationJob>
+            DETACHED_COVERAGE_JOBS = new ConcurrentHashMap<>();
+    private static int detachedCoverageLaunchStep;
 
     private WorldgenSurfaceSampler() {
     }
@@ -217,6 +224,14 @@ public final class WorldgenSurfaceSampler {
 
     public static int exactWorkerCount() {
         return EXACT_HEIGHT_WORKERS;
+    }
+
+    public static int detachedCoverageJobsActive() {
+        return DETACHED_COVERAGE_JOBS.size();
+    }
+
+    public static int detachedCoverageJobsMax() {
+        return MAX_DETACHED_COVERAGE_JOBS;
     }
 
     public static SharedHeightCacheStatus sharedHeightCacheStatus() {
@@ -511,6 +526,29 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
+        // M6.6: L2-L6 no longer wait behind one coverage tile lifecycle.
+        // Each detached job owns one complete tile height request and uses one
+        // worker from the shared coverage pool, allowing several tiles to make
+        // progress at the same time while the server lane keeps producing L1.
+        if (diskLoadReady) {
+            pollDetachedCoverage();
+
+            while (DETACHED_COVERAGE_JOBS.size()
+                    < MAX_DETACHED_COVERAGE_JOBS) {
+                WantedTile coverage =
+                        firstDetachedCoverageCandidate();
+
+                if (coverage == null
+                        || !startDetachedCoverage(
+                                server,
+                                clientLevel.dimension(),
+                                coverage
+                        )) {
+                    break;
+                }
+            }
+        }
+
         if (currentJob != null
                 && activeSliceId == 0L
                 && !containsWantedKey(currentJob.key)) {
@@ -531,8 +569,15 @@ public final class WorldgenSurfaceSampler {
         }
 
         if (currentJob == null && activeSliceId == 0L) {
-            WantedTile next = findNextMissing();
-            if (next != null) {
+            GenerationJob readyCoverage =
+                    takeReadyDetachedCoverage();
+            WantedTile next = readyCoverage == null
+                    ? findNextMissing()
+                    : null;
+
+            if (readyCoverage != null) {
+                currentJob = readyCoverage;
+            } else if (next != null) {
                 WorldgenSurfaceTile existing = CACHE.get(next.key());
 
                 int sampleSpacing = nextGenerationSpacing(next, existing);
@@ -938,6 +983,8 @@ public final class WorldgenSurfaceSampler {
         diskCacheStatus = "OFF";
         cancelCurrentJob();
         cancelDetachedExactJobs();
+        cancelDetachedCoverageJobs();
+        detachedCoverageLaunchStep = 0;
         activeSliceId = 0L;
     }
 
@@ -1557,6 +1604,50 @@ public final class WorldgenSurfaceSampler {
         return null;
     }
 
+    private static boolean isTileMissing(LodTileKey key) {
+        return !CACHE.containsKey(key)
+                && !DETACHED_COVERAGE_JOBS.containsKey(key);
+    }
+
+    private static WantedTile firstDetachedCoverageCandidate() {
+        LodTileKey pending = currentJob == null ? null : currentJob.key;
+
+        // Keep a stable mix of near fallback, L3 shield, L6 horizon and the
+        // progressive middle. Each selected tile is reserved immediately by
+        // DETACHED_COVERAGE_JOBS, so repeated calls naturally walk outward.
+        for (int attempt = 0; attempt < 6; attempt++) {
+            int phase = detachedCoverageLaunchStep % 6;
+            detachedCoverageLaunchStep =
+                    (detachedCoverageLaunchStep + 1) % 6;
+
+            WantedTile candidate = switch (phase) {
+                case 0, 1 -> firstMissingFallbackCoverage(pending);
+                case 2, 3 -> firstMissingEmergencyUnderlayCoverage(pending);
+                case 4 -> firstMissingGlobalSafetyFloorCoverage(pending);
+                default -> firstMissingProgressiveFarCoverage(pending);
+            };
+
+            if (candidate != null
+                    && candidate.ring().lodLevel() >= 2
+                    && candidate.ring().lodLevel() <= 6
+                    && CACHE.get(candidate.key()) == null) {
+                return candidate;
+            }
+        }
+
+        WantedTile fallback = firstMissingCurrentFarCoverage(pending);
+        if (fallback != null && fallback.ring().lodLevel() >= 2) {
+            return fallback;
+        }
+
+        WantedTile l2 = firstMissingFallbackCoverage(pending);
+        if (l2 != null) {
+            return l2;
+        }
+
+        return null;
+    }
+
     private static WantedTile firstMissingProgressiveFarCoverage(
             LodTileKey pending
     ) {
@@ -1570,7 +1661,7 @@ public final class WorldgenSurfaceSampler {
                     continue;
                 }
 
-                if (!CACHE.containsKey(wanted.key())) {
+                if (isTileMissing(wanted.key())) {
                     return wanted;
                 }
             }
@@ -1595,7 +1686,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1628,7 +1719,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1648,7 +1739,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1668,7 +1759,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1689,7 +1780,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1707,7 +1798,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1727,7 +1818,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1743,7 +1834,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1762,7 +1853,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1780,7 +1871,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1798,7 +1889,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1820,7 +1911,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1835,7 +1926,7 @@ public final class WorldgenSurfaceSampler {
             if (wanted.key().equals(pending) || wanted.prefetch()) {
                 continue;
             }
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -1846,7 +1937,7 @@ public final class WorldgenSurfaceSampler {
             if (wanted.key().equals(pending) || !wanted.prefetch()) {
                 continue;
             }
-            if (!CACHE.containsKey(wanted.key())) {
+            if (isTileMissing(wanted.key())) {
                 return wanted;
             }
         }
@@ -2042,6 +2133,137 @@ public final class WorldgenSurfaceSampler {
         }
 
         return null;
+    }
+
+    private static void pollDetachedCoverage() {
+        Iterator<Map.Entry<LodTileKey, GenerationJob>> iterator =
+                DETACHED_COVERAGE_JOBS.entrySet().iterator();
+
+        while (iterator.hasNext()) {
+            Map.Entry<LodTileKey, GenerationJob> entry = iterator.next();
+            GenerationJob job = entry.getValue();
+
+            if (!containsWantedKey(entry.getKey())) {
+                if (job.asyncHeightFuture != null) {
+                    job.asyncHeightFuture.cancel(true);
+                }
+                DETACHED_COVERAGE_JOBS.remove(entry.getKey(), job);
+                staleJobsCancelled++;
+                continue;
+            }
+
+            if (job.failed) {
+                DETACHED_COVERAGE_JOBS.remove(entry.getKey(), job);
+            }
+        }
+    }
+
+    private static boolean startDetachedCoverage(
+            MinecraftServer server,
+            ResourceKey<Level> dimension,
+            WantedTile wanted
+    ) {
+        LodTileKey key = wanted.key();
+        if (wanted.ring().lodLevel() < 2
+                || CACHE.containsKey(key)
+                || DETACHED_COVERAGE_JOBS.containsKey(key)) {
+            return false;
+        }
+
+        WorldgenSurfaceTile existing = CACHE.get(key);
+        int spacing = nextGenerationSpacing(wanted, existing);
+        GenerationJob job = new GenerationJob(
+                key,
+                wanted.ring(),
+                spacing,
+                existing != null,
+                null,
+                false
+        );
+        job.asyncCoverageStarted = true;
+
+        if (DETACHED_COVERAGE_JOBS.putIfAbsent(key, job) != null) {
+            return false;
+        }
+
+        long taskEpoch = epoch;
+        server.execute(() -> {
+            ServerLevel level = server.getLevel(dimension);
+            if (level == null
+                    || taskEpoch != epoch
+                    || DETACHED_COVERAGE_JOBS.get(key) != job) {
+                DETACHED_COVERAGE_JOBS.remove(key, job);
+                return;
+            }
+
+            try {
+                ServerChunkCache chunks = level.getChunkSource();
+                var generator = chunks.getGenerator();
+                var randomState = chunks.randomState();
+
+                int[] sampleIndices = new int[job.totalSamples];
+                for (int i = 0; i < sampleIndices.length; i++) {
+                    sampleIndices[i] = i;
+                }
+
+                job.asyncMissingSampleIndices = sampleIndices;
+                job.asyncStartedNanos = System.nanoTime();
+                job.asyncHeightFuture = submitHeightBatch(
+                        level,
+                        generator,
+                        randomState,
+                        job,
+                        sampleIndices,
+                        COVERAGE_HEIGHT_EXECUTOR,
+                        1
+                );
+            } catch (Throwable throwable) {
+                job.failed = true;
+                EverviewClient.LOGGER.warn(
+                        "Everview detached L{} coverage-height job failed at {}, {}",
+                        job.ring.lodLevel(),
+                        key.tileX(),
+                        key.tileZ(),
+                        throwable
+                );
+            }
+        });
+
+        return true;
+    }
+
+    private static GenerationJob takeReadyDetachedCoverage() {
+        for (Map.Entry<LodTileKey, GenerationJob> entry
+                : DETACHED_COVERAGE_JOBS.entrySet()) {
+            GenerationJob job = entry.getValue();
+            CompletableFuture<HeightBatchResult> future =
+                    job.asyncHeightFuture;
+
+            if (future == null || !future.isDone()) {
+                continue;
+            }
+
+            if (DETACHED_COVERAGE_JOBS.remove(entry.getKey(), job)) {
+                return job;
+            }
+        }
+
+        return null;
+    }
+
+    private static int cancelDetachedCoverageJobs() {
+        int cancelled = 0;
+
+        for (GenerationJob job : DETACHED_COVERAGE_JOBS.values()) {
+            if (job.asyncHeightFuture != null
+                    && !job.asyncHeightFuture.isDone()
+                    && job.asyncHeightFuture.cancel(true)) {
+                cancelled++;
+            }
+        }
+
+        DETACHED_COVERAGE_JOBS.clear();
+        return cancelled;
     }
 
     private static void pollDetachedExact() {
@@ -2413,7 +2635,8 @@ public final class WorldgenSurfaceSampler {
                         generator,
                         randomState,
                         worldX,
-                        worldZ
+                        worldZ,
+                        job.sampleSpacing
                 );
 
                 var biome = level.getNoiseBiome(worldX >> 2, y >> 2, worldZ >> 2);
@@ -2446,7 +2669,8 @@ public final class WorldgenSurfaceSampler {
                         generator,
                         randomState,
                         worldX,
-                        worldZ
+                        worldZ,
+                        job.sampleSpacing
                 );
                     grid.heights[fineIndex] = y;
                     grid.heightSampled[fineIndex] = true;
@@ -3019,14 +3243,19 @@ public final class WorldgenSurfaceSampler {
             net.minecraft.world.level.chunk.ChunkGenerator generator,
             net.minecraft.world.level.levelgen.RandomState randomState,
             int worldX,
-            int worldZ
+            int worldZ,
+            int sampleSpacing
     ) {
+        boolean reusableColumn = sampleSpacing > 1
+                || (((worldX & 1) == 0) && ((worldZ & 1) == 0));
         long key = packWorldColumn(worldX, worldZ);
-        Integer cached = SHARED_HEIGHT_CACHE.get(key);
 
-        if (cached != null) {
-            SHARED_HEIGHT_HITS.incrementAndGet();
-            return cached;
+        if (reusableColumn) {
+            Integer cached = SHARED_HEIGHT_CACHE.get(key);
+            if (cached != null) {
+                SHARED_HEIGHT_HITS.incrementAndGet();
+                return cached;
+            }
         }
 
         int y = generator.getBaseHeight(
@@ -3037,12 +3266,14 @@ public final class WorldgenSurfaceSampler {
                 randomState
         );
         y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
-        SHARED_HEIGHT_MISSES.incrementAndGet();
+        if (reusableColumn) {
+            SHARED_HEIGHT_MISSES.incrementAndGet();
 
-        if (SHARED_HEIGHT_CACHE.size() < SHARED_HEIGHT_CACHE_LIMIT) {
-            Integer raced = SHARED_HEIGHT_CACHE.putIfAbsent(key, y);
-            if (raced != null) {
-                return raced;
+            if (SHARED_HEIGHT_CACHE.size() < SHARED_HEIGHT_CACHE_LIMIT) {
+                Integer raced = SHARED_HEIGHT_CACHE.putIfAbsent(key, y);
+                if (raced != null) {
+                    return raced;
+                }
             }
         }
 
@@ -3091,7 +3322,8 @@ public final class WorldgenSurfaceSampler {
                         generator,
                         randomState,
                         worldX,
-                        worldZ
+                        worldZ,
+                        job.sampleSpacing
                 );
 
             indices[i] = sampleIndex;
@@ -4257,7 +4489,8 @@ public final class WorldgenSurfaceSampler {
                 true,
                 currentJob != null
                         || activeSliceId != 0L
-                        || !DETACHED_EXACT_JOBS.isEmpty(),
+                        || !DETACHED_EXACT_JOBS.isEmpty()
+                        || !DETACHED_COVERAGE_JOBS.isEmpty(),
                 lastGenerationMs,
                 generatedTileCount,
                 adaptiveSliceBudgetNanos / 1_000_000.0,
@@ -4302,7 +4535,7 @@ public final class WorldgenSurfaceSampler {
         private int generatedSamples;
         private int appearanceGeneratedSamples;
         private int provisionalAppearanceSamples;
-        private CompletableFuture<HeightBatchResult> asyncHeightFuture;
+        private volatile CompletableFuture<HeightBatchResult> asyncHeightFuture;
         private int[] asyncMissingSampleIndices = new int[0];
         private long asyncStartedNanos;
         private boolean asyncExactDisabled;
