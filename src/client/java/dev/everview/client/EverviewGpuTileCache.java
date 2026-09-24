@@ -122,14 +122,14 @@ public final class EverviewGpuTileCache {
         );
         int viewYawSector = Math.floorMod(
                 (int) Math.floor(
-                        (camera.getYRot()
+                        (camera.yRot()
                                 + VIEW_YAW_QUANTUM_DEGREES * 0.5F)
                                 / VIEW_YAW_QUANTUM_DEGREES
                 ),
                 Math.max(1, 360 / VIEW_YAW_QUANTUM_DEGREES)
         );
         int viewPitchSector = (int) Math.floor(
-                (camera.getXRot()
+                (camera.xRot()
                         + 90.0F
                         + VIEW_PITCH_QUANTUM_DEGREES * 0.5F)
                         / VIEW_PITCH_QUANTUM_DEGREES
