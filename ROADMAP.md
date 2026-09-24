@@ -374,3 +374,18 @@
 - [x] invalidate cache with v28 for cold-start comparison
 - [ ] verify exact workers remain fed during the first minute instead of falling to 0/4
 - [ ] compare far visual quality at 45-60 seconds against M6.7
+
+
+## M6.9 parallel appearance pipeline
+- [x] move exact-L1 material/color classification and mesh finishing to a dedicated appearance executor
+- [x] snapshot required biome holders on the server thread, then finish palette/mesh work off-thread
+- [x] run up to four exact appearance jobs concurrently so provisional 1b tiles stop pinning exact workers at 0/4
+- [x] remove exact-appearance work from the normal server quality scheduler
+- [x] add shared quart-biome caching to cut repeated getNoiseBiome calls across exact and coarse appearance
+- [x] retain L1 sample grids while detached appearance jobs are active
+- [x] make L5/L6 first-visible terrain final-density 8b/16b so 32b geometry is never deliberately displayed
+- [x] fix HUD provisional-limit display to report the actual 32-tile cap
+- [x] expose appearance-worker and biome-cache telemetry
+- [x] invalidate cache with v29 for cold-start comparison
+- [ ] validate exact workers remain fed while appearance jobs remain active
+- [ ] compare 45-60s far silhouette against M6.8 and watch server tick time during biome snapshots

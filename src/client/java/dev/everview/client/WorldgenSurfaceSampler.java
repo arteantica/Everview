@@ -3,11 +3,13 @@ package dev.everview.client;
 import dev.everview.core.LodTileKey;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.Holder;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.levelgen.Heightmap;
 
 import java.util.ArrayList;
@@ -72,6 +74,15 @@ public final class WorldgenSurfaceSampler {
             2,
             Math.min(8, COVERAGE_HEIGHT_WORKERS)
     );
+    private static final int APPEARANCE_WORKERS = Math.max(
+            2,
+            Math.min(
+                    4,
+                    Runtime.getRuntime().availableProcessors() / 4
+            )
+    );
+    private static final int MAX_DETACHED_APPEARANCE_JOBS =
+            APPEARANCE_WORKERS;
 
     private static final int CACHE_LIMIT = 6_144;
     private static final int NEAR_RING_MAX_LEVEL = 2;
@@ -92,6 +103,7 @@ public final class WorldgenSurfaceSampler {
     private static final int APPEARANCE_SERVICE_THRESHOLD = 4;
     private static final int APPEARANCE_COVERAGE_BURST = 4;
     private static final int SHARED_HEIGHT_CACHE_LIMIT = 1_250_000;
+    private static final int SHARED_BIOME_CACHE_LIMIT = 350_000;
     private static final int L1_PREFETCH_BLOCKS = 64;
     private static final int L2_PREFETCH_BLOCKS = 128;
     private static final int L1_BOOTSTRAP_SPACING = 4;
@@ -115,6 +127,10 @@ public final class WorldgenSurfaceSampler {
             SHARED_HEIGHT_CACHE = new ConcurrentHashMap<>(262_144);
     private static final AtomicLong SHARED_HEIGHT_HITS = new AtomicLong();
     private static final AtomicLong SHARED_HEIGHT_MISSES = new AtomicLong();
+    private static final ConcurrentHashMap<Long, Holder<Biome>>
+            SHARED_BIOME_CACHE = new ConcurrentHashMap<>(65_536);
+    private static final AtomicLong SHARED_BIOME_HITS = new AtomicLong();
+    private static final AtomicLong SHARED_BIOME_MISSES = new AtomicLong();
     private static final ConcurrentLinkedQueue<CompletedTile> COMPLETED =
             new ConcurrentLinkedQueue<>();
     private static final ExecutorService EXACT_HEIGHT_EXECUTOR =
@@ -136,6 +152,18 @@ public final class WorldgenSurfaceSampler {
                         Thread thread = new Thread(
                                 runnable,
                                 "Everview-CoverageHeight"
+                        );
+                        thread.setDaemon(true);
+                        return thread;
+                    }
+            );
+    private static final ExecutorService APPEARANCE_EXECUTOR =
+            Executors.newFixedThreadPool(
+                    APPEARANCE_WORKERS,
+                    runnable -> {
+                        Thread thread = new Thread(
+                                runnable,
+                                "Everview-Appearance"
                         );
                         thread.setDaemon(true);
                         return thread;
@@ -209,6 +237,8 @@ public final class WorldgenSurfaceSampler {
             DETACHED_EXACT_JOBS = new ConcurrentHashMap<>();
     private static final Map<LodTileKey, GenerationJob>
             DETACHED_COVERAGE_JOBS = new ConcurrentHashMap<>();
+    private static final Map<LodTileKey, CompletableFuture<Void>>
+            DETACHED_APPEARANCE_JOBS = new ConcurrentHashMap<>();
     private static int detachedCoverageLaunchStep;
     private static int detachedFarRefineLevelStep;
 
@@ -235,6 +265,18 @@ public final class WorldgenSurfaceSampler {
         return MAX_DETACHED_COVERAGE_JOBS;
     }
 
+    public static int detachedAppearanceJobsActive() {
+        return DETACHED_APPEARANCE_JOBS.size();
+    }
+
+    public static int detachedAppearanceJobsMax() {
+        return MAX_DETACHED_APPEARANCE_JOBS;
+    }
+
+    public static int maxProvisionalExactTiles() {
+        return MAX_PROVISIONAL_EXACT_TILES;
+    }
+
     public static SharedHeightCacheStatus sharedHeightCacheStatus() {
         long hits = SHARED_HEIGHT_HITS.get();
         long misses = SHARED_HEIGHT_MISSES.get();
@@ -245,6 +287,22 @@ public final class WorldgenSurfaceSampler {
 
         return new SharedHeightCacheStatus(
                 SHARED_HEIGHT_CACHE.size(),
+                hits,
+                misses,
+                hitPercent
+        );
+    }
+
+    public static SharedBiomeCacheStatus sharedBiomeCacheStatus() {
+        long hits = SHARED_BIOME_HITS.get();
+        long misses = SHARED_BIOME_MISSES.get();
+        long total = hits + misses;
+        double hitPercent = total == 0L
+                ? 0.0
+                : hits * 100.0 / total;
+
+        return new SharedBiomeCacheStatus(
+                SHARED_BIOME_CACHE.size(),
                 hits,
                 misses,
                 hitPercent
@@ -495,6 +553,28 @@ public final class WorldgenSurfaceSampler {
         }
 
         pollDetachedExact();
+        pollDetachedAppearance();
+
+        if (!highSpeedCoverageMode) {
+            int appearanceLaunches = 0;
+            while (DETACHED_APPEARANCE_JOBS.size()
+                    < MAX_DETACHED_APPEARANCE_JOBS
+                    && appearanceLaunches < 2) {
+                WantedTile appearance =
+                        firstExactAppearanceRefinement(null);
+
+                if (appearance == null
+                        || !startDetachedAppearance(
+                                server,
+                                clientLevel.dimension(),
+                                appearance
+                        )) {
+                    break;
+                }
+
+                appearanceLaunches++;
+            }
+        }
 
         if (highSpeedCoverageMode && !DETACHED_EXACT_JOBS.isEmpty()) {
             staleJobsCancelled += cancelDetachedExactJobs();
@@ -931,6 +1011,9 @@ public final class WorldgenSurfaceSampler {
         SHARED_HEIGHT_CACHE.clear();
         SHARED_HEIGHT_HITS.set(0L);
         SHARED_HEIGHT_MISSES.set(0L);
+        SHARED_BIOME_CACHE.clear();
+        SHARED_BIOME_HITS.set(0L);
+        SHARED_BIOME_MISSES.set(0L);
         COMPLETED.clear();
         activeRings = List.of();
         wantedTiles = List.of();
@@ -987,6 +1070,7 @@ public final class WorldgenSurfaceSampler {
         cancelCurrentJob();
         cancelDetachedExactJobs();
         cancelDetachedCoverageJobs();
+        cancelDetachedAppearanceJobs();
         detachedCoverageLaunchStep = 0;
         detachedFarRefineLevelStep = 0;
         activeSliceId = 0L;
@@ -1393,10 +1477,10 @@ public final class WorldgenSurfaceSampler {
         }
 
         if (existing == null) {
-            // M6.8: first-visible far terrain is now only one refinement step
-            // above its final target. M6.7 used 4x for L4-L6, which made the
-            // horizon appear quickly but still visibly faceted.
-            int bootstrapMultiplier = 2;
+            // M6.9 removes the last visibly coarse emergency tier. L5/L6 are
+            // born at their final 8b/16b density; L2-L4 still get one cheap
+            // 2x bootstrap step before their final target.
+            int bootstrapMultiplier = ring.lodLevel() >= 5 ? 1 : 2;
             return Math.min(
                     ring.tileSize(),
                     ring.sampleSpacing() * bootstrapMultiplier
@@ -1416,33 +1500,9 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        // M6.5 keeps exact L1 geometry workers saturated while guaranteeing
-        // that the server lane continuously pays down exact-appearance debt.
-        // M6.4 could hit the provisional cap with exact workers idle because
-        // coverage returned before appearance work was ever considered.
-        if (!highSpeedCoverageMode) {
-            int provisional = provisionalExactTileCount();
-            WantedTile appearanceDebt = provisional
-                    >= APPEARANCE_SERVICE_THRESHOLD
-                    ? firstExactAppearanceRefinement(pending)
-                    : null;
-
-            if (appearanceDebt != null) {
-                boolean hardDebt =
-                        provisional >= MAX_PROVISIONAL_EXACT_TILES - 4;
-
-                if (hardDebt
-                        || appearanceCoverageStep
-                                >= APPEARANCE_COVERAGE_BURST) {
-                    appearanceCoverageStep = 0;
-                    return appearanceDebt;
-                }
-
-                appearanceCoverageStep++;
-            } else {
-                appearanceCoverageStep = 0;
-            }
-        }
+        // M6.9 exact appearance is detached from the server quality scheduler.
+        // Dedicated appearance workers drain provisional 1b tiles continuously,
+        // leaving this lane free to keep producing near and far geometry.
 
         // -2) Normal startup now builds three layers together:
         // 4 near tiles : 2 L3 shield tiles : 1 global L6 horizon tile.
@@ -1667,6 +1727,7 @@ public final class WorldgenSurfaceSampler {
     ) {
         for (WantedTile wanted : wantedTiles) {
             if (wanted.key().equals(pending)
+                    || DETACHED_APPEARANCE_JOBS.containsKey(wanted.key())
                     || wanted.prefetch()
                     || wanted.ring().lodLevel() != 1
                     || !wanted.foreground()) {
@@ -2028,45 +2089,15 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile selectQualityWork(
             LodTileKey pending
     ) {
-        // M6.2 mirrors mature LOD streaming: visible exact near terrain wins
-        // over far polish. Distant refinement runs after L1 has caught up.
+        // Exact appearance is handled by DETACHED_APPEARANCE_JOBS. The server
+        // quality lane stays focused on geometry and remaining refinement.
         WantedTile exactGeometry = firstExactBandRefinement(pending);
-        WantedTile exactAppearance =
-                firstExactAppearanceRefinement(pending);
-        WantedTile intermediate =
-                firstIntermediateNearRefinement(pending);
-
-        int provisional = provisionalExactTileCount();
-
-        if (provisional >= MAX_PROVISIONAL_EXACT_TILES
-                && exactAppearance != null) {
-            exactGeometryBurstStep = 0;
-            return exactAppearance;
-        }
-
-        if (exactGeometry != null && exactAppearance != null) {
-            if (exactGeometryBurstStep < EXACT_GEOMETRY_BURST) {
-                exactGeometryBurstStep++;
-                return exactGeometry;
-            }
-
-            exactGeometryBurstStep = 0;
-            return exactAppearance;
-        }
-
         if (exactGeometry != null) {
-            exactGeometryBurstStep = Math.min(
-                    EXACT_GEOMETRY_BURST,
-                    exactGeometryBurstStep + 1
-            );
             return exactGeometry;
         }
 
-        if (exactAppearance != null) {
-            exactGeometryBurstStep = 0;
-            return exactAppearance;
-        }
-
+        WantedTile intermediate =
+                firstIntermediateNearRefinement(pending);
         if (intermediate != null) {
             return intermediate;
         }
@@ -2380,6 +2411,249 @@ public final class WorldgenSurfaceSampler {
         }
 
         DETACHED_COVERAGE_JOBS.clear();
+        return cancelled;
+    }
+
+    private static void pollDetachedAppearance() {
+        Iterator<Map.Entry<LodTileKey, CompletableFuture<Void>>> iterator =
+                DETACHED_APPEARANCE_JOBS.entrySet().iterator();
+
+        while (iterator.hasNext()) {
+            Map.Entry<LodTileKey, CompletableFuture<Void>> entry =
+                    iterator.next();
+            CompletableFuture<Void> future = entry.getValue();
+
+            if (!future.isDone()) {
+                continue;
+            }
+
+            try {
+                future.join();
+            } catch (RuntimeException exception) {
+                EverviewClient.LOGGER.warn(
+                        "Everview detached appearance job failed at {}",
+                        entry.getKey(),
+                        exception
+                );
+            }
+
+            DETACHED_APPEARANCE_JOBS.remove(entry.getKey(), future);
+        }
+    }
+
+    private static boolean startDetachedAppearance(
+            MinecraftServer server,
+            ResourceKey<Level> dimension,
+            WantedTile wanted
+    ) {
+        LodTileKey key = wanted.key();
+        if (DETACHED_APPEARANCE_JOBS.containsKey(key)
+                || DETACHED_EXACT_JOBS.containsKey(key)) {
+            return false;
+        }
+
+        WorldgenSurfaceTile existing = CACHE.get(key);
+        L1SampleGrid grid = L1_SAMPLE_CACHE.get(key);
+        if (existing == null
+                || existing.stage() != WorldgenTileStage.EXACT_GEOMETRY
+                || grid == null
+                || !grid.requiresAppearanceRefinement) {
+            return false;
+        }
+
+        CompletableFuture<Void> launcher = new CompletableFuture<>();
+        if (DETACHED_APPEARANCE_JOBS.putIfAbsent(key, launcher) != null) {
+            return false;
+        }
+
+        long taskEpoch = epoch;
+        long started = System.nanoTime();
+
+        server.execute(() -> {
+            ServerLevel level = server.getLevel(dimension);
+            if (level == null
+                    || taskEpoch != epoch
+                    || DETACHED_APPEARANCE_JOBS.get(key) != launcher) {
+                DETACHED_APPEARANCE_JOBS.remove(key, launcher);
+                launcher.complete(null);
+                return;
+            }
+
+            try {
+                GenerationJob job = new GenerationJob(
+                        key,
+                        wanted.ring(),
+                        L1_EXACT_SPACING,
+                        true,
+                        grid,
+                        true
+                );
+
+                @SuppressWarnings("unchecked")
+                Holder<Biome>[] biomes =
+                        (Holder<Biome>[]) new Holder<?>[job.totalSamples];
+
+                for (int sampleIndex = 0;
+                        sampleIndex < job.totalSamples;
+                        sampleIndex++) {
+                    int gx = sampleIndex % job.samplesAcross;
+                    int gz = sampleIndex / job.samplesAcross;
+                    int fineIndex = job.fineGridIndex(gx, gz);
+
+                    if (fineIndex < 0
+                            || !grid.heightSampled[fineIndex]) {
+                        throw new IllegalStateException(
+                                "Exact appearance missing L1 height anchor"
+                        );
+                    }
+
+                    int y = grid.heights[fineIndex];
+                    job.heights[sampleIndex] = y;
+                    job.minY = Math.min(job.minY, y);
+                    job.maxY = Math.max(job.maxY, y);
+                    job.reusedSamples++;
+
+                    if (!grid.appearanceSampled[fineIndex]) {
+                        int worldX = job.originX + gx;
+                        int worldZ = job.originZ + gz;
+                        biomes[sampleIndex] = sampleBiomeCached(
+                                level,
+                                worldX,
+                                y,
+                                worldZ
+                        );
+                    }
+                }
+
+                int seaLevel = level.getSeaLevel();
+                CompletableFuture.runAsync(
+                        () -> finishDetachedAppearance(
+                                job,
+                                biomes,
+                                seaLevel,
+                                taskEpoch,
+                                started
+                        ),
+                        APPEARANCE_EXECUTOR
+                ).whenComplete((ignored, throwable) -> {
+                    if (throwable != null) {
+                        launcher.completeExceptionally(throwable);
+                    } else {
+                        launcher.complete(null);
+                    }
+                });
+            } catch (Throwable throwable) {
+                launcher.completeExceptionally(throwable);
+            }
+        });
+
+        return true;
+    }
+
+    private static void finishDetachedAppearance(
+            GenerationJob job,
+            Holder<Biome>[] biomes,
+            int seaLevel,
+            long taskEpoch,
+            long started
+    ) {
+        if (taskEpoch != epoch
+                || !DETACHED_APPEARANCE_JOBS.containsKey(job.key)) {
+            return;
+        }
+
+        for (int sampleIndex = 0;
+                sampleIndex < job.totalSamples;
+                sampleIndex++) {
+            int gx = sampleIndex % job.samplesAcross;
+            int gz = sampleIndex / job.samplesAcross;
+            int fineIndex = job.fineGridIndex(gx, gz);
+            int worldX = job.originX + gx;
+            int worldZ = job.originZ + gz;
+            int y = job.heights[sampleIndex];
+
+            if (fineIndex >= 0
+                    && job.sampleGrid.appearanceSampled[fineIndex]) {
+                job.sampleColors[sampleIndex] =
+                        job.sampleGrid.colors[fineIndex];
+                job.sampleMaterials[sampleIndex] =
+                        job.sampleGrid.materials[fineIndex];
+                continue;
+            }
+
+            Holder<Biome> biome = biomes[sampleIndex];
+            if (biome == null) {
+                throw new IllegalStateException(
+                        "Exact appearance missing biome snapshot"
+                );
+            }
+
+            var appearance = MinecraftSurfacePalette.sample(
+                    biome,
+                    worldX,
+                    y,
+                    worldZ,
+                    seaLevel
+            );
+
+            job.sampleColors[sampleIndex] = appearance.rgb();
+            job.sampleMaterials[sampleIndex] = appearance.material();
+
+            if (fineIndex >= 0) {
+                job.sampleGrid.colors[fineIndex] = appearance.rgb();
+                job.sampleGrid.materials[fineIndex] =
+                        appearance.material();
+                job.sampleGrid.appearanceSampled[fineIndex] = true;
+            }
+
+            job.appearanceGeneratedSamples++;
+        }
+
+        job.sampleGrid.requiresAppearanceRefinement = false;
+        job.nextSample = job.totalSamples;
+
+        MeshData mesh = buildMesh(job, seaLevel);
+        job.accumulatedNanos = System.nanoTime() - started;
+
+        WorldgenSurfaceTile tile = new WorldgenSurfaceTile(
+                job.ring.lodLevel(),
+                job.key.tileX(),
+                job.key.tileZ(),
+                job.ring.tileSize(),
+                job.sampleSpacing,
+                WorldgenTileStage.EXACT_APPEARANCE,
+                mesh.vertices(),
+                mesh.colors(),
+                mesh.materials(),
+                mesh.quadCount(),
+                job.minY,
+                job.maxY,
+                seaLevel,
+                job.accumulatedNanos
+        );
+
+        COMPLETED.add(new CompletedTile(
+                taskEpoch,
+                job.key,
+                tile,
+                job.reusedSamples,
+                0,
+                job.appearanceGeneratedSamples,
+                0
+        ));
+    }
+
+    private static int cancelDetachedAppearanceJobs() {
+        int cancelled = 0;
+
+        for (CompletableFuture<Void> future
+                : DETACHED_APPEARANCE_JOBS.values()) {
+            if (!future.isDone() && future.cancel(true)) {
+                cancelled++;
+            }
+        }
+
+        DETACHED_APPEARANCE_JOBS.clear();
         return cancelled;
     }
 
@@ -2756,7 +3030,12 @@ public final class WorldgenSurfaceSampler {
                         job.sampleSpacing
                 );
 
-                var biome = level.getNoiseBiome(worldX >> 2, y >> 2, worldZ >> 2);
+                var biome = sampleBiomeCached(
+                                level,
+                                worldX,
+                                y,
+                                worldZ
+                        );
                 var appearance = MinecraftSurfacePalette.sample(
                         biome,
                         worldX,
@@ -2807,7 +3086,12 @@ public final class WorldgenSurfaceSampler {
                         grid.requiresAppearanceRefinement = true;
                         job.provisionalAppearanceSamples++;
                     } else {
-                        var biome = level.getNoiseBiome(worldX >> 2, y >> 2, worldZ >> 2);
+                        var biome = sampleBiomeCached(
+                                level,
+                                worldX,
+                                y,
+                                worldZ
+                        );
                         var appearance = MinecraftSurfacePalette.sample(
                                 biome,
                                 worldX,
@@ -2824,7 +3108,12 @@ public final class WorldgenSurfaceSampler {
                         processed++;
                     }
                 } else {
-                    var biome = level.getNoiseBiome(worldX >> 2, y >> 2, worldZ >> 2);
+                    var biome = sampleBiomeCached(
+                                level,
+                                worldX,
+                                y,
+                                worldZ
+                        );
                     var appearance = MinecraftSurfacePalette.sample(
                             biome,
                             worldX,
@@ -3009,11 +3298,12 @@ public final class WorldgenSurfaceSampler {
             int worldZ = job.originZ + gz * job.sampleSpacing;
             int y = job.heights[sampleIndex];
 
-            var biome = level.getNoiseBiome(
-                    worldX >> 2,
-                    y >> 2,
-                    worldZ >> 2
-            );
+            var biome = sampleBiomeCached(
+                                level,
+                                worldX,
+                                y,
+                                worldZ
+                        );
             var appearance = MinecraftSurfacePalette.sample(
                     biome,
                     worldX,
@@ -3238,11 +3528,12 @@ public final class WorldgenSurfaceSampler {
             }
 
             int y = job.heights[sampleIndex];
-            var biome = level.getNoiseBiome(
-                    worldX >> 2,
-                    y >> 2,
-                    worldZ >> 2
-            );
+            var biome = sampleBiomeCached(
+                                level,
+                                worldX,
+                                y,
+                                worldZ
+                        );
             var appearance = MinecraftSurfacePalette.sample(
                     biome,
                     worldX,
@@ -3375,6 +3666,47 @@ public final class WorldgenSurfaceSampler {
 
             return new HeightBatchResult(indices, heights);
         });
+    }
+
+    private static Holder<Biome> sampleBiomeCached(
+            ServerLevel level,
+            int worldX,
+            int worldY,
+            int worldZ
+    ) {
+        int quartX = worldX >> 2;
+        int quartY = worldY >> 2;
+        int quartZ = worldZ >> 2;
+        long key = packQuartBiome(quartX, quartY, quartZ);
+
+        Holder<Biome> cached = SHARED_BIOME_CACHE.get(key);
+        if (cached != null) {
+            SHARED_BIOME_HITS.incrementAndGet();
+            return cached;
+        }
+
+        Holder<Biome> biome = level.getNoiseBiome(
+                quartX,
+                quartY,
+                quartZ
+        );
+        SHARED_BIOME_MISSES.incrementAndGet();
+
+        if (SHARED_BIOME_CACHE.size() < SHARED_BIOME_CACHE_LIMIT) {
+            Holder<Biome> raced =
+                    SHARED_BIOME_CACHE.putIfAbsent(key, biome);
+            if (raced != null) {
+                return raced;
+            }
+        }
+
+        return biome;
+    }
+
+    private static long packQuartBiome(int x, int y, int z) {
+        return ((long) (x & 0x3FF_FFFF) << 38)
+                | ((long) (z & 0x3FF_FFFF) << 12)
+                | (long) (y & 0xFFF);
     }
 
     private static int sampleHeightCached(
@@ -4567,7 +4899,8 @@ public final class WorldgenSurfaceSampler {
             if (currentJob != null && currentJob.key.equals(entry.getKey())) {
                 continue;
             }
-            if (DETACHED_EXACT_JOBS.containsKey(entry.getKey())) {
+            if (DETACHED_EXACT_JOBS.containsKey(entry.getKey())
+                    || DETACHED_APPEARANCE_JOBS.containsKey(entry.getKey())) {
                 continue;
             }
             if (containsWantedKey(entry.getKey())) {
@@ -4629,7 +4962,8 @@ public final class WorldgenSurfaceSampler {
                 currentJob != null
                         || activeSliceId != 0L
                         || !DETACHED_EXACT_JOBS.isEmpty()
-                        || !DETACHED_COVERAGE_JOBS.isEmpty(),
+                        || !DETACHED_COVERAGE_JOBS.isEmpty()
+                        || !DETACHED_APPEARANCE_JOBS.isEmpty(),
                 lastGenerationMs,
                 generatedTileCount,
                 adaptiveSliceBudgetNanos / 1_000_000.0,
@@ -4966,6 +5300,14 @@ public final class WorldgenSurfaceSampler {
     }
 
     public record SharedHeightCacheStatus(
+            int entries,
+            long hits,
+            long misses,
+            double hitPercent
+    ) {
+    }
+
+    public record SharedBiomeCacheStatus(
             int entries,
             long hits,
             long misses,

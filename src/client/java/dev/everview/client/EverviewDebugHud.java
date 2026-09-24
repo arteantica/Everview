@@ -68,7 +68,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSnapshot far
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M6.8 | F8 details");
+        lines.add("Everview M6.9 | F8 details");
 
         if (!far.available()) {
             lines.add("LOD worldgen unavailable");
@@ -113,13 +113,13 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M6.8 DEV | DENSE BOOTSTRAP + L1 FEED");
+        lines.add("Everview M6.9 DEV | PARALLEL APPEARANCE PIPELINE");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Streaming: 2x L1 bootstrap lanes | concurrent L2-L6 | dense first-visible far | seam shield");
+        lines.add("Streaming: L1 exact + appearance lanes | concurrent L2-L6 | <=16b far bootstrap | seam shield");
         lines.add("Handoff: 64b overlap | upload grace | chunk fade forced OFF");
         lines.add("LOD targets: L1 1b | L2 2b | L3 2b | L4 4b | L5 8b | L6 16b");
-        lines.add("First-visible: L1 4b | L2 4b | L3 4b | L4 8b | L5 16b | L6 32b");
+        lines.add("First-visible: L1 4b | L2 4b | L3 4b | L4 8b | L5 8b | L6 16b");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
@@ -324,7 +324,7 @@ public final class EverviewDebugHud {
                     reuse.appearanceReadyTiles(),
                     reuse.appearanceDesiredTiles(),
                     reuse.provisionalExactTiles(),
-                    8,
+                    WorldgenSurfaceSampler.maxProvisionalExactTiles(),
                     reuse.totalAppearanceGeneratedSamples()
             ));
             lines.add("Height workers: exact "
@@ -349,6 +349,16 @@ public final class EverviewDebugHud {
                     shared.hits(),
                     shared.misses(),
                     shared.hitPercent()
+            ));
+
+            WorldgenSurfaceSampler.SharedBiomeCacheStatus biomes =
+                    WorldgenSurfaceSampler.sharedBiomeCacheStatus();
+            lines.add(String.format(
+                    "Appearance jobs: %d/%d | biome cache %,d | %.1f%% reuse",
+                    WorldgenSurfaceSampler.detachedAppearanceJobsActive(),
+                    WorldgenSurfaceSampler.detachedAppearanceJobsMax(),
+                    biomes.entries(),
+                    biomes.hitPercent()
             ));
         } else {
             lines.add("Far WORLDGEN: unavailable (singleplayer test path)");
