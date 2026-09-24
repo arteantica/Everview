@@ -18,11 +18,17 @@ import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
 import org.joml.Vector3fc;
+import org.lwjgl.PointerBuffer;
+import org.lwjgl.system.MemoryStack;
 
+import java.nio.IntBuffer;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.BitSet;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -78,7 +84,7 @@ public final class EverviewRenderer {
     private static final Map<ChunkKey, VanillaHandoffState>
             VANILLA_HANDOFF_STATES = new HashMap<>();
     private static ClientLevel compileHintLevel;
-    private static final Map<EverviewGpuTileCache.GpuTile, FinerMask>
+    private static final Map<EverviewGpuRegionCache.GpuTile, FinerMask>
             FINER_MASK_CACHE = new IdentityHashMap<>();
     private static long maskResidencyRevision = Long.MIN_VALUE;
     private static long maskRingSignature = Long.MIN_VALUE;
@@ -104,7 +110,7 @@ public final class EverviewRenderer {
             WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
             if (!snapshot.tiles().isEmpty()) {
                 Camera camera = client.gameRenderer.mainCamera();
-                EverviewGpuTileCache.prepareFrame(
+                EverviewGpuRegionCache.prepareFrame(
                         client.level,
                         snapshot,
                         camera
@@ -143,7 +149,7 @@ public final class EverviewRenderer {
         double cameraY = cameraPos.y();
         double cameraZ = cameraPos.z();
         var frustum = camera.getCullFrustum();
-        long residencyRevision = EverviewGpuTileCache.residencyRevision();
+        long residencyRevision = EverviewGpuRegionCache.residencyRevision();
         long ringSignature = 1L;
         for (int level = 1; level <= 6; level++) {
             WorldgenLodRing ring = snapshot.ringForLevel(level);
@@ -193,7 +199,7 @@ public final class EverviewRenderer {
                 client.options.getEffectiveRenderDistance() * 16.0D;
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
-            if (EverviewGpuTileCache.getResident(tile) == null) {
+            if (EverviewGpuRegionCache.getResident(tile) == null) {
                 continue;
             }
 
@@ -236,8 +242,8 @@ public final class EverviewRenderer {
                 continue;
             }
 
-            EverviewGpuTileCache.GpuTile gpuTile =
-                    EverviewGpuTileCache.getResident(tile);
+            EverviewGpuRegionCache.GpuTile gpuTile =
+                    EverviewGpuRegionCache.getResident(tile);
             if (gpuTile == null) {
                 continue;
             }
@@ -980,7 +986,7 @@ public final class EverviewRenderer {
     }
 
     private static FinerMask classifyFinerCoverage(
-            EverviewGpuTileCache.GpuTile gpuTile,
+            EverviewGpuRegionCache.GpuTile gpuTile,
             int lodLevel,
             WorldgenLodRing l1Ring,
             WorldgenLodRing l2Ring,
@@ -1125,7 +1131,7 @@ public final class EverviewRenderer {
     }
 
     private static boolean hasCoveredL2Batch(
-            EverviewGpuTileCache.GpuTile gpuTile,
+            EverviewGpuRegionCache.GpuTile gpuTile,
             WorldgenLodRing l1Ring,
             Set<Long> residentL1Tiles,
             double cameraX,
@@ -1208,7 +1214,7 @@ public final class EverviewRenderer {
     }
 
     private static boolean hasCoveredByL3Region(
-            EverviewGpuTileCache.GpuTile gpuTile,
+            EverviewGpuRegionCache.GpuTile gpuTile,
             int coarseLevel,
             WorldgenLodRing l3Ring,
             Set<Long> residentL3Tiles,
@@ -1279,7 +1285,7 @@ public final class EverviewRenderer {
     }
 
     private static boolean hasCoveredUnderlayRegion(
-            EverviewGpuTileCache.GpuTile gpuTile,
+            EverviewGpuRegionCache.GpuTile gpuTile,
             WorldgenLodRing finerRing,
             Set<Long> residentFinerTiles,
             double cameraX,
