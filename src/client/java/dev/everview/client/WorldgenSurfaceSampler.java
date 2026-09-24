@@ -3849,7 +3849,7 @@ public final class WorldgenSurfaceSampler {
 
             for (int i = 0; i < futures.size(); i++) {
                 parts[i] = futures.get(i).join();
-                total += parts[i].sampleIndices().length;
+                total += parts[i].heights().length;
             }
 
             int[] indices = new int[total];
@@ -3857,14 +3857,11 @@ public final class WorldgenSurfaceSampler {
             int offset = 0;
 
             for (HeightPart part : parts) {
-                int count = part.sampleIndices().length;
-                System.arraycopy(
-                        part.sampleIndices(),
-                        0,
-                        indices,
-                        offset,
-                        count
-                );
+                int count = part.heights().length;
+                for (int i = 0; i < count; i++) {
+                    indices[offset + i] =
+                            sampleIndices[part.startOffset() + i];
+                }
                 System.arraycopy(
                         part.heights(),
                         0,
@@ -3977,13 +3974,12 @@ public final class WorldgenSurfaceSampler {
             int end
     ) {
         int count = Math.max(0, end - start);
-        int[] indices = new int[count];
         int[] heights = new int[count];
 
         for (int i = 0; i < count; i++) {
             if (Thread.currentThread().isInterrupted()) {
                 return new HeightPart(
-                        Arrays.copyOf(indices, i),
+                        start,
                         Arrays.copyOf(heights, i)
                 );
             }
@@ -3999,20 +3995,17 @@ public final class WorldgenSurfaceSampler {
             int worldX = job.originX + gx * job.sampleSpacing;
             int worldZ = job.originZ + gz * job.sampleSpacing;
 
-            int y = sampleHeightCached(
-                        level,
-                        generator,
-                        randomState,
-                        worldX,
-                        worldZ,
-                        job.sampleSpacing
-                );
-
-            indices[i] = sampleIndex;
-            heights[i] = y;
+            heights[i] = sampleHeightCached(
+                    level,
+                    generator,
+                    randomState,
+                    worldX,
+                    worldZ,
+                    job.sampleSpacing
+            );
         }
 
-        return new HeightPart(indices, heights);
+        return new HeightPart(start, heights);
     }
 
     private static MeshData buildMesh(GenerationJob job, int seaLevel) {
@@ -5390,7 +5383,7 @@ public final class WorldgenSurfaceSampler {
     }
 
     private record HeightPart(
-            int[] sampleIndices,
+            int startOffset,
             int[] heights
     ) {
     }
@@ -5399,38 +5392,6 @@ public final class WorldgenSurfaceSampler {
             int[] sampleIndices,
             int[] heights
     ) {
-        private static HeightBatchResult combine(
-                HeightPart first,
-                HeightPart second
-        ) {
-            int firstCount = first.sampleIndices().length;
-            int secondCount = second.sampleIndices().length;
-            int[] indices = Arrays.copyOf(
-                    first.sampleIndices(),
-                    firstCount + secondCount
-            );
-            int[] heights = Arrays.copyOf(
-                    first.heights(),
-                    firstCount + secondCount
-            );
-
-            System.arraycopy(
-                    second.sampleIndices(),
-                    0,
-                    indices,
-                    firstCount,
-                    secondCount
-            );
-            System.arraycopy(
-                    second.heights(),
-                    0,
-                    heights,
-                    firstCount,
-                    secondCount
-            );
-
-            return new HeightBatchResult(indices, heights);
-        }
     }
 
     private record MeshData(
