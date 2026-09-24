@@ -40,11 +40,7 @@ public final class EverviewGpuTileCache {
             1_000L * 1024L * 1024L;
     private static final long MAX_GPU_BYTES =
             1_280L * 1024L * 1024L;
-    // M9.3 L1/L2 macro tiles are much larger uploads. A small count budget
-    // prevents one burst of freshly generated exact tiles from monopolizing
-    // the render thread, while still clearing the queue far faster than
-    // worldgen can produce 256b tiles.
-    private static final int MAX_UPLOADS_PER_FRAME = 4;
+    private static final int MAX_UPLOADS_PER_FRAME = 12;
     private static final int PRUNE_RING_MARGIN_BLOCKS = 128;
     // M9.1 separates "what is currently in the frustum" from "what should
     // remain turn-stable". A full 360-degree near belt plus the L3 safety
