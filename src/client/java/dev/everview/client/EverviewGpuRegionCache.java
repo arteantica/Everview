@@ -51,7 +51,7 @@ public final class EverviewGpuRegionCache {
     private static final int POSITION_REBUILD_QUANTUM_BLOCKS = 64;
     private static final int RESIDENCY_HYSTERESIS_BLOCKS = 256;
     private static final int MOVEMENT_GUARD_BLOCKS = 384;
-    private static final int L1_SPATIAL_QUALITY_RADIUS_BLOCKS = 1_536;
+    private static final int L1_SPATIAL_QUALITY_RADIUS_BLOCKS = 2_048;
     private static final int L1_MIN_PROTECTED_RADIUS_BLOCKS = 768;
 
     private static final int MAX_REGION_REBUILDS_PER_FRAME = 2;
@@ -138,8 +138,6 @@ public final class EverviewGpuRegionCache {
         Map<RegionKey, DesiredRegion> desiredRegions =
                 buildDesiredRegions(snapshot);
 
-        removeUndesiredRegions(desiredRegions.keySet());
-
         List<DesiredRegion> dirty = new ArrayList<>();
         for (DesiredRegion desired : desiredRegions.values()) {
             GpuRegion existing = REGIONS.get(desired.key());
@@ -173,6 +171,16 @@ public final class EverviewGpuRegionCache {
             uploadBudget = Math.max(0L, uploadBudget - replacement.bytes());
 
             replaceRegion(replacement);
+        }
+
+        // Never retire the previous spatial representation before its
+        // replacement is actually resident. This is the region-level handoff
+        // equivalent of the vanilla/LOD overlap rule: fine arrives first,
+        // then stale fallback leaves. It prevents movement or a refinement
+        // publication from exposing a transient hole.
+        boolean wantedResident = allWantedSourcesResident(snapshot);
+        if (wantedResident) {
+            removeUndesiredRegions(desiredRegions.keySet());
         }
 
         trimHardLimit(cameraX, cameraZ);
@@ -638,9 +646,17 @@ public final class EverviewGpuRegionCache {
         List<GpuRegion> farthest =
                 new ArrayList<>(REGIONS.values());
         farthest.sort(Comparator
-                .comparingDouble((GpuRegion region) ->
-                        region.distanceTo(cameraX, cameraZ))
-                .reversed());
+                .comparingInt((GpuRegion region) ->
+                        regionContainsWantedTile(region) ? 1 : 0)
+                .thenComparing(
+                        Comparator.comparingDouble(
+                                (GpuRegion region) ->
+                                        region.distanceTo(
+                                                cameraX,
+                                                cameraZ
+                                        )
+                        ).reversed()
+                ));
 
         for (GpuRegion region : farthest) {
             if (residentBytes <= MAX_GPU_BYTES
@@ -676,6 +692,17 @@ public final class EverviewGpuRegionCache {
         if (residentBytes < 0L) {
             residentBytes = 0L;
         }
+    }
+
+    private static boolean regionContainsWantedTile(
+            GpuRegion region
+    ) {
+        for (GpuTile tile : region.tileViews()) {
+            if (RESIDENCY_WANTED.contains(keyOf(tile.source()))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean allWantedSourcesResident(
