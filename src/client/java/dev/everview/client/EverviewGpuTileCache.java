@@ -42,8 +42,15 @@ public final class EverviewGpuTileCache {
             1_280L * 1024L * 1024L;
     private static final int MAX_UPLOADS_PER_FRAME = 12;
     private static final int PRUNE_RING_MARGIN_BLOCKS = 128;
-    private static final int RESIDENCY_NEAR_RADIUS_BLOCKS = 768;
-    private static final double RESIDENCY_FRUSTUM_MARGIN_BLOCKS = 192.0D;
+    // M9.1 separates "what is currently in the frustum" from "what should
+    // remain turn-stable". A full 360-degree near belt plus the L3 safety
+    // surface stays resident so a 180/360 turn never reveals empty sky while
+    // view-specific L1/L2 uploads catch up.
+    private static final int RESIDENCY_NEAR_RADIUS_BLOCKS = 1_024;
+    private static final int TURN_STABLE_L3_RADIUS_BLOCKS = 2_304;
+    private static final long VIEW_RESIDENCY_HOLD_NANOS =
+            15_000_000_000L;
+    private static final double RESIDENCY_FRUSTUM_MARGIN_BLOCKS = 256.0D;
     private static final int VIEW_YAW_QUANTUM_DEGREES = 12;
     private static final int VIEW_PITCH_QUANTUM_DEGREES = 10;
     private static final int L3_UNDERLAY_REGION_SIZE = 128;
@@ -75,6 +82,8 @@ public final class EverviewGpuTileCache {
             new HashSet<>();
     private static final Set<LodTileKey> SUPPRESSED_COARSE =
             new HashSet<>();
+    private static final Map<LodTileKey, Long> LAST_VIEW_WANTED_NANOS =
+            new HashMap<>();
     private static WorldgenSurfaceSnapshot lastSnapshotReference;
     private static long lastSnapshotFingerprint = Long.MIN_VALUE;
     private static int lastPruneCellX = Integer.MIN_VALUE;
@@ -272,8 +281,15 @@ public final class EverviewGpuTileCache {
         double cameraX = cameraPos.x();
         double cameraZ = cameraPos.z();
         var frustum = camera.getCullFrustum();
+        long now = System.nanoTime();
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+            LodTileKey key = new LodTileKey(
+                    tile.lodLevel(),
+                    tile.tileX(),
+                    tile.tileZ()
+            );
+
             double nearestX = Math.max(
                     tile.minX(),
                     Math.min(cameraX, tile.maxX())
@@ -287,12 +303,12 @@ public final class EverviewGpuTileCache {
                     nearestZ - cameraZ
             );
 
-            if (nearest <= RESIDENCY_NEAR_RADIUS_BLOCKS) {
-                RESIDENCY_WANTED.add(new LodTileKey(
-                        tile.lodLevel(),
-                        tile.tileX(),
-                        tile.tileZ()
-                ));
+            // Keep the immediate LOD world resident independent of camera yaw.
+            // L3 is deliberately the permanent 360-degree safety surface.
+            if (nearest <= RESIDENCY_NEAR_RADIUS_BLOCKS
+                    || (tile.lodLevel() == 3
+                            && nearest <= TURN_STABLE_L3_RADIUS_BLOCKS)) {
+                RESIDENCY_WANTED.add(key);
                 continue;
             }
 
@@ -310,13 +326,31 @@ public final class EverviewGpuTileCache {
             );
 
             if (frustum.isVisible(bounds)) {
-                RESIDENCY_WANTED.add(new LodTileKey(
-                        tile.lodLevel(),
-                        tile.tileX(),
-                        tile.tileZ()
-                ));
+                RESIDENCY_WANTED.add(key);
+
+                // L1/L2 that were actually visible remain sticky for a while.
+                // Turning away and straight back therefore reuses the existing
+                // GPU mesh instead of visibly re-uploading it.
+                if (tile.lodLevel() <= 2) {
+                    LAST_VIEW_WANTED_NANOS.put(key, now);
+                }
+                continue;
+            }
+
+            Long lastWanted = LAST_VIEW_WANTED_NANOS.get(key);
+            if (tile.lodLevel() <= 2
+                    && lastWanted != null
+                    && now - lastWanted <= VIEW_RESIDENCY_HOLD_NANOS) {
+                RESIDENCY_WANTED.add(key);
             }
         }
+
+        LAST_VIEW_WANTED_NANOS.entrySet().removeIf(entry ->
+                !ACTIVE_KEYS.contains(entry.getKey())
+                        || now - entry.getValue()
+                                > VIEW_RESIDENCY_HOLD_NANOS
+                                        * 2L
+        );
     }
 
     private static int trimOffscreenToTarget() {
@@ -685,6 +719,7 @@ public final class EverviewGpuTileCache {
         ACTIVE_KEYS.clear();
         RESIDENCY_WANTED.clear();
         SUPPRESSED_COARSE.clear();
+        LAST_VIEW_WANTED_NANOS.clear();
         lastSnapshotReference = null;
         lastSnapshotFingerprint = Long.MIN_VALUE;
         lastPruneCellX = Integer.MIN_VALUE;
