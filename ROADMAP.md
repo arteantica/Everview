@@ -416,3 +416,15 @@
 - [ ] verify settled 100% coverage reaches uploads 0 / prune 0 for stationary camera
 - [ ] compare FPS against M6.9 and M7.0 at the same 95-100% coverage viewpoint
 - [ ] once settled rendering is stable, extend horizon with an outer L7/L8 shell instead of increasing L6 workload
+
+
+## M7.2 cached residency analysis
+- [x] identify M7.1's per-frame full snapshot + hierarchical coverage analysis as an unmeasured render-thread cost
+- [x] cache active GPU keys and coarse suppression state across render frames
+- [x] fingerprint snapshot tile identities only when the sampler publishes a new snapshot object
+- [x] rebuild hierarchical suppression only when tile content changes, camera crosses a 128b prune cell, or GPU residency changes
+- [x] remove the second same-frame full hierarchy scan after uploads; defer it one frame through a dirty flag
+- [x] add a true settled fast path that skips the entire upload walk once all unsuppressed buffers are resident
+- [x] expose total GPU prepare-frame CPU time separately from geometry submission CPU
+- [ ] verify stationary 100% coverage reaches prepare <0.5ms, uploads 0, rebuild 0
+- [ ] compare FPS against M6.9/M7.0/M7.1 before any horizon expansion

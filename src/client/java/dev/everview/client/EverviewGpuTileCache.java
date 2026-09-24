@@ -47,7 +47,19 @@ public final class EverviewGpuTileCache {
     private static int staleRemovedThisFrame;
     private static int coveredPrunedThisFrame;
     private static int forcedEvictionsThisFrame;
+    private static int suppressionRebuildsThisFrame;
+    private static long prepareNanosThisFrame;
     private static long residentBytes;
+
+    private static final Set<LodTileKey> ACTIVE_KEYS = new HashSet<>();
+    private static final Set<LodTileKey> SUPPRESSED_COARSE =
+            new HashSet<>();
+    private static WorldgenSurfaceSnapshot lastSnapshotReference;
+    private static long lastSnapshotFingerprint = Long.MIN_VALUE;
+    private static int lastPruneCellX = Integer.MIN_VALUE;
+    private static int lastPruneCellZ = Integer.MIN_VALUE;
+    private static boolean suppressionDirty = true;
+    private static boolean residencyComplete;
 
     private EverviewGpuTileCache() {
     }
@@ -63,6 +75,8 @@ public final class EverviewGpuTileCache {
             double cameraX,
             double cameraZ
     ) {
+        long prepareStarted = System.nanoTime();
+
         if (level != lastLevel) {
             clear();
             lastLevel = level;
@@ -74,103 +88,169 @@ public final class EverviewGpuTileCache {
         staleRemovedThisFrame = 0;
         coveredPrunedThisFrame = 0;
         forcedEvictionsThisFrame = 0;
+        suppressionRebuildsThisFrame = 0;
 
-        Map<LodTileKey, WorldgenSurfaceTile> active = new HashMap<>(
-                Math.max(16, snapshot.tiles().size() * 2)
+        int pruneCellX = Math.floorDiv(
+                (int) Math.floor(cameraX),
+                PRUNE_RING_MARGIN_BLOCKS
         );
-        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
-            active.put(
-                    new LodTileKey(
-                            tile.lodLevel(),
-                            tile.tileX(),
-                            tile.tileZ()
-                    ),
-                    tile
-            );
+        int pruneCellZ = Math.floorDiv(
+                (int) Math.floor(cameraZ),
+                PRUNE_RING_MARGIN_BLOCKS
+        );
+
+        boolean newSnapshotObject = snapshot != lastSnapshotReference;
+        if (newSnapshotObject) {
+            long fingerprint = snapshotFingerprint(snapshot);
+
+            if (fingerprint != lastSnapshotFingerprint) {
+                rebuildActiveKeys(snapshot);
+                removeStaleResidents();
+                lastSnapshotFingerprint = fingerprint;
+                suppressionDirty = true;
+                residencyComplete = false;
+            }
+
+            lastSnapshotReference = snapshot;
         }
 
-        // Old camera-area tiles used to sit in the access-order cache until the
-        // 3072-tile cap happened to evict them. At high coverage that meant the
-        // cache permanently uploaded eight tiles, evicted eight tiles, then did
-        // the same work again next frame. Remove tiles that are no longer part
-        // of the current wanted snapshot immediately.
-        Iterator<Map.Entry<LodTileKey, GpuTile>> staleIterator =
+        if (pruneCellX != lastPruneCellX
+                || pruneCellZ != lastPruneCellZ) {
+            lastPruneCellX = pruneCellX;
+            lastPruneCellZ = pruneCellZ;
+            suppressionDirty = true;
+            residencyComplete = false;
+        }
+
+        if (suppressionDirty) {
+            SUPPRESSED_COARSE.clear();
+            SUPPRESSED_COARSE.addAll(findCoveredCoarseKeys(
+                    snapshot,
+                    cameraX,
+                    cameraZ
+            ));
+            coveredPrunedThisFrame += pruneCoveredCoarse(
+                    SUPPRESSED_COARSE
+            );
+            suppressionDirty = false;
+            suppressionRebuildsThisFrame++;
+            residencyComplete = false;
+        }
+
+        // The settled fast path is intentionally boring: no snapshot change,
+        // no camera prune-cell change, and every unsuppressed tile already has
+        // the correct GPU buffer. M7.1 still walked ~3600 tiles and performed
+        // the full hierarchical coverage analysis every render frame.
+        if (!residencyComplete) {
+            boolean sawMissing = false;
+
+            for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+                LodTileKey key = new LodTileKey(
+                        tile.lodLevel(),
+                        tile.tileX(),
+                        tile.tileZ()
+                );
+
+                if (SUPPRESSED_COARSE.contains(key)) {
+                    continue;
+                }
+
+                GpuTile existing = TILES.get(key);
+                if (existing != null
+                        && existing.source() == tile
+                        && !existing.vertexBuffer().isClosed()) {
+                    continue;
+                }
+
+                sawMissing = true;
+                if (uploadsRemaining <= 0) {
+                    break;
+                }
+
+                long started = System.nanoTime();
+                GpuTile uploaded = upload(tile);
+                uploadNanosThisFrame += System.nanoTime() - started;
+                uploadsThisFrame++;
+                uploadsRemaining--;
+
+                if (existing != null) {
+                    removeResident(existing);
+                }
+
+                TILES.put(key, uploaded);
+                residentBytes += uploaded.bytes();
+            }
+
+            // A new finer upload can make coarse residency redundant. Do not
+            // re-run the expensive coverage walk in the same frame; mark it
+            // dirty once and resolve it on the next frame.
+            if (uploadsThisFrame > 0
+                    || staleRemovedThisFrame > 0) {
+                suppressionDirty = true;
+            }
+
+            residencyComplete = !sawMissing;
+        }
+
+        trim();
+
+        if (forcedEvictionsThisFrame > 0) {
+            suppressionDirty = true;
+            residencyComplete = false;
+        }
+
+        prepareNanosThisFrame = System.nanoTime() - prepareStarted;
+    }
+
+    private static long snapshotFingerprint(
+            WorldgenSurfaceSnapshot snapshot
+    ) {
+        long hash = 0xcbf29ce484222325L;
+
+        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+            hash ^= tile.lodLevel();
+            hash *= 0x100000001b3L;
+            hash ^= tile.tileX();
+            hash *= 0x100000001b3L;
+            hash ^= tile.tileZ();
+            hash *= 0x100000001b3L;
+            hash ^= System.identityHashCode(tile);
+            hash *= 0x100000001b3L;
+        }
+
+        hash ^= snapshot.tiles().size();
+        hash *= 0x100000001b3L;
+        return hash;
+    }
+
+    private static void rebuildActiveKeys(
+            WorldgenSurfaceSnapshot snapshot
+    ) {
+        ACTIVE_KEYS.clear();
+
+        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+            ACTIVE_KEYS.add(new LodTileKey(
+                    tile.lodLevel(),
+                    tile.tileX(),
+                    tile.tileZ()
+            ));
+        }
+    }
+
+    private static void removeStaleResidents() {
+        Iterator<Map.Entry<LodTileKey, GpuTile>> iterator =
                 TILES.entrySet().iterator();
-        while (staleIterator.hasNext()) {
-            Map.Entry<LodTileKey, GpuTile> entry = staleIterator.next();
-            if (active.containsKey(entry.getKey())) {
+
+        while (iterator.hasNext()) {
+            Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
+            if (ACTIVE_KEYS.contains(entry.getKey())) {
                 continue;
             }
 
             removeResident(entry.getValue());
-            staleIterator.remove();
+            iterator.remove();
             staleRemovedThisFrame++;
         }
-
-        // M7.1: compute the set of coarse tiles that are completely replaced
-        // by stable finer residency BEFORE the upload loop. M7.0 pruned these
-        // buffers and then immediately saw them missing from TILES and uploaded
-        // the same coarse buffers again in the very same frame. At settled
-        // coverage that became an 8-upload / 8-prune ping-pong every frame.
-        Set<LodTileKey> suppressedCoarse = findCoveredCoarseKeys(
-                snapshot,
-                cameraX,
-                cameraZ
-        );
-        coveredPrunedThisFrame += pruneCoveredCoarse(
-                suppressedCoarse
-        );
-
-        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
-            if (uploadsRemaining <= 0) {
-                break;
-            }
-
-            LodTileKey key = new LodTileKey(
-                    tile.lodLevel(),
-                    tile.tileX(),
-                    tile.tileZ()
-            );
-
-            if (suppressedCoarse.contains(key)) {
-                continue;
-            }
-
-            GpuTile existing = TILES.get(key);
-
-            if (existing != null
-                    && existing.source() == tile
-                    && !existing.vertexBuffer().isClosed()) {
-                continue;
-            }
-
-            long started = System.nanoTime();
-            GpuTile uploaded = upload(tile);
-            uploadNanosThisFrame += System.nanoTime() - started;
-            uploadsThisFrame++;
-            uploadsRemaining--;
-
-            if (existing != null) {
-                removeResident(existing);
-            }
-
-            TILES.put(key, uploaded);
-            residentBytes += uploaded.bytes();
-        }
-
-        // Finer buffers uploaded above can make additional coarse buffers
-        // redundant. Prune those once; next frame findCoveredCoarseKeys() will
-        // keep them suppressed instead of re-uploading them.
-        Set<LodTileKey> newlySuppressed = findCoveredCoarseKeys(
-                snapshot,
-                cameraX,
-                cameraZ
-        );
-        coveredPrunedThisFrame += pruneCoveredCoarse(
-                newlySuppressed
-        );
-
-        trim();
     }
 
     private static Set<LodTileKey> findCoveredCoarseKeys(
@@ -398,9 +478,13 @@ public final class EverviewGpuTileCache {
                 residentBytes,
                 uploadsThisFrame,
                 uploadNanosThisFrame / 1_000_000.0,
+                prepareNanosThisFrame / 1_000_000.0,
                 staleRemovedThisFrame,
                 coveredPrunedThisFrame,
-                forcedEvictionsThisFrame
+                forcedEvictionsThisFrame,
+                suppressionRebuildsThisFrame,
+                SUPPRESSED_COARSE.size(),
+                residencyComplete
         );
     }
 
@@ -410,10 +494,20 @@ public final class EverviewGpuTileCache {
         }
 
         TILES.clear();
+        ACTIVE_KEYS.clear();
+        SUPPRESSED_COARSE.clear();
+        lastSnapshotReference = null;
+        lastSnapshotFingerprint = Long.MIN_VALUE;
+        lastPruneCellX = Integer.MIN_VALUE;
+        lastPruneCellZ = Integer.MIN_VALUE;
+        suppressionDirty = true;
+        residencyComplete = false;
         residentBytes = 0L;
         uploadsRemaining = 0;
         uploadsThisFrame = 0;
         uploadNanosThisFrame = 0L;
+        prepareNanosThisFrame = 0L;
+        suppressionRebuildsThisFrame = 0;
     }
 
     private static void trim() {
@@ -1354,9 +1448,13 @@ public final class EverviewGpuTileCache {
             long residentBytes,
             int uploadsThisFrame,
             double uploadMs,
+            double prepareMs,
             int staleRemovedThisFrame,
             int coveredPrunedThisFrame,
-            int forcedEvictionsThisFrame
+            int forcedEvictionsThisFrame,
+            int suppressionRebuildsThisFrame,
+            int suppressedCoarseTiles,
+            boolean residencyComplete
     ) {
         public double residentMiB() {
             return residentBytes / (1024.0 * 1024.0);
