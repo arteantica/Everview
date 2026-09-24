@@ -16,10 +16,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -85,6 +88,8 @@ public final class WorldgenSurfaceSampler {
             APPEARANCE_WORKERS;
 
     private static final int CACHE_LIMIT = 6_144;
+    private static final long MAX_CPU_MESH_BYTES =
+            1_300L * 1024L * 1024L;
     private static final int NEAR_RING_MAX_LEVEL = 2;
     private static final int EMERGENCY_UNDERLAY_LEVEL = 3;
     private static final int GLOBAL_SAFETY_FLOOR_LEVEL = 6;
@@ -134,6 +139,10 @@ public final class WorldgenSurfaceSampler {
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
+    // Account for the size at insertion, even if a worker compacts a tile
+    // between a cache replacement and the compaction completion notification.
+    private static final Map<WorldgenSurfaceTile, Long> ACCOUNTED_MESH_BYTES =
+            new IdentityHashMap<>();
     private static long cacheResidentBytes;
     private static final Map<LodTileKey, L1SampleGrid> L1_SAMPLE_CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
@@ -147,6 +156,15 @@ public final class WorldgenSurfaceSampler {
     private static final AtomicLong SHARED_BIOME_MISSES = new AtomicLong();
     private static final ConcurrentLinkedQueue<CompletedTile> COMPLETED =
             new ConcurrentLinkedQueue<>();
+    private static final ConcurrentLinkedQueue<CompactedTile>
+            COMPLETED_COMPACTIONS = new ConcurrentLinkedQueue<>();
+    private static final ExecutorService MESH_COMPACTION_EXECUTOR =
+            Executors.newSingleThreadExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "Everview-MeshCompaction");
+                thread.setDaemon(true);
+                thread.setPriority(Thread.MIN_PRIORITY);
+                return thread;
+            });
     private static final ExecutorService EXACT_HEIGHT_EXECUTOR =
             Executors.newFixedThreadPool(
                     EXACT_HEIGHT_WORKERS,
@@ -236,7 +254,7 @@ public final class WorldgenSurfaceSampler {
     private static long totalRefineGeneratedSamples;
     private static long totalAppearanceGeneratedSamples;
 
-    private static long epoch;
+    private static volatile long epoch;
     private static long nextSliceId;
     private static double lastGenerationMs;
     private static int generatedTileCount;
@@ -249,6 +267,7 @@ public final class WorldgenSurfaceSampler {
 
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
+    private static Set<LodTileKey> wantedKeys = Set.of();
     private static GenerationJob currentJob;
     private static final Map<LodTileKey, CompletableFuture<Void>>
             DETACHED_EXACT_JOBS = new ConcurrentHashMap<>();
@@ -538,6 +557,7 @@ public final class WorldgenSurfaceSampler {
         }
 
         pollDiskIo();
+        drainCompletedCompactions();
         updateAdaptiveBudget(client, server);
         drainCompleted();
 
@@ -616,6 +636,11 @@ public final class WorldgenSurfaceSampler {
                     forwardX,
                     forwardZ
             );
+            Set<LodTileKey> keys = new HashSet<>(wantedTiles.size());
+            for (WantedTile wanted : wantedTiles) {
+                keys.add(wanted.key());
+            }
+            wantedKeys = keys;
 
             if (initialFillStartedNanos == 0L && !wantedTiles.isEmpty()) {
                 initialFillStartedNanos = System.nanoTime();
@@ -905,6 +930,7 @@ public final class WorldgenSurfaceSampler {
                 diskCacheStatus = result.status();
                 diskLoadReady = true;
                 trimCache();
+                scheduleMeshCompaction(result.tiles());
             } catch (RuntimeException exception) {
                 diskCacheStatus = "LOAD_ERROR";
                 diskLoadReady = true;
@@ -921,6 +947,10 @@ public final class WorldgenSurfaceSampler {
                 diskSaveMs = result.elapsedMs();
                 diskFileMiB = result.bytes() / (1024.0 * 1024.0);
                 diskCacheStatus = result.status();
+
+                if ("SAVED".equals(result.status())) {
+                    scheduleMeshCompaction(diskSaveBatch);
+                }
 
                 if (!"SAVED".equals(result.status())
                         && !"IDLE".equals(result.status())) {
@@ -1152,6 +1182,7 @@ public final class WorldgenSurfaceSampler {
         scheduleDetachedSaveIfDirty();
         epoch++;
         CACHE.clear();
+        ACCOUNTED_MESH_BYTES.clear();
         cacheResidentBytes = 0L;
         L1_SAMPLE_CACHE.clear();
         SHARED_HEIGHT_CACHE.clear();
@@ -1161,8 +1192,10 @@ public final class WorldgenSurfaceSampler {
         SHARED_BIOME_HITS.set(0L);
         SHARED_BIOME_MISSES.set(0L);
         COMPLETED.clear();
+        COMPLETED_COMPACTIONS.clear();
         activeRings = List.of();
         wantedTiles = List.of();
+        wantedKeys = Set.of();
         lastClientLevel = null;
         lastServer = null;
         lastAnchorX = Integer.MIN_VALUE;
@@ -1628,12 +1661,7 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static boolean containsWantedKey(LodTileKey key) {
-        for (WantedTile wanted : wantedTiles) {
-            if (wanted.key().equals(key)) {
-                return true;
-            }
-        }
-        return false;
+        return wantedKeys.contains(key);
     }
 
     private static int nextGenerationSpacing(
@@ -5090,28 +5118,75 @@ public final class WorldgenSurfaceSampler {
     ) {
         WorldgenSurfaceTile previous = CACHE.put(key, tile);
         if (previous != null) {
-            cacheResidentBytes -= estimatedTileBytes(previous);
+            cacheResidentBytes -= ACCOUNTED_MESH_BYTES.remove(previous);
         }
-        cacheResidentBytes += estimatedTileBytes(tile);
+        long bytes = estimatedTileBytes(tile);
+        ACCOUNTED_MESH_BYTES.put(tile, bytes);
+        cacheResidentBytes += bytes;
     }
 
     private static long estimatedTileBytes(WorldgenSurfaceTile tile) {
-        return (long) tile.vertices().length * Integer.BYTES
-                + (long) tile.colors().length * Integer.BYTES
-                + tile.materials().length;
+        return tile.residentMeshBytes();
+    }
+
+    private static void scheduleMeshCompaction(List<WorldgenSurfaceTile> tiles) {
+        if (tiles.isEmpty()) {
+            return;
+        }
+        long scheduledEpoch = epoch;
+        MESH_COMPACTION_EXECUTOR.execute(() -> {
+            for (WorldgenSurfaceTile tile : tiles) {
+                if (scheduledEpoch != epoch) {
+                    return;
+                }
+                try {
+                    long saved = tile.compactGeometry();
+                    if (saved > 0L) {
+                        COMPLETED_COMPACTIONS.add(new CompactedTile(
+                                scheduledEpoch,
+                                new LodTileKey(tile.lodLevel(),
+                                        tile.tileX(), tile.tileZ()),
+                                tile, saved
+                        ));
+                    }
+                } catch (RuntimeException exception) {
+                    EverviewClient.LOGGER.warn(
+                            "Everview could not compact a saved LOD tile",
+                            exception
+                    );
+                }
+            }
+        });
+    }
+
+    private static void drainCompletedCompactions() {
+        CompactedTile compacted;
+        while ((compacted = COMPLETED_COMPACTIONS.poll()) != null) {
+            if (compacted.epoch() == epoch
+                    && CACHE.get(compacted.key()) == compacted.tile()) {
+                long currentBytes = estimatedTileBytes(compacted.tile());
+                Long previousBytes = ACCOUNTED_MESH_BYTES.put(
+                        compacted.tile(), currentBytes);
+                if (previousBytes != null) {
+                    cacheResidentBytes += currentBytes - previousBytes;
+                }
+            }
+        }
     }
 
     private static void trimCache() {
         Iterator<Map.Entry<LodTileKey, WorldgenSurfaceTile>> iterator =
                 CACHE.entrySet().iterator();
 
-        while (CACHE.size() > CACHE_LIMIT && iterator.hasNext()) {
+        while ((CACHE.size() > CACHE_LIMIT
+                        || cacheResidentBytes > MAX_CPU_MESH_BYTES)
+                && iterator.hasNext()) {
             Map.Entry<LodTileKey, WorldgenSurfaceTile> entry =
                     iterator.next();
             if (containsWantedKey(entry.getKey())) {
                 continue;
             }
-            cacheResidentBytes -= estimatedTileBytes(entry.getValue());
+            cacheResidentBytes -= ACCOUNTED_MESH_BYTES.remove(entry.getValue());
             iterator.remove();
         }
 
@@ -5560,6 +5635,14 @@ public final class WorldgenSurfaceSampler {
             int generatedSamples,
             int appearanceGeneratedSamples,
             int provisionalAppearanceSamples
+    ) {
+    }
+
+    private record CompactedTile(
+            long epoch,
+            LodTileKey key,
+            WorldgenSurfaceTile tile,
+            long savedBytes
     ) {
     }
 }

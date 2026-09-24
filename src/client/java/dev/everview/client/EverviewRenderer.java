@@ -21,6 +21,8 @@ import org.joml.Vector3fc;
 
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.BitSet;
+import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Set;
 
@@ -76,6 +78,12 @@ public final class EverviewRenderer {
     private static final Map<ChunkKey, VanillaHandoffState>
             VANILLA_HANDOFF_STATES = new HashMap<>();
     private static ClientLevel compileHintLevel;
+    private static final Map<EverviewGpuTileCache.GpuTile, FinerMask>
+            FINER_MASK_CACHE = new IdentityHashMap<>();
+    private static long maskResidencyRevision = Long.MIN_VALUE;
+    private static long maskRingSignature = Long.MIN_VALUE;
+    private static double maskCameraX = Double.NaN;
+    private static double maskCameraZ = Double.NaN;
 
     private EverviewRenderer() {
     }
@@ -116,6 +124,7 @@ public final class EverviewRenderer {
         if (client.level != compileHintLevel) {
             RECENTLY_COMPILED_SECTIONS.clear();
             VANILLA_HANDOFF_STATES.clear();
+            FINER_MASK_CACHE.clear();
             compileHintLevel = client.level;
         }
         pruneCompileHints();
@@ -134,6 +143,27 @@ public final class EverviewRenderer {
         double cameraY = cameraPos.y();
         double cameraZ = cameraPos.z();
         var frustum = camera.getCullFrustum();
+        long residencyRevision = EverviewGpuTileCache.residencyRevision();
+        long ringSignature = 1L;
+        for (int level = 1; level <= 6; level++) {
+            WorldgenLodRing ring = snapshot.ringForLevel(level);
+            if (ring != null) {
+                ringSignature = ringSignature * 31L
+                        + ring.innerRadiusBlocks();
+                ringSignature = ringSignature * 31L
+                        + ring.outerRadiusBlocks();
+                ringSignature = ringSignature * 31L + ring.tileSize();
+            }
+        }
+        if (maskResidencyRevision != residencyRevision
+                || maskRingSignature != ringSignature
+                || maskCameraX != cameraX || maskCameraZ != cameraZ) {
+            FINER_MASK_CACHE.clear();
+            maskResidencyRevision = residencyRevision;
+            maskRingSignature = ringSignature;
+            maskCameraX = cameraX;
+            maskCameraZ = cameraZ;
+        }
 
         renderPass.setPipeline(
                 RenderSystem.getCompiledPipeline(EverviewGpuPipeline.TERRAIN)
@@ -213,40 +243,6 @@ public final class EverviewRenderer {
             }
 
             long started = System.nanoTime();
-            GpuBuffer indexBuffer =
-                    quadIndices.getBuffer(gpuTile.indexCount());
-
-            Matrix4f modelView = RenderSystem.getModelViewMatrixCopy();
-            double verticalBias = BASE_TERRAIN_BIAS
-                    + Math.max(0, tile.lodLevel() - 1)
-                    * RING_LAYER_BIAS;
-            modelView.translate(
-                    (float) (tile.minX() - cameraX),
-                    (float) (-cameraY - verticalBias),
-                    (float) (tile.minZ() - cameraZ)
-            );
-
-            GpuBufferSlice dynamicTransforms =
-                    RenderSystem.getDynamicUniforms().writeTransform(
-                            modelView,
-                            COLOR_MODULATOR,
-                            MODEL_OFFSET,
-                            TEXTURE_MATRIX
-                    );
-
-            renderPass.setVertexBuffer(
-                    0,
-                    gpuTile.vertexBuffer().slice()
-            );
-            renderPass.setIndexBuffer(
-                    indexBuffer,
-                    quadIndices.type()
-            );
-            renderPass.setUniform(
-                    "DynamicTransforms",
-                    dynamicTransforms
-            );
-
             boolean vanillaOwnership = tile.lodLevel() <= 3
                     && tileIntersectsVanillaOwnershipArea(
                             tile,
@@ -255,7 +251,10 @@ public final class EverviewRenderer {
                             vanillaRadius
                     );
 
-            FinerCoverage finerCoverage = classifyFinerCoverage(
+            FinerMask finerMask = tile.lodLevel() == 1
+                    || !mayIntersectFinerRing(tile, snapshot, cameraX, cameraZ)
+                    ? FinerMask.NONE : FINER_MASK_CACHE.computeIfAbsent(
+                    gpuTile, ignored -> classifyFinerCoverage(
                     gpuTile,
                     tile.lodLevel(),
                     l1Ring,
@@ -270,12 +269,35 @@ public final class EverviewRenderer {
                     residentL5Tiles,
                     cameraX,
                     cameraZ
-            );
+            ));
+            FinerCoverage finerCoverage = finerMask.coverage();
 
             if (finerCoverage == FinerCoverage.FULL) {
                 finerOwnedBatches += gpuTile.drawBatches().size();
                 continue;
             }
+
+            // M9.3.1 combined this optimization with shared index state and
+            // a reused mutable transform; those changes corrupted rendering.
+            // Keep M9.2's independent index binding and immutable per-draw
+            // transform, but do the work only for tiles that can actually draw.
+            GpuBuffer indexBuffer =
+                    quadIndices.getBuffer(gpuTile.indexCount());
+            Matrix4f modelView = RenderSystem.getModelViewMatrixCopy();
+            double verticalBias = BASE_TERRAIN_BIAS
+                    + Math.max(0, tile.lodLevel() - 1) * RING_LAYER_BIAS;
+            modelView.translate(
+                    (float) (tile.minX() - cameraX),
+                    (float) (-cameraY - verticalBias),
+                    (float) (tile.minZ() - cameraZ)
+            );
+            GpuBufferSlice dynamicTransforms =
+                    RenderSystem.getDynamicUniforms().writeTransform(
+                            modelView, COLOR_MODULATOR, MODEL_OFFSET, TEXTURE_MATRIX
+                    );
+            renderPass.setVertexBuffer(0, gpuTile.vertexBuffer().slice());
+            renderPass.setIndexBuffer(indexBuffer, quadIndices.type());
+            renderPass.setUniform("DynamicTransforms", dynamicTransforms);
 
             boolean drewAny = false;
             int drawnQuads = 0;
@@ -298,24 +320,10 @@ public final class EverviewRenderer {
                 int rangeIndexCount = 0;
                 boolean rangeTouchesVanillaHandoff = false;
 
+                int batchIndex = 0;
                 for (EverviewGpuTileCache.DrawBatch batch
                         : gpuTile.drawBatches()) {
-                    boolean ownedByFinerLod = finerOwnsBatch(
-                            batch,
-                            tile.lodLevel(),
-                            l1Ring,
-                            l2Ring,
-                            l3Ring,
-                            l4Ring,
-                            l5Ring,
-                            residentL1Tiles,
-                            residentL2Tiles,
-                            residentL3Tiles,
-                            residentL4Tiles,
-                            residentL5Tiles,
-                            cameraX,
-                            cameraZ
-                    );
+                    boolean ownedByFinerLod = finerMask.owns(batchIndex++);
 
                     ColumnOwnershipResult vanillaResult =
                             vanillaOwnership && batch.vanillaSensitive()
@@ -950,7 +958,28 @@ public final class EverviewRenderer {
     ) {
     }
 
-    private static FinerCoverage classifyFinerCoverage(
+    private static boolean mayIntersectFinerRing(
+            WorldgenSurfaceTile tile,
+            WorldgenSurfaceSnapshot snapshot,
+            double cameraX,
+            double cameraZ
+    ) {
+        WorldgenLodRing adjacent = snapshot.ringForLevel(tile.lodLevel() - 1);
+        WorldgenLodRing shield = tile.lodLevel() >= 4
+                ? snapshot.ringForLevel(3) : null;
+        double outer = Math.max(
+                adjacent == null ? 0 : adjacent.outerRadiusBlocks(),
+                shield == null ? 0 : shield.outerRadiusBlocks()
+        );
+        double nearestX = Math.max(tile.minX(), Math.min(cameraX, tile.maxX()));
+        double nearestZ = Math.max(tile.minZ(), Math.min(cameraZ, tile.maxZ()));
+        // Conservative rejection only. Ownership at an annulus edge is still
+        // decided by the existing chunk/region rules below.
+        return Math.hypot(nearestX - cameraX, nearestZ - cameraZ)
+                <= outer + tile.tileSize();
+    }
+
+    private static FinerMask classifyFinerCoverage(
             EverviewGpuTileCache.GpuTile gpuTile,
             int lodLevel,
             WorldgenLodRing l1Ring,
@@ -968,6 +997,8 @@ public final class EverviewRenderer {
     ) {
         boolean anyOwned = false;
         boolean anyVisible = false;
+        BitSet finerOwned = null;
+        int batchIndex = 0;
 
         for (EverviewGpuTileCache.DrawBatch batch
                 : gpuTile.drawBatches()) {
@@ -990,17 +1021,22 @@ public final class EverviewRenderer {
 
             anyOwned |= owned;
             anyVisible |= !owned;
-
-            if (anyOwned && anyVisible) {
-                return FinerCoverage.PARTIAL;
+            if (owned) {
+                if (finerOwned == null) {
+                    finerOwned = new BitSet(gpuTile.drawBatches().size());
+                }
+                finerOwned.set(batchIndex);
             }
+            batchIndex++;
         }
 
         if (anyOwned && !anyVisible) {
-            return FinerCoverage.FULL;
+            return FinerMask.FULL;
         }
 
-        return FinerCoverage.NONE;
+        return anyOwned
+                ? new FinerMask(FinerCoverage.PARTIAL, finerOwned)
+                : FinerMask.NONE;
     }
 
     private static boolean finerOwnsBatch(
@@ -1075,6 +1111,17 @@ public final class EverviewRenderer {
         NONE,
         PARTIAL,
         FULL
+    }
+
+    private record FinerMask(FinerCoverage coverage, BitSet ownedBatches) {
+        private static final FinerMask NONE =
+                new FinerMask(FinerCoverage.NONE, null);
+        private static final FinerMask FULL =
+                new FinerMask(FinerCoverage.FULL, null);
+
+        private boolean owns(int index) {
+            return ownedBatches != null && ownedBatches.get(index);
+        }
     }
 
     private static boolean hasCoveredL2Batch(

@@ -378,19 +378,20 @@ public final class WorldgenDiskCache {
         output.writeInt(tile.maxY());
         output.writeInt(tile.seaLevel());
 
-        int[] vertices = tile.vertices();
+        WorldgenSurfaceTile.Geometry geometry = tile.geometry();
+        int[] vertices = geometry.vertices();
         output.writeInt(vertices.length);
         for (int vertex : vertices) {
             output.writeInt(vertex);
         }
 
-        int[] colors = tile.colors();
+        int[] colors = geometry.colors();
         output.writeInt(colors.length);
         for (int color : colors) {
             output.writeInt(color);
         }
 
-        byte[] materials = tile.materials();
+        byte[] materials = geometry.materials();
         output.writeInt(materials.length);
         output.write(materials);
     }
