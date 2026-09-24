@@ -360,3 +360,17 @@
 - [ ] compare 45s screenshot against M6.6 for L5 population and far silhouette quality
 - [ ] benchmark settled far refinement cost before increasing density again
 - [ ] begin actual block-atlas/UV surface rendering once this geometry ladder is acceptable
+
+
+## M6.8 dense bootstrap + L1 feed
+- [x] reduce L4-L6 first-visible bootstrap from 4x target to 2x target
+- [x] make first-visible far spacing L3 4b / L4 8b / L5 16b / L6 32b
+- [x] expand detached tile concurrency to all eight coverage workers when available
+- [x] reserve two of eight detached producer phases for visible foreground L1 bootstrap
+- [x] generate L1 bootstrap heights off-thread instead of waiting entirely on the server lane
+- [x] publish detached L1 height and appearance anchors into the fine sample grid so exact workers can immediately refine them
+- [x] prioritize ready L1 bootstrap jobs when returning detached work to the server finishing lane
+- [x] preserve one phase for live far refinement plus one phase each for L2-L6 coverage
+- [x] invalidate cache with v28 for cold-start comparison
+- [ ] verify exact workers remain fed during the first minute instead of falling to 0/4
+- [ ] compare far visual quality at 45-60 seconds against M6.7

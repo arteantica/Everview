@@ -70,7 +70,7 @@ public final class WorldgenSurfaceSampler {
     private static final int MAX_DETACHED_EXACT_JOBS = EXACT_HEIGHT_WORKERS;
     private static final int MAX_DETACHED_COVERAGE_JOBS = Math.max(
             2,
-            Math.min(6, COVERAGE_HEIGHT_WORKERS)
+            Math.min(8, COVERAGE_HEIGHT_WORKERS)
     );
 
     private static final int CACHE_LIMIT = 6_144;
@@ -1393,8 +1393,10 @@ public final class WorldgenSurfaceSampler {
         }
 
         if (existing == null) {
-            int bootstrapMultiplier =
-                    ring.lodLevel() >= 4 ? 4 : 2;
+            // M6.8: first-visible far terrain is now only one refinement step
+            // above its final target. M6.7 used 4x for L4-L6, which made the
+            // horizon appear quickly but still visibly faceted.
+            int bootstrapMultiplier = 2;
             return Math.min(
                     ring.tileSize(),
                     ring.sampleSpacing() * bootstrapMultiplier
@@ -1616,28 +1618,35 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile firstDetachedCoverageCandidate() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        // M6.7 gives every distance band a live lane from the beginning:
-        // L2, L3, L4, L5, L6, then one refinement slot. M6.6 could complete
-        // L4 while L5 stayed at zero, leaving a very obvious coarse far band.
-        for (int attempt = 0; attempt < 6; attempt++) {
-            int phase = detachedCoverageLaunchStep % 6;
+        // M6.8 uses eight independent producer phases:
+        // L1, L1, L2, L3, L4, L5, L6, far refinement.
+        // Two slots are reserved for L1 bootstrap because exact workers cannot
+        // do anything until a 4b L1 tile exists with appearance anchors.
+        for (int attempt = 0; attempt < 8; attempt++) {
+            int phase = detachedCoverageLaunchStep % 8;
             detachedCoverageLaunchStep =
-                    (detachedCoverageLaunchStep + 1) % 6;
+                    (detachedCoverageLaunchStep + 1) % 8;
 
             WantedTile candidate = switch (phase) {
-                case 0 -> firstMissingLevelCoverage(pending, 2);
-                case 1 -> firstMissingLevelCoverage(pending, 3);
-                case 2 -> firstMissingLevelCoverage(pending, 4);
-                case 3 -> firstMissingLevelCoverage(pending, 5);
-                case 4 -> firstMissingLevelCoverage(pending, 6);
+                case 0, 1 -> firstMissingL1BootstrapCoverage(pending);
+                case 2 -> firstMissingLevelCoverage(pending, 2);
+                case 3 -> firstMissingLevelCoverage(pending, 3);
+                case 4 -> firstMissingLevelCoverage(pending, 4);
+                case 5 -> firstMissingLevelCoverage(pending, 5);
+                case 6 -> firstMissingLevelCoverage(pending, 6);
                 default -> firstDetachedFarRefinementCandidate(pending);
             };
 
             if (candidate != null
-                    && candidate.ring().lodLevel() >= 2
+                    && candidate.ring().lodLevel() >= 1
                     && candidate.ring().lodLevel() <= 6) {
                 return candidate;
             }
+        }
+
+        WantedTile l1 = firstMissingL1BootstrapCoverage(pending);
+        if (l1 != null) {
+            return l1;
         }
 
         WantedTile fallback = firstMissingCurrentFarCoverage(pending);
@@ -1651,6 +1660,25 @@ public final class WorldgenSurfaceSampler {
         }
 
         return firstMissingFallbackCoverage(pending);
+    }
+
+    private static WantedTile firstMissingL1BootstrapCoverage(
+            LodTileKey pending
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || wanted.prefetch()
+                    || wanted.ring().lodLevel() != 1
+                    || !wanted.foreground()) {
+                continue;
+            }
+
+            if (isTileMissing(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
     }
 
     private static WantedTile firstMissingLevelCoverage(
@@ -2216,12 +2244,17 @@ public final class WorldgenSurfaceSampler {
             WantedTile wanted
     ) {
         LodTileKey key = wanted.key();
-        if (wanted.ring().lodLevel() < 2
+        if (wanted.ring().lodLevel() < 1
                 || DETACHED_COVERAGE_JOBS.containsKey(key)) {
             return false;
         }
 
         WorldgenSurfaceTile existing = CACHE.get(key);
+        if (wanted.ring().lodLevel() == 1 && existing != null) {
+            // Detached L1 lane is bootstrap-only. Exact refinement belongs to
+            // the dedicated exact worker pool once this tile is published.
+            return false;
+        }
         if (existing != null
                 && existing.sampleSpacing()
                         <= wanted.ring().sampleSpacing()) {
@@ -2229,12 +2262,21 @@ public final class WorldgenSurfaceSampler {
         }
 
         int spacing = nextGenerationSpacing(wanted, existing);
+        L1SampleGrid sampleGrid = null;
+        if (wanted.ring().lodLevel() == 1) {
+            sampleGrid = L1_SAMPLE_CACHE.computeIfAbsent(
+                    key,
+                    ignored -> new L1SampleGrid(wanted.ring().tileSize())
+            );
+            trimL1SampleCache();
+        }
+
         GenerationJob job = new GenerationJob(
                 key,
                 wanted.ring(),
                 spacing,
                 existing != null,
-                null,
+                sampleGrid,
                 false
         );
         job.asyncCoverageStarted = true;
@@ -2290,6 +2332,24 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static GenerationJob takeReadyDetachedCoverage() {
+        // Feed exact L1 first whenever a bootstrap tile's heights are ready.
+        for (Map.Entry<LodTileKey, GenerationJob> entry
+                : DETACHED_COVERAGE_JOBS.entrySet()) {
+            GenerationJob job = entry.getValue();
+            CompletableFuture<HeightBatchResult> future =
+                    job.asyncHeightFuture;
+
+            if (job.ring.lodLevel() != 1
+                    || future == null
+                    || !future.isDone()) {
+                continue;
+            }
+
+            if (DETACHED_COVERAGE_JOBS.remove(entry.getKey(), job)) {
+                return job;
+            }
+        }
+
         for (Map.Entry<LodTileKey, GenerationJob> entry
                 : DETACHED_COVERAGE_JOBS.entrySet()) {
             GenerationJob job = entry.getValue();
@@ -2921,6 +2981,17 @@ public final class WorldgenSurfaceSampler {
             int sampleIndex = result.sampleIndices()[i];
             int y = result.heights()[i];
             job.heights[sampleIndex] = y;
+
+            if (job.sampleGrid != null) {
+                int gx = sampleIndex % job.samplesAcross;
+                int gz = sampleIndex / job.samplesAcross;
+                int fineIndex = job.fineGridIndex(gx, gz);
+                if (fineIndex >= 0) {
+                    job.sampleGrid.heights[fineIndex] = y;
+                    job.sampleGrid.heightSampled[fineIndex] = true;
+                }
+            }
+
             job.minY = Math.min(job.minY, y);
             job.maxY = Math.max(job.maxY, y);
             job.generatedSamples++;
@@ -2953,6 +3024,17 @@ public final class WorldgenSurfaceSampler {
 
             job.sampleColors[sampleIndex] = appearance.rgb();
             job.sampleMaterials[sampleIndex] = appearance.material();
+
+            if (job.sampleGrid != null) {
+                int fineIndex = job.fineGridIndex(gx, gz);
+                if (fineIndex >= 0) {
+                    job.sampleGrid.colors[fineIndex] = appearance.rgb();
+                    job.sampleGrid.materials[fineIndex] =
+                            appearance.material();
+                    job.sampleGrid.appearanceSampled[fineIndex] = true;
+                }
+            }
+
             job.appearanceGeneratedSamples++;
         }
 
