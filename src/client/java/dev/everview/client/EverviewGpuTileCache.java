@@ -33,7 +33,14 @@ import java.util.Set;
 public final class EverviewGpuTileCache {
     private static final int MAX_GPU_TILES = 4_096;
     private static final int TARGET_GPU_TILES = 3_840;
-    private static final int MAX_UPLOADS_PER_FRAME = 8;
+    // Tile count alone is not a safe residency bound once exact 1b meshes
+    // become large. M8 could climb past ~700 MiB while still below 900 tiles,
+    // so M9 also enforces an explicit byte budget.
+    private static final long TARGET_GPU_BYTES =
+            1_000L * 1024L * 1024L;
+    private static final long MAX_GPU_BYTES =
+            1_280L * 1024L * 1024L;
+    private static final int MAX_UPLOADS_PER_FRAME = 12;
     private static final int PRUNE_RING_MARGIN_BLOCKS = 128;
     private static final int RESIDENCY_NEAR_RADIUS_BLOCKS = 768;
     private static final double RESIDENCY_FRUSTUM_MARGIN_BLOCKS = 192.0D;
@@ -313,7 +320,8 @@ public final class EverviewGpuTileCache {
     }
 
     private static int trimOffscreenToTarget() {
-        if (TILES.size() <= TARGET_GPU_TILES) {
+        if (TILES.size() <= TARGET_GPU_TILES
+                && residentBytes <= TARGET_GPU_BYTES) {
             return 0;
         }
 
@@ -321,7 +329,8 @@ public final class EverviewGpuTileCache {
         Iterator<Map.Entry<LodTileKey, GpuTile>> iterator =
                 TILES.entrySet().iterator();
 
-        while (TILES.size() > TARGET_GPU_TILES
+        while ((TILES.size() > TARGET_GPU_TILES
+                        || residentBytes > TARGET_GPU_BYTES)
                 && iterator.hasNext()) {
             Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
 
@@ -338,14 +347,16 @@ public final class EverviewGpuTileCache {
     }
 
     private static void trimHardLimit() {
-        if (TILES.size() <= MAX_GPU_TILES) {
+        if (TILES.size() <= MAX_GPU_TILES
+                && residentBytes <= MAX_GPU_BYTES) {
             return;
         }
 
         Iterator<Map.Entry<LodTileKey, GpuTile>> iterator =
                 TILES.entrySet().iterator();
 
-        while (TILES.size() > MAX_GPU_TILES
+        while ((TILES.size() > MAX_GPU_TILES
+                        || residentBytes > MAX_GPU_BYTES)
                 && iterator.hasNext()) {
             Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
 
@@ -358,12 +369,14 @@ public final class EverviewGpuTileCache {
             forcedEvictionsThisFrame++;
         }
 
-        if (TILES.size() <= MAX_GPU_TILES) {
+        if (TILES.size() <= MAX_GPU_TILES
+                && residentBytes <= MAX_GPU_BYTES) {
             return;
         }
 
         iterator = TILES.entrySet().iterator();
-        while (TILES.size() > MAX_GPU_TILES
+        while ((TILES.size() > MAX_GPU_TILES
+                        || residentBytes > MAX_GPU_BYTES)
                 && iterator.hasNext()) {
             Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
             removeResident(entry.getValue());
