@@ -53,36 +53,34 @@ public final class WorldgenSurfaceSampler {
     public static final long NORMAL_MAX_SLICE_BUDGET_NANOS = 12_000_000L;
     public static final long MAX_SLICE_BUDGET_NANOS = 16_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 128;
-    // M9.1 keeps explicit scheduling headroom for Minecraft. M9.0 could run
-    // 5 exact + 6 coverage + 3 appearance workers on a 16-thread CPU while
-    // the render and integrated-server threads were also busy, which matched
-    // the observed progressive FPS collapse as the world became dense.
+    // M9.2 keeps the same total background-thread envelope as M9.1, but
+    // reallocates it toward exact 1b height production: 6 exact + 2 coverage
+    // + 1 appearance workers on a 16-thread desktop. Exact render tiles are
+    // internally split across several workers so the nearest 128b tile can
+    // complete much sooner without increasing total background concurrency.
     private static final int EXACT_HEIGHT_WORKERS = Math.max(
             2,
             Math.min(
-                    4,
-                    Runtime.getRuntime().availableProcessors() / 4
+                    6,
+                    Runtime.getRuntime().availableProcessors() * 3 / 8
             )
     );
     private static final int COVERAGE_HEIGHT_WORKERS = Math.max(
-            2,
-            Math.min(
-                    3,
-                    Runtime.getRuntime().availableProcessors() / 5
-            )
-    );
-    private static final int MAX_DETACHED_EXACT_JOBS = EXACT_HEIGHT_WORKERS;
-    private static final int MAX_DETACHED_COVERAGE_JOBS = Math.max(
-            2,
-            Math.min(8, COVERAGE_HEIGHT_WORKERS)
-    );
-    private static final int APPEARANCE_WORKERS = Math.max(
             1,
             Math.min(
                     2,
                     Runtime.getRuntime().availableProcessors() / 8
             )
     );
+    private static final int MAX_DETACHED_EXACT_JOBS = Math.max(
+            1,
+            EXACT_HEIGHT_WORKERS / 2
+    );
+    private static final int MAX_DETACHED_COVERAGE_JOBS = Math.max(
+            1,
+            COVERAGE_HEIGHT_WORKERS
+    );
+    private static final int APPEARANCE_WORKERS = 1;
     private static final int MAX_DETACHED_APPEARANCE_JOBS =
             APPEARANCE_WORKERS;
 
@@ -272,6 +270,14 @@ public final class WorldgenSurfaceSampler {
         return COVERAGE_HEIGHT_WORKERS;
     }
 
+    public static int exactWorkersPerTileCurrent() {
+        return exactWorkersPerTile();
+    }
+
+    public static int exactWorkerBudgetCurrent() {
+        return activeExactWorkerBudget();
+    }
+
     public static double cpuTileCacheMiB() {
         return cacheResidentBytes / (1024.0 * 1024.0);
     }
@@ -300,33 +306,50 @@ public final class WorldgenSurfaceSampler {
         return MAX_PROVISIONAL_EXACT_TILES;
     }
 
+    private static int activeExactWorkerBudget() {
+        if (clientFrameMs <= 0.0 || clientFrameMs < 5.5) {
+            return EXACT_HEIGHT_WORKERS;
+        }
+        if (clientFrameMs < 8.0) {
+            return Math.min(4, EXACT_HEIGHT_WORKERS);
+        }
+        if (clientFrameMs < 12.0) {
+            return Math.min(2, EXACT_HEIGHT_WORKERS);
+        }
+        return 1;
+    }
+
+    private static int exactWorkersPerTile() {
+        int budget = activeExactWorkerBudget();
+        if (budget >= 6) {
+            return 3;
+        }
+        if (budget >= 4) {
+            return 2;
+        }
+        return 1;
+    }
+
     private static int activeExactJobBudget() {
-        if (clientFrameMs >= 18.0) {
-            return Math.min(1, MAX_DETACHED_EXACT_JOBS);
-        }
-        if (clientFrameMs >= 12.0) {
-            return Math.min(2, MAX_DETACHED_EXACT_JOBS);
-        }
-        if (clientFrameMs >= 8.0) {
-            return Math.min(3, MAX_DETACHED_EXACT_JOBS);
-        }
-        return MAX_DETACHED_EXACT_JOBS;
+        int workersPerTile = exactWorkersPerTile();
+        return Math.max(
+                1,
+                Math.min(
+                        MAX_DETACHED_EXACT_JOBS,
+                        activeExactWorkerBudget() / workersPerTile
+                )
+        );
     }
 
     private static int activeCoverageJobBudget() {
-        if (clientFrameMs >= 14.0) {
+        if (clientFrameMs >= 12.0) {
             return 1;
-        }
-        if (clientFrameMs >= 9.0) {
-            return Math.min(2, MAX_DETACHED_COVERAGE_JOBS);
         }
         return MAX_DETACHED_COVERAGE_JOBS;
     }
 
     private static int activeAppearanceJobBudget() {
-        return clientFrameMs >= 12.0
-                ? 1
-                : MAX_DETACHED_APPEARANCE_JOBS;
+        return MAX_DETACHED_APPEARANCE_JOBS;
     }
 
     public static SharedHeightCacheStatus sharedHeightCacheStatus() {
@@ -1855,11 +1878,11 @@ public final class WorldgenSurfaceSampler {
                     (detachedCoverageLaunchStep + 1) % 8;
 
             WantedTile candidate = switch (phase) {
-                case 0, 1, 2 -> firstMissingL1BootstrapCoverage(pending);
-                case 3 -> firstMissingLevelCoverage(pending, 2);
-                case 4 -> firstMissingLevelCoverage(pending, 3);
-                case 5 -> firstMissingLevelCoverage(pending, 4);
-                case 6 -> firstMissingLevelCoverage(pending, 5);
+                // Feed exact L1 aggressively: half of detached coverage slots
+                // create the 4b appearance anchors that exact workers require.
+                case 0, 1, 2, 3 -> firstMissingL1BootstrapCoverage(pending);
+                case 4, 5 -> firstMissingLevelCoverage(pending, 2);
+                case 6 -> firstMissingLevelCoverage(pending, 3);
                 default -> firstMissingLevelCoverage(pending, 6);
             };
 
@@ -3000,17 +3023,15 @@ public final class WorldgenSurfaceSampler {
                 .toArray();
         long started = System.nanoTime();
 
-        CompletableFuture.supplyAsync(
-                () -> computeHeightPart(
-                        level,
-                        generator,
-                        randomState,
-                        job,
-                        missingIndices,
-                        0,
-                        missingIndices.length
-                ),
-                EXACT_HEIGHT_EXECUTOR
+        int workersForTile = exactWorkersPerTile();
+        submitHeightBatch(
+                level,
+                generator,
+                randomState,
+                job,
+                missingIndices,
+                EXACT_HEIGHT_EXECUTOR,
+                workersForTile
         ).thenAcceptAsync(
                 result -> finishDetachedExact(
                         level,
@@ -3036,7 +3057,7 @@ public final class WorldgenSurfaceSampler {
             long taskEpoch,
             long started,
             int expectedMissing,
-            HeightPart result
+            HeightBatchResult result
     ) {
         if (taskEpoch != epoch
                 || !DETACHED_EXACT_JOBS.containsKey(job.key)
@@ -3609,35 +3630,14 @@ public final class WorldgenSurfaceSampler {
             job.asyncMissingSampleIndices = missingIndices;
             job.asyncStartedNanos = System.nanoTime();
 
-            int split = (missingIndices.length + 1) / 2;
-            CompletableFuture<HeightPart> first = CompletableFuture.supplyAsync(
-                    () -> computeHeightPart(
-                            level,
-                            generator,
-                            randomState,
-                            job,
-                            missingIndices,
-                            0,
-                            split
-                    ),
-                    EXACT_HEIGHT_EXECUTOR
-            );
-            CompletableFuture<HeightPart> second = CompletableFuture.supplyAsync(
-                    () -> computeHeightPart(
-                            level,
-                            generator,
-                            randomState,
-                            job,
-                            missingIndices,
-                            split,
-                            missingIndices.length
-                    ),
-                    EXACT_HEIGHT_EXECUTOR
-            );
-
-            job.asyncHeightFuture = first.thenCombine(
-                    second,
-                    HeightBatchResult::combine
+            job.asyncHeightFuture = submitHeightBatch(
+                    level,
+                    generator,
+                    randomState,
+                    job,
+                    missingIndices,
+                    EXACT_HEIGHT_EXECUTOR,
+                    exactWorkersPerTile()
             );
 
             lastSliceSamples = 0;
