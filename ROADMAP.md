@@ -474,3 +474,23 @@
 - [ ] verify LOD-to-vanilla transitions no longer flash missing sky for one frame
 - [ ] verify zoomed focused far mountains read as stepped Minecraft terrain instead of rounded pyramids
 - [ ] next major renderer phase: regional multi-tile batching / indirect submission if draw calls remain the dominant cost
+
+
+## M9.0 persistent exact streaming
+- [x] treat M8 late-stage degradation as a scalability blocker: ~883 GPU tiles / ~691 MiB / ~1041 draw calls had already fallen to ~140 FPS before the later crash
+- [x] stop gating normal disk writes on 100% initial fill; autosave useful generated tiles during streaming
+- [x] persist provisional EXACT_GEOMETRY so true 1b height work survives a world rejoin
+- [x] chain the final world-exit snapshot behind any in-flight autosave instead of racing the same cache file
+- [x] bump persistent cache to v31 for the new exact-L1 geometry layout
+- [x] widen L1 to roughly 2K and keep a wide all-direction exact core with view-focused 1b refinement beyond it
+- [x] increase movement prediction horizon and lead for high-speed travel
+- [x] rebalance worldgen workers toward exact L1 while reserving CPU headroom for Minecraft
+- [x] enlarge L1 render/generation tiles from 64b to 128b while retaining true 1b samples and 16b ownership partitioning
+- [x] add explicit GPU byte budgets (1.0 GiB soft / 1.28 GiB hard) in addition to tile-count caps
+- [x] expose JVM heap, CPU LOD mesh memory and GPU LOD memory in the F8 HUD
+- [ ] verify warm rejoin loads the previously generated near/exact world instead of restarting from zero
+- [ ] verify 128b L1 reduces settled draw submissions materially versus M8's ~1000-draw late stage
+- [ ] capture the M8 crash report/latest.log to distinguish JVM heap OOM, native/GPU allocation failure, or another crash path
+- [ ] verify M9 never shows progressive FPS decay while coverage/refinement rises
+- [ ] move persistent storage from whole-cache snapshots to regional/sharded records so generated terrain remains permanent even after CPU-cache eviction
+- [ ] next renderer phase if submission count is still dominant: regional multi-tile GPU batching / indirect submission
