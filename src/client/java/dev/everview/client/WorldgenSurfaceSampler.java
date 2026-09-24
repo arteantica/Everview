@@ -138,6 +138,7 @@ public final class WorldgenSurfaceSampler {
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
+    private static long cacheResidentBytes;
     private static final Map<LodTileKey, L1SampleGrid> L1_SAMPLE_CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
     private static final ConcurrentHashMap<Long, Integer>
@@ -270,6 +271,10 @@ public final class WorldgenSurfaceSampler {
 
     public static int coverageWorkerCount() {
         return COVERAGE_HEIGHT_WORKERS;
+    }
+
+    public static double cpuTileCacheMiB() {
+        return cacheResidentBytes / (1024.0 * 1024.0);
     }
 
     public static int exactWorkerCount() {
@@ -834,8 +839,12 @@ public final class WorldgenSurfaceSampler {
                 WorldgenDiskCache.LoadResult result = diskLoadFuture.join();
 
                 for (WorldgenSurfaceTile tile : result.tiles()) {
-                    CACHE.put(
-                            new LodTileKey(tile.lodLevel(), tile.tileX(), tile.tileZ()),
+                    putCacheTile(
+                            new LodTileKey(
+                                    tile.lodLevel(),
+                                    tile.tileX(),
+                                    tile.tileZ()
+                            ),
                             tile
                     );
                 }
@@ -1056,6 +1065,7 @@ public final class WorldgenSurfaceSampler {
         scheduleDetachedSaveIfDirty();
         epoch++;
         CACHE.clear();
+        cacheResidentBytes = 0L;
         L1_SAMPLE_CACHE.clear();
         SHARED_HEIGHT_CACHE.clear();
         SHARED_HEIGHT_HITS.set(0L);
@@ -1135,7 +1145,7 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            CACHE.put(completed.key(), completed.tile());
+            putCacheTile(completed.key(), completed.tile());
             lastGenerationMs = completed.tile().generationMs();
             generatedTileCount++;
             cacheDirty = true;
@@ -5004,15 +5014,39 @@ public final class WorldgenSurfaceSampler {
         return MinecraftSurfacePalette.applyLighting(color, shade);
     }
 
+    private static void putCacheTile(
+            LodTileKey key,
+            WorldgenSurfaceTile tile
+    ) {
+        WorldgenSurfaceTile previous = CACHE.put(key, tile);
+        if (previous != null) {
+            cacheResidentBytes -= estimatedTileBytes(previous);
+        }
+        cacheResidentBytes += estimatedTileBytes(tile);
+    }
+
+    private static long estimatedTileBytes(WorldgenSurfaceTile tile) {
+        return (long) tile.vertices().length * Integer.BYTES
+                + (long) tile.colors().length * Integer.BYTES
+                + tile.materials().length;
+    }
+
     private static void trimCache() {
-        Iterator<LodTileKey> iterator = CACHE.keySet().iterator();
+        Iterator<Map.Entry<LodTileKey, WorldgenSurfaceTile>> iterator =
+                CACHE.entrySet().iterator();
 
         while (CACHE.size() > CACHE_LIMIT && iterator.hasNext()) {
-            LodTileKey key = iterator.next();
-            if (containsWantedKey(key)) {
+            Map.Entry<LodTileKey, WorldgenSurfaceTile> entry =
+                    iterator.next();
+            if (containsWantedKey(entry.getKey())) {
                 continue;
             }
+            cacheResidentBytes -= estimatedTileBytes(entry.getValue());
             iterator.remove();
+        }
+
+        if (cacheResidentBytes < 0L) {
+            cacheResidentBytes = 0L;
         }
     }
 
