@@ -53,24 +53,22 @@ public final class WorldgenSurfaceSampler {
     public static final long NORMAL_MAX_SLICE_BUDGET_NANOS = 12_000_000L;
     public static final long MAX_SLICE_BUDGET_NANOS = 16_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 128;
-    // M9 biases worker capacity toward exact L1 while leaving explicit CPU
-    // headroom for Minecraft's render/server threads. On a 16-thread desktop
-    // this resolves to 5 exact + 6 coverage workers instead of saturating the
-    // machine with the old 4 + 8 split.
+    // M9.1 keeps explicit scheduling headroom for Minecraft. M9.0 could run
+    // 5 exact + 6 coverage + 3 appearance workers on a 16-thread CPU while
+    // the render and integrated-server threads were also busy, which matched
+    // the observed progressive FPS collapse as the world became dense.
     private static final int EXACT_HEIGHT_WORKERS = Math.max(
             2,
             Math.min(
-                    6,
-                    Runtime.getRuntime().availableProcessors() / 3
+                    4,
+                    Runtime.getRuntime().availableProcessors() / 4
             )
     );
     private static final int COVERAGE_HEIGHT_WORKERS = Math.max(
             2,
             Math.min(
-                    6,
-                    Runtime.getRuntime().availableProcessors()
-                            - EXACT_HEIGHT_WORKERS
-                            - 4
+                    3,
+                    Runtime.getRuntime().availableProcessors() / 5
             )
     );
     private static final int MAX_DETACHED_EXACT_JOBS = EXACT_HEIGHT_WORKERS;
@@ -79,10 +77,10 @@ public final class WorldgenSurfaceSampler {
             Math.min(8, COVERAGE_HEIGHT_WORKERS)
     );
     private static final int APPEARANCE_WORKERS = Math.max(
-            2,
+            1,
             Math.min(
-                    3,
-                    Runtime.getRuntime().availableProcessors() / 5
+                    2,
+                    Runtime.getRuntime().availableProcessors() / 8
             )
     );
     private static final int MAX_DETACHED_APPEARANCE_JOBS =
@@ -130,8 +128,8 @@ public final class WorldgenSurfaceSampler {
     // Persist useful work while streaming instead of waiting for the complete
     // 16K initial fill. This is the warm-rejoin contract for M9.
     private static final long DISK_AUTOSAVE_INTERVAL_NANOS =
-            3_000_000_000L;
-    private static final int DISK_AUTOSAVE_MIN_DIRTY_TILES = 16;
+            4_000_000_000L;
+    private static final int DISK_AUTOSAVE_MIN_DIRTY_TILES = 8;
     private static final int VIEW_SECTOR_COUNT = 16;
     private static final double VIEW_SECTOR_DEGREES = 360.0 / VIEW_SECTOR_COUNT;
     private static final int COVERAGE_FRONTIER_BUCKET_BLOCKS = 64;
@@ -203,8 +201,9 @@ public final class WorldgenSurfaceSampler {
     private static long diskCacheSeed;
     private static String diskCacheDimension = "";
     private static boolean diskLoadReady;
-    private static boolean cacheDirty;
-    private static int dirtyTilesSinceSave;
+    private static final Map<LodTileKey, WorldgenSurfaceTile>
+            DISK_DIRTY_TILES = new LinkedHashMap<>();
+    private static List<WorldgenSurfaceTile> diskSaveBatch = List.of();
     private static long lastDiskSaveStartedNanos;
     private static int diskLoadedTiles;
     private static double diskLoadMs;
@@ -299,6 +298,35 @@ public final class WorldgenSurfaceSampler {
 
     public static int maxProvisionalExactTiles() {
         return MAX_PROVISIONAL_EXACT_TILES;
+    }
+
+    private static int activeExactJobBudget() {
+        if (clientFrameMs >= 18.0) {
+            return Math.min(1, MAX_DETACHED_EXACT_JOBS);
+        }
+        if (clientFrameMs >= 12.0) {
+            return Math.min(2, MAX_DETACHED_EXACT_JOBS);
+        }
+        if (clientFrameMs >= 8.0) {
+            return Math.min(3, MAX_DETACHED_EXACT_JOBS);
+        }
+        return MAX_DETACHED_EXACT_JOBS;
+    }
+
+    private static int activeCoverageJobBudget() {
+        if (clientFrameMs >= 14.0) {
+            return 1;
+        }
+        if (clientFrameMs >= 9.0) {
+            return Math.min(2, MAX_DETACHED_COVERAGE_JOBS);
+        }
+        return MAX_DETACHED_COVERAGE_JOBS;
+    }
+
+    private static int activeAppearanceJobBudget() {
+        return clientFrameMs >= 12.0
+                ? 1
+                : MAX_DETACHED_APPEARANCE_JOBS;
     }
 
     public static SharedHeightCacheStatus sharedHeightCacheStatus() {
@@ -582,7 +610,7 @@ public final class WorldgenSurfaceSampler {
         if (!highSpeedCoverageMode) {
             int appearanceLaunches = 0;
             while (DETACHED_APPEARANCE_JOBS.size()
-                    < MAX_DETACHED_APPEARANCE_JOBS
+                    < activeAppearanceJobBudget()
                     && appearanceLaunches < 2) {
                 WantedTile appearance =
                         firstExactAppearanceRefinement(null);
@@ -613,7 +641,7 @@ public final class WorldgenSurfaceSampler {
                     : currentJob.key;
 
             while (DETACHED_EXACT_JOBS.size()
-                    < MAX_DETACHED_EXACT_JOBS) {
+                    < activeExactJobBudget()) {
                 WantedTile detached =
                         firstExactBandRefinement(pending);
 
@@ -639,7 +667,7 @@ public final class WorldgenSurfaceSampler {
             pollDetachedCoverage();
 
             while (DETACHED_COVERAGE_JOBS.size()
-                    < MAX_DETACHED_COVERAGE_JOBS) {
+                    < activeCoverageJobBudget()) {
                 WantedTile coverage =
                         firstDetachedCoverageCandidate();
 
@@ -871,29 +899,44 @@ public final class WorldgenSurfaceSampler {
                 diskFileMiB = result.bytes() / (1024.0 * 1024.0);
                 diskCacheStatus = result.status();
 
-                if (!"SAVED".equals(result.status())) {
-                    cacheDirty = true;
-                    dirtyTilesSinceSave = Math.max(
-                            dirtyTilesSinceSave,
-                            DISK_AUTOSAVE_MIN_DIRTY_TILES
-                    );
+                if (!"SAVED".equals(result.status())
+                        && !"IDLE".equals(result.status())) {
+                    for (WorldgenSurfaceTile tile : diskSaveBatch) {
+                        DISK_DIRTY_TILES.put(
+                                new LodTileKey(
+                                        tile.lodLevel(),
+                                        tile.tileX(),
+                                        tile.tileZ()
+                                ),
+                                tile
+                        );
+                    }
                 }
             } catch (RuntimeException exception) {
                 diskCacheStatus = "SAVE_ERROR";
-                cacheDirty = true;
-                dirtyTilesSinceSave = Math.max(
-                        dirtyTilesSinceSave,
-                        DISK_AUTOSAVE_MIN_DIRTY_TILES
+                for (WorldgenSurfaceTile tile : diskSaveBatch) {
+                    DISK_DIRTY_TILES.put(
+                            new LodTileKey(
+                                    tile.lodLevel(),
+                                    tile.tileX(),
+                                    tile.tileZ()
+                            ),
+                            tile
+                    );
+                }
+                EverviewClient.LOGGER.warn(
+                        "Everview regional LOD cache save task failed",
+                        exception
                 );
-                EverviewClient.LOGGER.warn("Everview LOD cache save task failed", exception);
             } finally {
                 diskSaveFuture = null;
+                diskSaveBatch = List.of();
             }
         }
     }
 
     private static void maybeScheduleDiskSave() {
-        if (!cacheDirty
+        if (DISK_DIRTY_TILES.isEmpty()
                 || diskCachePath == null
                 || diskSaveFuture != null
                 || !diskLoadReady) {
@@ -902,7 +945,7 @@ public final class WorldgenSurfaceSampler {
 
         long now = System.nanoTime();
         boolean enoughNewTiles =
-                dirtyTilesSinceSave >= DISK_AUTOSAVE_MIN_DIRTY_TILES;
+                DISK_DIRTY_TILES.size() >= DISK_AUTOSAVE_MIN_DIRTY_TILES;
         boolean intervalElapsed =
                 lastDiskSaveStartedNanos == 0L
                         || now - lastDiskSaveStartedNanos
@@ -913,47 +956,68 @@ public final class WorldgenSurfaceSampler {
             return;
         }
 
-        List<WorldgenSurfaceTile> tiles = CACHE.values().stream()
-                .filter(tile -> tile.stage().diskSafe())
-                .toList();
+        diskSaveBatch = List.copyOf(DISK_DIRTY_TILES.values());
+        DISK_DIRTY_TILES.clear();
+
         Path path = diskCachePath;
         long seed = diskCacheSeed;
         String dimension = diskCacheDimension;
+        List<WorldgenSurfaceTile> batch = diskSaveBatch;
 
-        cacheDirty = false;
-        dirtyTilesSinceSave = 0;
         lastDiskSaveStartedNanos = now;
         diskCacheStatus = "SAVING";
         diskSaveFuture = CompletableFuture.supplyAsync(
-                () -> WorldgenDiskCache.save(path, seed, dimension, tiles)
+                () -> WorldgenDiskCache.save(
+                        path,
+                        seed,
+                        dimension,
+                        batch
+                )
         );
     }
 
     private static void scheduleDetachedSaveIfDirty() {
-        if (!cacheDirty || diskCachePath == null || CACHE.isEmpty()) {
+        if (diskCachePath == null
+                || (DISK_DIRTY_TILES.isEmpty()
+                        && diskSaveFuture == null)) {
             return;
         }
 
-        List<WorldgenSurfaceTile> tiles = CACHE.values().stream()
-                .filter(tile -> tile.stage().diskSafe())
-                .toList();
+        List<WorldgenSurfaceTile> pending =
+                new ArrayList<>(DISK_DIRTY_TILES.values());
+        List<WorldgenSurfaceTile> inFlightBatch =
+                List.copyOf(diskSaveBatch);
         Path path = diskCachePath;
         long seed = diskCacheSeed;
         String dimension = diskCacheDimension;
         CompletableFuture<WorldgenDiskCache.SaveResult> inFlight =
                 diskSaveFuture;
 
-        // If an autosave is already writing, chain the final world-exit snapshot
-        // behind it. This avoids two writers fighting over the same cache temp
-        // file and guarantees the newest snapshot wins.
+        DISK_DIRTY_TILES.clear();
+
+        // Serialize the final world-exit write behind an in-flight regional
+        // save. If that save failed, merge its batch back into the final write.
         CompletableFuture.runAsync(() -> {
             if (inFlight != null) {
                 try {
-                    inFlight.join();
-                } catch (RuntimeException ignored) {
+                    WorldgenDiskCache.SaveResult result = inFlight.join();
+                    if (!"SAVED".equals(result.status())
+                            && !"IDLE".equals(result.status())) {
+                        pending.addAll(inFlightBatch);
+                    }
+                } catch (RuntimeException exception) {
+                    pending.addAll(inFlightBatch);
                 }
             }
-            WorldgenDiskCache.save(path, seed, dimension, tiles);
+
+            if (!pending.isEmpty()) {
+                WorldgenDiskCache.save(
+                        path,
+                        seed,
+                        dimension,
+                        pending
+                );
+            }
         });
     }
 
@@ -1119,8 +1183,8 @@ public final class WorldgenSurfaceSampler {
         diskCacheSeed = 0L;
         diskCacheDimension = "";
         diskLoadReady = false;
-        cacheDirty = false;
-        dirtyTilesSinceSave = 0;
+        DISK_DIRTY_TILES.clear();
+        diskSaveBatch = List.of();
         lastDiskSaveStartedNanos = 0L;
         diskLoadedTiles = 0;
         diskLoadMs = 0.0;
@@ -1148,8 +1212,12 @@ public final class WorldgenSurfaceSampler {
             putCacheTile(completed.key(), completed.tile());
             lastGenerationMs = completed.tile().generationMs();
             generatedTileCount++;
-            cacheDirty = true;
-            dirtyTilesSinceSave++;
+            if (completed.tile().stage().diskSafe()) {
+                DISK_DIRTY_TILES.put(
+                        completed.key(),
+                        completed.tile()
+                );
+            }
 
             if (completed.tile().lodLevel() == 1) {
                 lastRefineReusedSamples = completed.reusedSamples();
@@ -2301,7 +2369,12 @@ public final class WorldgenSurfaceSampler {
             }
 
             WorldgenSurfaceTile tile = CACHE.get(wanted.key());
-            if (tile != null && tile.sampleSpacing() > L1_EXACT_SPACING) {
+            L1SampleGrid grid = L1_SAMPLE_CACHE.get(wanted.key());
+            if (tile != null
+                    && tile.sampleSpacing() > L1_EXACT_SPACING
+                    && grid != null
+                    && grid.hasAnyAppearance()
+                    && !DETACHED_COVERAGE_JOBS.containsKey(wanted.key())) {
                 return wanted;
             }
         }
