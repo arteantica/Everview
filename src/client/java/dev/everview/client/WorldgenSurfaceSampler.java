@@ -102,7 +102,9 @@ public final class WorldgenSurfaceSampler {
     private static final int MAX_PROVISIONAL_EXACT_TILES = 32;
     private static final int FOCUSED_L5_SAMPLE_SPACING = 4;
     private static final int FOCUSED_L6_SAMPLE_SPACING = 8;
-    private static final double FAR_FOCUS_DOT_THRESHOLD = 0.20D;
+    // Keep expensive high-density far refinement tightly centered on the
+    // current view instead of refining most of a hemisphere.
+    private static final double FAR_FOCUS_DOT_THRESHOLD = 0.90D;
     private static final int APPEARANCE_SERVICE_THRESHOLD = 4;
     private static final int APPEARANCE_COVERAGE_BURST = 4;
     private static final int SHARED_HEIGHT_CACHE_LIMIT = 1_250_000;
@@ -112,8 +114,8 @@ public final class WorldgenSurfaceSampler {
     private static final int L1_BOOTSTRAP_SPACING = 4;
     private static final int L1_INTERMEDIATE_SPACING = 2;
     private static final int L1_EXACT_SPACING = 1;
-    private static final int L1_FINE_GRID_SAMPLES = 33;
-    private static final int L1_SAMPLE_CACHE_LIMIT = 2_048;
+    private static final int L1_FINE_GRID_SAMPLES = 65;
+    private static final int L1_SAMPLE_CACHE_LIMIT = 1_024;
     // M6.2: the whole visible L1 annulus is an exact 1-block target.
     // Bootstrap still appears at 4b, but exact workers immediately replace it.
     private static final int L1_EXACT_BAND_BLOCKS = 512;
@@ -956,7 +958,7 @@ public final class WorldgenSurfaceSampler {
                 1,
                 innerRadius,
                 ultraNearOuter,
-                32,
+                64,
                 1
         ));
 
@@ -3872,6 +3874,14 @@ public final class WorldgenSurfaceSampler {
             return buildBlockColumnMesh(job, seaLevel);
         }
 
+        if (job.ring.lodLevel() >= 5
+                && job.sampleSpacing < job.ring.sampleSpacing()) {
+            // Focus-refined far terrain must stop looking like a smooth
+            // heightfield. Horizontal plateaus plus vertical walls preserve a
+            // Minecraft-like stepped silhouette when the user zooms in.
+            return buildTerracedMesh(job, seaLevel);
+        }
+
         if (job.ring.lodLevel() >= 3) {
             return buildMinecraftFacetedMesh(job, seaLevel);
         }
@@ -5148,7 +5158,7 @@ public final class WorldgenSurfaceSampler {
         private L1SampleGrid(int tileSize) {
             if (tileSize + 1 != L1_FINE_GRID_SAMPLES) {
                 throw new IllegalArgumentException(
-                        "L1 sample hierarchy expects 32-block tiles"
+                        "L1 sample hierarchy expects 64-block tiles"
                 );
             }
 
