@@ -405,3 +405,14 @@
 - [ ] verify camera rotation no longer produces widespread ownership flashes
 - [ ] profile settled draw calls, GPU MiB and FPS before raising zoom-direction geometry fidelity
 - [ ] add screen-space / zoom-aware refinement so distant terrain sharpens when magnified without globally doubling L5/L6 density
+
+
+## M7.1 residency stability hotfix
+- [x] identify settled-frame 8-upload / 8-prune ping-pong introduced by M7.0
+- [x] compute fully covered coarse suppression before GPU upload selection
+- [x] skip suppressed coarse snapshot tiles instead of immediately re-uploading freshly pruned buffers
+- [x] re-evaluate coverage after finer uploads and keep newly covered coarse tiles suppressed on the next frame
+- [x] remove duplicated per-frame GPU telemetry resets
+- [ ] verify settled 100% coverage reaches uploads 0 / prune 0 for stationary camera
+- [ ] compare FPS against M6.9 and M7.0 at the same 95-100% coverage viewpoint
+- [ ] once settled rendering is stable, extend horizon with an outer L7/L8 shell instead of increasing L6 workload

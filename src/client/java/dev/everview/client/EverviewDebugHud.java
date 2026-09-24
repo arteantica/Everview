@@ -68,7 +68,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSnapshot far
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M7.0 | F8 details");
+        lines.add("Everview M7.1 | F8 details");
 
         if (!far.available()) {
             lines.add("LOD worldgen unavailable");
@@ -113,10 +113,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M7.0 DEV | RENDER STABILITY");
+        lines.add("Everview M7.1 DEV | RESIDENCY STABILITY");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Renderer: hierarchical GPU pruning | full-cover fast skip | exact region ownership | seam shield");
+        lines.add("Renderer: no prune/upload ping-pong | hierarchical GPU pruning | full-cover fast skip | seam shield");
         lines.add("Handoff: 64b overlap | upload grace | chunk fade forced OFF");
         lines.add("LOD targets: L1 1b | L2 2b | L3 2b | L4 4b | L5 8b | L6 16b");
         lines.add("First-visible: L1 4b | L2 4b | L3 4b | L4 8b | L5 8b | L6 16b");

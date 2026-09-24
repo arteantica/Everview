@@ -74,9 +74,6 @@ public final class EverviewGpuTileCache {
         staleRemovedThisFrame = 0;
         coveredPrunedThisFrame = 0;
         forcedEvictionsThisFrame = 0;
-        staleRemovedThisFrame = 0;
-        coveredPrunedThisFrame = 0;
-        forcedEvictionsThisFrame = 0;
 
         Map<LodTileKey, WorldgenSurfaceTile> active = new HashMap<>(
                 Math.max(16, snapshot.tiles().size() * 2)
@@ -110,12 +107,18 @@ public final class EverviewGpuTileCache {
             staleRemovedThisFrame++;
         }
 
-        // Free coarse buffers that are already completely replaced by stable,
-        // current finer GPU coverage before uploading anything new.
-        coveredPrunedThisFrame += pruneCoveredCoarse(
+        // M7.1: compute the set of coarse tiles that are completely replaced
+        // by stable finer residency BEFORE the upload loop. M7.0 pruned these
+        // buffers and then immediately saw them missing from TILES and uploaded
+        // the same coarse buffers again in the very same frame. At settled
+        // coverage that became an 8-upload / 8-prune ping-pong every frame.
+        Set<LodTileKey> suppressedCoarse = findCoveredCoarseKeys(
                 snapshot,
                 cameraX,
                 cameraZ
+        );
+        coveredPrunedThisFrame += pruneCoveredCoarse(
+                suppressedCoarse
         );
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
@@ -128,6 +131,11 @@ public final class EverviewGpuTileCache {
                     tile.tileX(),
                     tile.tileZ()
             );
+
+            if (suppressedCoarse.contains(key)) {
+                continue;
+            }
+
             GpuTile existing = TILES.get(key);
 
             if (existing != null
@@ -150,26 +158,27 @@ public final class EverviewGpuTileCache {
             residentBytes += uploaded.bytes();
         }
 
-        // Newly uploaded finer tiles may make another large coarse buffer
-        // redundant in this same frame.
-        coveredPrunedThisFrame += pruneCoveredCoarse(
+        // Finer buffers uploaded above can make additional coarse buffers
+        // redundant. Prune those once; next frame findCoveredCoarseKeys() will
+        // keep them suppressed instead of re-uploading them.
+        Set<LodTileKey> newlySuppressed = findCoveredCoarseKeys(
                 snapshot,
                 cameraX,
                 cameraZ
+        );
+        coveredPrunedThisFrame += pruneCoveredCoarse(
+                newlySuppressed
         );
 
         trim();
     }
 
-    private static int pruneCoveredCoarse(
+    private static Set<LodTileKey> findCoveredCoarseKeys(
             WorldgenSurfaceSnapshot snapshot,
             double cameraX,
             double cameraZ
     ) {
         Map<Integer, Set<Long>> residentByLevel = new HashMap<>();
-        Map<LodTileKey, WorldgenSurfaceTile> active = new HashMap<>(
-                Math.max(16, snapshot.tiles().size() * 2)
-        );
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
             LodTileKey key = new LodTileKey(
@@ -177,7 +186,6 @@ public final class EverviewGpuTileCache {
                     tile.tileX(),
                     tile.tileZ()
             );
-            active.put(key, tile);
             GpuTile resident = TILES.get(key);
 
             if (resident != null
@@ -192,33 +200,46 @@ public final class EverviewGpuTileCache {
             }
         }
 
+        Set<LodTileKey> covered = new HashSet<>();
+
+        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
+            if (tile.lodLevel() <= 1) {
+                continue;
+            }
+
+            if (isFullyCoveredByFiner(
+                    tile,
+                    snapshot,
+                    residentByLevel,
+                    cameraX,
+                    cameraZ
+            )) {
+                covered.add(new LodTileKey(
+                        tile.lodLevel(),
+                        tile.tileX(),
+                        tile.tileZ()
+                ));
+            }
+        }
+
+        return covered;
+    }
+
+    private static int pruneCoveredCoarse(
+            Set<LodTileKey> covered
+    ) {
         int removed = 0;
         Iterator<Map.Entry<LodTileKey, GpuTile>> iterator =
                 TILES.entrySet().iterator();
 
         while (iterator.hasNext()) {
             Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
-            GpuTile gpuTile = entry.getValue();
-            WorldgenSurfaceTile tile = gpuTile.source();
 
-            if (tile.lodLevel() <= 1
-                    || active.get(entry.getKey()) != tile
-                    || !isFullyCoveredByFiner(
-                            tile,
-                            snapshot,
-                            residentByLevel,
-                            cameraX,
-                            cameraZ
-                    )) {
+            if (!covered.contains(entry.getKey())) {
                 continue;
             }
 
-            Set<Long> ownLevel = residentByLevel.get(tile.lodLevel());
-            if (ownLevel != null) {
-                ownLevel.remove(packTile(tile.tileX(), tile.tileZ()));
-            }
-
-            removeResident(gpuTile);
+            removeResident(entry.getValue());
             iterator.remove();
             removed++;
         }
