@@ -68,7 +68,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSnapshot far
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M8.0 | F8 details");
+        lines.add("Everview M9.0 | F8 details");
 
         if (!far.available()) {
             lines.add("LOD worldgen unavailable");
@@ -113,14 +113,14 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M8.0 DEV | STEPPED TERRAIN + RENDER BUDGET");
+        lines.add("Everview M9.0 DEV | PERSISTENT EXACT STREAMING");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Renderer: 64b L1 tiles | persistent 360 cache | stepped focused far mesh | seam shield");
+        lines.add("Renderer: 128b L1 tiles | byte-capped GPU residency | stepped far mesh | seam shield");
         lines.add("Handoff: 64b overlap | 350ms visible-stability gate | chunk fade forced OFF");
         lines.add("LOD targets: L1 1b | L2 2b | L3 2b | L4 4b | L5 8b | L6 16b");
-        lines.add("First-visible: L1 4b | L2 4b | L3 4b | L4 8b | L5 8b | L6 16b");
-        lines.add("View focus: narrow cone | L5 -> 4b stepped | L6 -> 8b stepped | GPU 3840 / 4096");
+        lines.add("First-visible: L1 4b -> 1b | L2 4b | L3 4b | L4 8b | L5 8b | L6 16b");
+        lines.add("View focus: L1 exact to 2K | L5 -> 4b stepped | L6 -> 8b stepped | GPU <= 1.28 GiB");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
@@ -376,6 +376,17 @@ public final class EverviewDebugHud {
         ));
 
         EverviewGpuTileCache.Stats gpu = EverviewGpuTileCache.stats();
+        Runtime runtime = Runtime.getRuntime();
+        double heapUsedMiB = (runtime.totalMemory() - runtime.freeMemory())
+                / (1024.0 * 1024.0);
+        double heapMaxMiB = runtime.maxMemory() / (1024.0 * 1024.0);
+        lines.add(String.format(
+                "Memory: heap %.0f/%.0f MiB | CPU LOD %.1f MiB | GPU LOD %.1f MiB",
+                heapUsedMiB,
+                heapMaxMiB,
+                WorldgenSurfaceSampler.cpuTileCacheMiB(),
+                gpu.residentMiB()
+        ));
         lines.add(String.format(
                 "GPU tiles: %d | %.2f MiB | upload %d / %.3f ms | prepare %.3f ms",
                 gpu.bufferCount(),
