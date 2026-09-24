@@ -41,8 +41,9 @@
 - [ ] multiplayer/server data path
 
 ## M3 - GPU architecture
-- [ ] persistent GPU buffers
+- [x] first persistent GPU tile-buffer path
 - [ ] batched/indirect terrain submission
+- [ ] exact GPU-side ring clipping / clipmap ownership
 - [x] frustum culling
 - [ ] horizon/occlusion culling
 - [ ] screen-space error based detail selection

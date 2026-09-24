@@ -42,7 +42,7 @@ public final class WorldgenSurfaceSampler {
     public static final long MAX_SLICE_BUDGET_NANOS = 6_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 48;
 
-    private static final int CACHE_LIMIT = 1_536;
+    private static final int CACHE_LIMIT = 2_304;
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
@@ -134,8 +134,11 @@ public final class WorldgenSurfaceSampler {
         // holes without making the coarse LOD visibly take over too early.
         // The renderer biases LOD slightly downward so vanilla wins depth
         // wherever both surfaces exist.
-        int anchorX = Math.floorDiv(centerX, 128) * 128;
-        int anchorZ = Math.floorDiv(centerZ, 128) * 128;
+        // The ultra-near ring now uses 32-block GPU tiles so the vanilla/LOD
+        // boundary can follow the camera closely instead of advancing in
+        // 128-block slabs.
+        int anchorX = Math.floorDiv(centerX, 32) * 32;
+        int anchorZ = Math.floorDiv(centerZ, 32) * 32;
 
         if (anchorX != lastAnchorX
                 || anchorZ != lastAnchorZ
@@ -314,10 +317,10 @@ public final class WorldgenSurfaceSampler {
     private static List<WorldgenLodRing> createRings(int innerRadius) {
         List<WorldgenLodRing> rings = new ArrayList<>(6);
 
-        // M3.2.2 introduces a narrow ultra-near band rather than making the
-        // entire 1K ring four times denser. At the current 384-block vanilla
-        // radius this resolves to ~352-544 at 4-block spacing, followed by the
-        // validated 8-block representation out to 1,024.
+        // M3.3.1 keeps the 4-block ultra-near sampling from M3.2.2 but cuts
+        // its tile size from 128 to 32 blocks. Persistent GPU buffers make the
+        // extra tile count affordable, while the smaller tiles let the
+        // vanilla handoff be clipped much more accurately.
         int ultraNearOuter = Math.min(
                 1_024,
                 Math.max(544, innerRadius + 192)
@@ -327,7 +330,7 @@ public final class WorldgenSurfaceSampler {
                 1,
                 innerRadius,
                 ultraNearOuter,
-                128,
+                32,
                 4
         ));
 

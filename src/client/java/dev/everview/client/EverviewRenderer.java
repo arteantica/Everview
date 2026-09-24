@@ -1,30 +1,54 @@
 package dev.everview.client;
 
-import com.mojang.blaze3d.vertex.VertexConsumer;
-import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
+import com.mojang.renderpearl.api.commands.RenderPass;
+import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.world.phys.AABB;
-import org.joml.Matrix4fc;
+import org.joml.Matrix4f;
+import org.joml.Vector3f;
+import org.joml.Vector4f;
 
 /**
- * M3.1.1 baked-material distant terrain renderer.
+ * M3.3 persistent-GPU distant terrain renderer.
  *
- * Material breakup is precomputed when a tile is generated/loaded from cache.
- * The hot render path now only submits baked vertex colors instead of hashing
- * every visible vertex every frame.
+ * Important 26.3 detail: LevelRenderEvents.AFTER_OPAQUE_TERRAIN fires while
+ * Minecraft's opaque terrain RenderPass is still open. Everview therefore
+ * draws into that existing pass instead of trying to create a nested pass.
  */
 public final class EverviewRenderer {
+    private static final Vector4f COLOR_MODULATOR = new Vector4f(1.0F, 1.0F, 1.0F, 1.0F);
+    private static final Vector3f MODEL_OFFSET = new Vector3f();
+    private static final Matrix4f TEXTURE_MATRIX = new Matrix4f();
+
     private EverviewRenderer() {
     }
 
+    /**
+     * GPU uploads happen during COLLECT_SUBMITS, before the opaque terrain
+     * RenderPass begins. The actual draw hook is a small LevelRenderer mixin
+     * that receives Minecraft's already-open opaque RenderPass.
+     */
     public static void register() {
-        LevelRenderEvents.COLLECT_SUBMITS.register(EverviewRenderer::collect);
+        LevelRenderEvents.COLLECT_SUBMITS.register(context -> {
+            Minecraft client = Minecraft.getInstance();
+
+            if (client.level == null || client.player == null) {
+                return;
+            }
+
+            WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
+            if (!snapshot.tiles().isEmpty()) {
+                EverviewGpuTileCache.prepareFrame(client.level, snapshot);
+            }
+        });
     }
 
-    private static void collect(LevelRenderContext context) {
+    public static void drawPersistentTerrain(RenderPass renderPass) {
         Minecraft client = Minecraft.getInstance();
         Camera camera = client.gameRenderer.mainCamera();
 
@@ -32,25 +56,28 @@ public final class EverviewRenderer {
             return;
         }
 
-        WorldgenSurfaceSnapshot far = WorldgenSurfaceSampler.snapshot();
-        if (far.tiles().isEmpty()) {
+        WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
+        if (snapshot.tiles().isEmpty()) {
             return;
         }
 
         EverviewMetrics.beginRenderFrame();
-        submitWorldgenTiles(context, camera, far);
-    }
 
-    private static void submitWorldgenTiles(
-            LevelRenderContext context,
-            Camera camera,
-            WorldgenSurfaceSnapshot snapshot
-    ) {
+        var cameraPos = camera.position();
+        double cameraX = cameraPos.x();
+        double cameraY = cameraPos.y();
+        double cameraZ = cameraPos.z();
         var frustum = camera.getCullFrustum();
+
+        renderPass.setPipeline(RenderSystem.getCompiledPipeline(EverviewGpuPipeline.TERRAIN));
+        RenderSystem.bindDefaultUniforms(renderPass);
+
+        RenderSystem.AutoStorageIndexBuffer quadIndices =
+                RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
             WorldgenLodRing ring = snapshot.ringForLevel(tile.lodLevel());
-            if (ring == null) {
+            if (ring == null || !tileBelongsToRing(tile, ring, cameraX, cameraZ)) {
                 continue;
             }
 
@@ -68,115 +95,71 @@ public final class EverviewRenderer {
                 continue;
             }
 
-            EverviewMetrics.recordSubmission(tile.lodLevel());
-
-            context.submitNodeCollector().submitCustomGeometry(
-                    context.poseStack(),
-                    RenderTypes.debugQuads(),
-                    (poseState, consumer) -> {
-                        long start = System.nanoTime();
-                        DrawStats drawStats = drawWorldgenTile(
-                                poseState.pose(),
-                                consumer,
-                                tile,
-                                ring,
-                                camera
-                        );
-                        EverviewMetrics.recordTileDraw(
-                                tile.lodLevel(),
-                                System.nanoTime() - start,
-                                drawStats.emittedQuads(),
-                                drawStats.maxQuadDistance()
-                        );
-                    }
-            );
-        }
-    }
-
-    private static DrawStats drawWorldgenTile(
-            Matrix4fc pose,
-            VertexConsumer consumer,
-            WorldgenSurfaceTile tile,
-            WorldgenLodRing ring,
-            Camera camera
-    ) {
-        var cameraPos = camera.position();
-        double cameraX = cameraPos.x();
-        double cameraY = cameraPos.y();
-        double cameraZ = cameraPos.z();
-
-        double innerSq = (double) ring.innerRadiusBlocks() * ring.innerRadiusBlocks();
-        double outerSq = (double) ring.outerRadiusBlocks() * ring.outerRadiusBlocks();
-
-        int emittedQuads = 0;
-        double maxDistanceSq = 0.0;
-        int[] vertices = tile.vertices();
-
-        for (int i = 0; i < vertices.length; i += 12) {
-            double quadCenterX = (vertices[i] + vertices[i + 6]) * 0.5;
-            double quadCenterZ = (vertices[i + 2] + vertices[i + 8]) * 0.5;
-            double dx = quadCenterX - cameraX;
-            double dz = quadCenterZ - cameraZ;
-            double distanceSq = dx * dx + dz * dz;
-
-            if (distanceSq < innerSq || distanceSq > outerSq) {
+            EverviewGpuTileCache.GpuTile gpuTile =
+                    EverviewGpuTileCache.getResident(tile);
+            if (gpuTile == null) {
                 continue;
             }
 
-            drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(),
-                    i, cameraX, cameraY, cameraZ
-            );
-            drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(),
-                    i + 3, cameraX, cameraY, cameraZ
-            );
-            drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(),
-                    i + 6, cameraX, cameraY, cameraZ
-            );
-            drawWorldgenVertex(
-                    pose, consumer, vertices, tile.colors(),
-                    i + 9, cameraX, cameraY, cameraZ
-            );
-            emittedQuads++;
-            maxDistanceSq = Math.max(maxDistanceSq, distanceSq);
-        }
+            EverviewMetrics.recordSubmission(tile.lodLevel());
+            long started = System.nanoTime();
 
-        return new DrawStats(emittedQuads, Math.sqrt(maxDistanceSq));
+            GpuBuffer indexBuffer = quadIndices.getBuffer(gpuTile.indexCount());
+
+            Matrix4f modelView = RenderSystem.getModelViewMatrixCopy();
+            modelView.translate(
+                    (float) (tile.minX() - cameraX),
+                    (float) (-cameraY - 0.22D),
+                    (float) (tile.minZ() - cameraZ)
+            );
+
+            GpuBufferSlice dynamicTransforms = RenderSystem.getDynamicUniforms()
+                    .writeTransform(
+                            modelView,
+                            COLOR_MODULATOR,
+                            MODEL_OFFSET,
+                            TEXTURE_MATRIX
+                    );
+
+            renderPass.setVertexBuffer(0, gpuTile.vertexBuffer().slice());
+            renderPass.setIndexBuffer(indexBuffer, quadIndices.type());
+            renderPass.setUniform("DynamicTransforms", dynamicTransforms);
+            renderPass.drawIndexed(gpuTile.indexCount(), 1, 0, 0, 0);
+
+            double centerX = (tile.minX() + tile.maxX()) * 0.5;
+            double centerZ = (tile.minZ() + tile.maxZ()) * 0.5;
+            double distance = Math.hypot(centerX - cameraX, centerZ - cameraZ);
+
+            EverviewMetrics.recordTileDraw(
+                    tile.lodLevel(),
+                    System.nanoTime() - started,
+                    tile.vertices().length / 12,
+                    distance
+            );
+        }
     }
 
-    private static void drawWorldgenVertex(
-            Matrix4fc pose,
-            VertexConsumer consumer,
-            int[] vertices,
-            int[] colors,
-            int index,
+    /**
+     * Persistent buffers are whole-tile draws, so ring ownership is decided at
+     * tile granularity instead of scanning every quad every frame.
+     */
+    private static boolean tileBelongsToRing(
+            WorldgenSurfaceTile tile,
+            WorldgenLodRing ring,
             double cameraX,
-            double cameraY,
             double cameraZ
     ) {
-        int worldX = vertices[index];
-        int worldY = vertices[index + 1];
-        int worldZ = vertices[index + 2];
+        double centerX = (tile.minX() + tile.maxX()) * 0.5;
+        double centerZ = (tile.minZ() + tile.maxZ()) * 0.5;
+        double centerDistance = Math.hypot(centerX - cameraX, centerZ - cameraZ);
 
-        float x = (float) (worldX - cameraX);
-        // Keep LOD a fraction below vanilla terrain during the overlap band so
-        // real chunks win depth cleanly instead of z-fighting with the coarse mesh.
-        float y = (float) (worldY - 0.22D - cameraY);
-        float z = (float) (worldZ - cameraZ);
-
-        int vertexIndex = index / 3;
-        int rgb = colors[vertexIndex];
-        int red = (rgb >> 16) & 0xFF;
-        int green = (rgb >> 8) & 0xFF;
-        int blue = rgb & 0xFF;
-
-        consumer.addVertex(pose, x, y, z)
-                .setColor(red, green, blue, 255);
+        // M3.3.1 over-corrected the handoff by requiring the entire
+        // 32-block L1 tile to sit outside the inner radius. That creates an
+        // extra camera-centered dead zone, making the LOD appear to "run away"
+        // as the player moves. Center ownership keeps the boundary stable while
+        // the small 32-block L1 tiles limit inward spill to roughly half a tile.
+        // Vanilla depth still wins where the two representations overlap.
+        return centerDistance >= ring.innerRadiusBlocks()
+                && centerDistance <= ring.outerRadiusBlocks();
     }
-
-    private record DrawStats(int emittedQuads, double maxQuadDistance) {
-    }
-
 }
