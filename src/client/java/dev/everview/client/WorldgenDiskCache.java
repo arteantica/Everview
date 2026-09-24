@@ -28,7 +28,7 @@ import java.util.zip.GZIPOutputStream;
  */
 public final class WorldgenDiskCache {
     private static final int MAGIC = 0x45564C31; // EVL1
-    private static final int VERSION = 30;
+    private static final int VERSION = 31;
     private static final int MAX_TILES = 100_000;
     private static final int MAX_VERTEX_INTS = 4_000_000;
 
@@ -43,7 +43,7 @@ public final class WorldgenDiskCache {
 
         return server.getWorldPath(LevelResource.ROOT)
                 .resolve("everview")
-                .resolve("lod-cache-v30")
+                .resolve("lod-cache-v31")
                 .resolve(dimensionId + ".evc.gz");
     }
 

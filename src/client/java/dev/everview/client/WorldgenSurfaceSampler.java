@@ -53,20 +53,24 @@ public final class WorldgenSurfaceSampler {
     public static final long NORMAL_MAX_SLICE_BUDGET_NANOS = 12_000_000L;
     public static final long MAX_SLICE_BUDGET_NANOS = 16_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 128;
+    // M9 biases worker capacity toward exact L1 while leaving explicit CPU
+    // headroom for Minecraft's render/server threads. On a 16-thread desktop
+    // this resolves to 5 exact + 6 coverage workers instead of saturating the
+    // machine with the old 4 + 8 split.
     private static final int EXACT_HEIGHT_WORKERS = Math.max(
             2,
             Math.min(
-                    4,
-                    Runtime.getRuntime().availableProcessors() / 4
+                    6,
+                    Runtime.getRuntime().availableProcessors() / 3
             )
     );
     private static final int COVERAGE_HEIGHT_WORKERS = Math.max(
             2,
             Math.min(
-                    8,
+                    6,
                     Runtime.getRuntime().availableProcessors()
                             - EXACT_HEIGHT_WORKERS
-                            - 2
+                            - 4
             )
     );
     private static final int MAX_DETACHED_EXACT_JOBS = EXACT_HEIGHT_WORKERS;
@@ -77,8 +81,8 @@ public final class WorldgenSurfaceSampler {
     private static final int APPEARANCE_WORKERS = Math.max(
             2,
             Math.min(
-                    4,
-                    Runtime.getRuntime().availableProcessors() / 4
+                    3,
+                    Runtime.getRuntime().availableProcessors() / 5
             )
     );
     private static final int MAX_DETACHED_APPEARANCE_JOBS =
@@ -93,13 +97,13 @@ public final class WorldgenSurfaceSampler {
     private static final double PREDICTION_START_BLOCKS_PER_SECOND = 12.0;
     private static final double HIGH_SPEED_BLOCKS_PER_SECOND = 64.0;
     private static final double VELOCITY_SMOOTHING = 0.35;
-    private static final double PREDICTION_SECONDS = 3.0;
-    private static final int MAX_PREDICTIVE_LEAD_BLOCKS = 1_536;
+    private static final double PREDICTION_SECONDS = 4.0;
+    private static final int MAX_PREDICTIVE_LEAD_BLOCKS = 3_072;
     private static final int PREDICTIVE_ANCHOR_QUANTUM = 64;
     private static final int REMAINING_COVERAGE_BURST = 8;
     private static final int INITIAL_COVERAGE_CYCLE = 7;
     private static final int EXACT_GEOMETRY_BURST = 2;
-    private static final int MAX_PROVISIONAL_EXACT_TILES = 32;
+    private static final int MAX_PROVISIONAL_EXACT_TILES = 128;
     private static final int FOCUSED_L5_SAMPLE_SPACING = 4;
     private static final int FOCUSED_L6_SAMPLE_SPACING = 8;
     // Keep expensive high-density far refinement tightly centered on the
@@ -109,23 +113,32 @@ public final class WorldgenSurfaceSampler {
     private static final int APPEARANCE_COVERAGE_BURST = 4;
     private static final int SHARED_HEIGHT_CACHE_LIMIT = 1_250_000;
     private static final int SHARED_BIOME_CACHE_LIMIT = 350_000;
-    private static final int L1_PREFETCH_BLOCKS = 64;
-    private static final int L2_PREFETCH_BLOCKS = 128;
+    private static final int L1_PREFETCH_BLOCKS = 256;
+    private static final int L2_PREFETCH_BLOCKS = 256;
     private static final int L1_BOOTSTRAP_SPACING = 4;
     private static final int L1_INTERMEDIATE_SPACING = 2;
     private static final int L1_EXACT_SPACING = 1;
-    private static final int L1_FINE_GRID_SAMPLES = 65;
-    private static final int L1_SAMPLE_CACHE_LIMIT = 1_024;
-    // M6.2: the whole visible L1 annulus is an exact 1-block target.
-    // Bootstrap still appears at 4b, but exact workers immediately replace it.
-    private static final int L1_EXACT_BAND_BLOCKS = 512;
-    private static final int L1_INTERMEDIATE_BAND_BLOCKS = 512;
+    private static final int L1_FINE_GRID_SAMPLES = 129;
+    private static final int L1_SAMPLE_CACHE_LIMIT = 640;
+    // M9 keeps a wide all-direction exact core and extends true 1-block terrain
+    // through the current view all the way to the outer L1 boundary.
+    private static final int L1_EXACT_BAND_BLOCKS = 896;
+    private static final int L1_INTERMEDIATE_BAND_BLOCKS = 1_280;
+    private static final double L1_FOCUS_DOT_THRESHOLD = 0.35D;
+    private static final int L1_OUTER_RADIUS_BLOCKS = 2_048;
+
+    // Persist useful work while streaming instead of waiting for the complete
+    // 16K initial fill. This is the warm-rejoin contract for M9.
+    private static final long DISK_AUTOSAVE_INTERVAL_NANOS =
+            3_000_000_000L;
+    private static final int DISK_AUTOSAVE_MIN_DIRTY_TILES = 16;
     private static final int VIEW_SECTOR_COUNT = 16;
     private static final double VIEW_SECTOR_DEGREES = 360.0 / VIEW_SECTOR_COUNT;
     private static final int COVERAGE_FRONTIER_BUCKET_BLOCKS = 64;
 
     private static final Map<LodTileKey, WorldgenSurfaceTile> CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
+    private static long cacheResidentBytes;
     private static final Map<LodTileKey, L1SampleGrid> L1_SAMPLE_CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
     private static final ConcurrentHashMap<Long, Integer>
@@ -191,6 +204,8 @@ public final class WorldgenSurfaceSampler {
     private static String diskCacheDimension = "";
     private static boolean diskLoadReady;
     private static boolean cacheDirty;
+    private static int dirtyTilesSinceSave;
+    private static long lastDiskSaveStartedNanos;
     private static int diskLoadedTiles;
     private static double diskLoadMs;
     private static int diskSavedTiles;
@@ -256,6 +271,10 @@ public final class WorldgenSurfaceSampler {
 
     public static int coverageWorkerCount() {
         return COVERAGE_HEIGHT_WORKERS;
+    }
+
+    public static double cpuTileCacheMiB() {
+        return cacheResidentBytes / (1024.0 * 1024.0);
     }
 
     public static int exactWorkerCount() {
@@ -820,8 +839,12 @@ public final class WorldgenSurfaceSampler {
                 WorldgenDiskCache.LoadResult result = diskLoadFuture.join();
 
                 for (WorldgenSurfaceTile tile : result.tiles()) {
-                    CACHE.put(
-                            new LodTileKey(tile.lodLevel(), tile.tileX(), tile.tileZ()),
+                    putCacheTile(
+                            new LodTileKey(
+                                    tile.lodLevel(),
+                                    tile.tileX(),
+                                    tile.tileZ()
+                            ),
                             tile
                     );
                 }
@@ -850,10 +873,18 @@ public final class WorldgenSurfaceSampler {
 
                 if (!"SAVED".equals(result.status())) {
                     cacheDirty = true;
+                    dirtyTilesSinceSave = Math.max(
+                            dirtyTilesSinceSave,
+                            DISK_AUTOSAVE_MIN_DIRTY_TILES
+                    );
                 }
             } catch (RuntimeException exception) {
                 diskCacheStatus = "SAVE_ERROR";
                 cacheDirty = true;
+                dirtyTilesSinceSave = Math.max(
+                        dirtyTilesSinceSave,
+                        DISK_AUTOSAVE_MIN_DIRTY_TILES
+                );
                 EverviewClient.LOGGER.warn("Everview LOD cache save task failed", exception);
             } finally {
                 diskSaveFuture = null;
@@ -865,7 +896,20 @@ public final class WorldgenSurfaceSampler {
         if (!cacheDirty
                 || diskCachePath == null
                 || diskSaveFuture != null
-                || !snapshot.initialFillComplete()) {
+                || !diskLoadReady) {
+            return;
+        }
+
+        long now = System.nanoTime();
+        boolean enoughNewTiles =
+                dirtyTilesSinceSave >= DISK_AUTOSAVE_MIN_DIRTY_TILES;
+        boolean intervalElapsed =
+                lastDiskSaveStartedNanos == 0L
+                        || now - lastDiskSaveStartedNanos
+                                >= DISK_AUTOSAVE_INTERVAL_NANOS;
+
+        if (!snapshot.initialFillComplete()
+                && (!enoughNewTiles || !intervalElapsed)) {
             return;
         }
 
@@ -877,6 +921,8 @@ public final class WorldgenSurfaceSampler {
         String dimension = diskCacheDimension;
 
         cacheDirty = false;
+        dirtyTilesSinceSave = 0;
+        lastDiskSaveStartedNanos = now;
         diskCacheStatus = "SAVING";
         diskSaveFuture = CompletableFuture.supplyAsync(
                 () -> WorldgenDiskCache.save(path, seed, dimension, tiles)
@@ -884,7 +930,7 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static void scheduleDetachedSaveIfDirty() {
-        if (!cacheDirty || diskCachePath == null || CACHE.isEmpty() || diskSaveFuture != null) {
+        if (!cacheDirty || diskCachePath == null || CACHE.isEmpty()) {
             return;
         }
 
@@ -894,10 +940,21 @@ public final class WorldgenSurfaceSampler {
         Path path = diskCachePath;
         long seed = diskCacheSeed;
         String dimension = diskCacheDimension;
+        CompletableFuture<WorldgenDiskCache.SaveResult> inFlight =
+                diskSaveFuture;
 
-        CompletableFuture.runAsync(
-                () -> WorldgenDiskCache.save(path, seed, dimension, tiles)
-        );
+        // If an autosave is already writing, chain the final world-exit snapshot
+        // behind it. This avoids two writers fighting over the same cache temp
+        // file and guarantees the newest snapshot wins.
+        CompletableFuture.runAsync(() -> {
+            if (inFlight != null) {
+                try {
+                    inFlight.join();
+                } catch (RuntimeException ignored) {
+                }
+            }
+            WorldgenDiskCache.save(path, seed, dimension, tiles);
+        });
     }
 
     private static void updateAdaptiveBudget(Minecraft client, MinecraftServer server) {
@@ -942,23 +999,19 @@ public final class WorldgenSurfaceSampler {
     private static List<WorldgenLodRing> createRings(int innerRadius) {
         List<WorldgenLodRing> rings = new ArrayList<>(6);
 
-        // M3.6 pushes exact ultra-near sampling from 2 blocks to 1 block.
-        // Progressive streaming still bootstraps these 32-block tiles at
-        // 2-block spacing first, so coverage stays fast while exact detail
-        // catches up behind the L2 safety layer.
-        // M6.4 materially widens the exact-quality band. With the usual
-        // 20-24 chunk vanilla distance this places roughly 500 blocks of
-        // 1-block LOD beyond the vanilla edge instead of ~190.
+        // M9 moves L1 from a narrow transition ring to a real near-distance
+        // product. A wide exact core surrounds the player and the current view
+        // can refine true 1-block terrain all the way to ~2K.
         int ultraNearOuter = Math.min(
-                1_024,
-                Math.max(768, innerRadius + 512)
+                L1_OUTER_RADIUS_BLOCKS,
+                Math.max(1_536, innerRadius + 1_536)
         );
 
         rings.add(new WorldgenLodRing(
                 1,
                 innerRadius,
                 ultraNearOuter,
-                64,
+                128,
                 1
         ));
 
@@ -968,7 +1021,7 @@ public final class WorldgenSurfaceSampler {
         rings.add(new WorldgenLodRing(
                 2,
                 innerRadius,
-                1_024,
+                L1_OUTER_RADIUS_BLOCKS,
                 128,
                 2
         ));
@@ -1012,6 +1065,7 @@ public final class WorldgenSurfaceSampler {
         scheduleDetachedSaveIfDirty();
         epoch++;
         CACHE.clear();
+        cacheResidentBytes = 0L;
         L1_SAMPLE_CACHE.clear();
         SHARED_HEIGHT_CACHE.clear();
         SHARED_HEIGHT_HITS.set(0L);
@@ -1066,6 +1120,8 @@ public final class WorldgenSurfaceSampler {
         diskCacheDimension = "";
         diskLoadReady = false;
         cacheDirty = false;
+        dirtyTilesSinceSave = 0;
+        lastDiskSaveStartedNanos = 0L;
         diskLoadedTiles = 0;
         diskLoadMs = 0.0;
         diskSavedTiles = 0;
@@ -1089,10 +1145,11 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
-            CACHE.put(completed.key(), completed.tile());
+            putCacheTile(completed.key(), completed.tile());
             lastGenerationMs = completed.tile().generationMs();
             generatedTileCount++;
             cacheDirty = true;
+            dirtyTilesSinceSave++;
 
             if (completed.tile().lodLevel() == 1) {
                 lastRefineReusedSamples = completed.reusedSamples();
@@ -1310,28 +1367,31 @@ public final class WorldgenSurfaceSampler {
                         double dx = tileCenterX - centerX;
                         double dz = tileCenterZ - centerZ;
 
-                        // Front hemisphere is urgent. Rear L1 stays optional
-                        // because the persistent L2 underlay already covers it.
-                        foreground = dx * forwardX + dz * forwardZ >= 0.0;
+                        // Only the view-relevant sector gets the expensive
+                        // extended exact lane. The all-direction exact core
+                        // remains wide enough that turning never exposes a
+                        // coarse wall directly outside vanilla.
+                        double distance = Math.hypot(dx, dz);
+                        double facing = distance <= 1.0D
+                                ? 1.0D
+                                : (dx * forwardX + dz * forwardZ) / distance;
+                        foreground = facing >= L1_FOCUS_DOT_THRESHOLD;
+
                         if (!visibleNow) {
                             targetSpacing = L1_BOOTSTRAP_SPACING;
                         } else {
                             int exactOuter = Math.min(
                                     ring.outerRadiusBlocks(),
-                                    ring.innerRadiusBlocks() + L1_EXACT_BAND_BLOCKS
+                                    ring.innerRadiusBlocks()
+                                            + L1_EXACT_BAND_BLOCKS
                             );
                             int intermediateOuter = Math.min(
                                     ring.outerRadiusBlocks(),
-                                    ring.innerRadiusBlocks() + L1_INTERMEDIATE_BAND_BLOCKS
+                                    ring.innerRadiusBlocks()
+                                            + L1_INTERMEDIATE_BAND_BLOCKS
                             );
 
-                            // Use tile/annulus intersection, not tile-center
-                            // distance. If any part of a visible 32x32 tile
-                            // touches the exact belt, refine the whole tile to
-                            // 1b. This deliberately adds up to one tile of
-                            // overlap so a coarser island cannot sit between
-                            // vanilla and already-exact terrain.
-                            if (tileIntersectsAnnulus(
+                            boolean inExactCore = tileIntersectsAnnulus(
                                     tileX,
                                     tileZ,
                                     centerX,
@@ -1339,7 +1399,19 @@ public final class WorldgenSurfaceSampler {
                                     ring.innerRadiusBlocks(),
                                     exactOuter,
                                     tileSize
-                            )) {
+                            );
+                            boolean inFocusedExact = foreground
+                                    && tileIntersectsAnnulus(
+                                            tileX,
+                                            tileZ,
+                                            centerX,
+                                            centerZ,
+                                            exactOuter,
+                                            ring.outerRadiusBlocks(),
+                                            tileSize
+                                    );
+
+                            if (inExactCore || inFocusedExact) {
                                 targetSpacing = L1_EXACT_SPACING;
                             } else if (tileIntersectsAnnulus(
                                     tileX,
@@ -1706,23 +1778,21 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile firstDetachedCoverageCandidate() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        // M6.8 uses eight independent producer phases:
-        // L1, L1, L2, L3, L4, L5, L6, far refinement.
-        // Two slots are reserved for L1 bootstrap because exact workers cannot
-        // do anything until a 4b L1 tile exists with appearance anchors.
+        // M9 reserves more producer slots for the visible L1 bootstrap so the
+        // exact worker pool receives usable 4b appearance anchors immediately.
+        // Coarse safety coverage still advances continuously in parallel.
         for (int attempt = 0; attempt < 8; attempt++) {
             int phase = detachedCoverageLaunchStep % 8;
             detachedCoverageLaunchStep =
                     (detachedCoverageLaunchStep + 1) % 8;
 
             WantedTile candidate = switch (phase) {
-                case 0, 1 -> firstMissingL1BootstrapCoverage(pending);
-                case 2 -> firstMissingLevelCoverage(pending, 2);
-                case 3 -> firstMissingLevelCoverage(pending, 3);
-                case 4 -> firstMissingLevelCoverage(pending, 4);
-                case 5 -> firstMissingLevelCoverage(pending, 5);
-                case 6 -> firstMissingLevelCoverage(pending, 6);
-                default -> firstDetachedFarRefinementCandidate(pending);
+                case 0, 1, 2 -> firstMissingL1BootstrapCoverage(pending);
+                case 3 -> firstMissingLevelCoverage(pending, 2);
+                case 4 -> firstMissingLevelCoverage(pending, 3);
+                case 5 -> firstMissingLevelCoverage(pending, 4);
+                case 6 -> firstMissingLevelCoverage(pending, 5);
+                default -> firstMissingLevelCoverage(pending, 6);
             };
 
             if (candidate != null
@@ -4944,15 +5014,39 @@ public final class WorldgenSurfaceSampler {
         return MinecraftSurfacePalette.applyLighting(color, shade);
     }
 
+    private static void putCacheTile(
+            LodTileKey key,
+            WorldgenSurfaceTile tile
+    ) {
+        WorldgenSurfaceTile previous = CACHE.put(key, tile);
+        if (previous != null) {
+            cacheResidentBytes -= estimatedTileBytes(previous);
+        }
+        cacheResidentBytes += estimatedTileBytes(tile);
+    }
+
+    private static long estimatedTileBytes(WorldgenSurfaceTile tile) {
+        return (long) tile.vertices().length * Integer.BYTES
+                + (long) tile.colors().length * Integer.BYTES
+                + tile.materials().length;
+    }
+
     private static void trimCache() {
-        Iterator<LodTileKey> iterator = CACHE.keySet().iterator();
+        Iterator<Map.Entry<LodTileKey, WorldgenSurfaceTile>> iterator =
+                CACHE.entrySet().iterator();
 
         while (CACHE.size() > CACHE_LIMIT && iterator.hasNext()) {
-            LodTileKey key = iterator.next();
-            if (containsWantedKey(key)) {
+            Map.Entry<LodTileKey, WorldgenSurfaceTile> entry =
+                    iterator.next();
+            if (containsWantedKey(entry.getKey())) {
                 continue;
             }
+            cacheResidentBytes -= estimatedTileBytes(entry.getValue());
             iterator.remove();
+        }
+
+        if (cacheResidentBytes < 0L) {
+            cacheResidentBytes = 0L;
         }
     }
 
@@ -5158,7 +5252,7 @@ public final class WorldgenSurfaceSampler {
         private L1SampleGrid(int tileSize) {
             if (tileSize + 1 != L1_FINE_GRID_SAMPLES) {
                 throw new IllegalArgumentException(
-                        "L1 sample hierarchy expects 64-block tiles"
+                        "L1 sample hierarchy expects 128-block tiles"
                 );
             }
 
