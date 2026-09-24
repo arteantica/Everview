@@ -210,6 +210,7 @@ public final class WorldgenSurfaceSampler {
     private static final Map<LodTileKey, GenerationJob>
             DETACHED_COVERAGE_JOBS = new ConcurrentHashMap<>();
     private static int detachedCoverageLaunchStep;
+    private static int detachedFarRefineLevelStep;
 
     private WorldgenSurfaceSampler() {
     }
@@ -901,14 +902,16 @@ public final class WorldgenSurfaceSampler {
                 emergencyInnerRadius,
                 2_048,
                 256,
-                4
+                2
         ));
-        // M6.2 uses a strict powers-of-two visual ladder after exact L1:
-        // L2 2b -> L3 4b -> L4 8b -> L5 16b -> L6 32b.
-        // First fill remains 2x coarser for L3-L6, then refinement converges.
-        rings.add(new WorldgenLodRing(4, 0, 4_096, 512, 8));
-        rings.add(new WorldgenLodRing(5, 0, 8_192, 1_024, 16));
-        rings.add(new WorldgenLodRing(6, 0, 16_384, 2_048, 32));
+        // M6.7 raises the settled visual ceiling again:
+        // L2 2b -> L3 2b -> L4 4b -> L5 8b -> L6 16b.
+        // The bootstrap path is still deliberately coarser, but because every
+        // final target is halved, first-visible far terrain is also twice as
+        // dense as M6.6.
+        rings.add(new WorldgenLodRing(4, 0, 4_096, 512, 4));
+        rings.add(new WorldgenLodRing(5, 0, 8_192, 1_024, 8));
+        rings.add(new WorldgenLodRing(6, 0, 16_384, 2_048, 16));
 
         return List.copyOf(rings);
     }
@@ -985,6 +988,7 @@ public final class WorldgenSurfaceSampler {
         cancelDetachedExactJobs();
         cancelDetachedCoverageJobs();
         detachedCoverageLaunchStep = 0;
+        detachedFarRefineLevelStep = 0;
         activeSliceId = 0L;
     }
 
@@ -1612,25 +1616,26 @@ public final class WorldgenSurfaceSampler {
     private static WantedTile firstDetachedCoverageCandidate() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
 
-        // Keep a stable mix of near fallback, L3 shield, L6 horizon and the
-        // progressive middle. Each selected tile is reserved immediately by
-        // DETACHED_COVERAGE_JOBS, so repeated calls naturally walk outward.
+        // M6.7 gives every distance band a live lane from the beginning:
+        // L2, L3, L4, L5, L6, then one refinement slot. M6.6 could complete
+        // L4 while L5 stayed at zero, leaving a very obvious coarse far band.
         for (int attempt = 0; attempt < 6; attempt++) {
             int phase = detachedCoverageLaunchStep % 6;
             detachedCoverageLaunchStep =
                     (detachedCoverageLaunchStep + 1) % 6;
 
             WantedTile candidate = switch (phase) {
-                case 0, 1 -> firstMissingFallbackCoverage(pending);
-                case 2, 3 -> firstMissingEmergencyUnderlayCoverage(pending);
-                case 4 -> firstMissingGlobalSafetyFloorCoverage(pending);
-                default -> firstMissingProgressiveFarCoverage(pending);
+                case 0 -> firstMissingLevelCoverage(pending, 2);
+                case 1 -> firstMissingLevelCoverage(pending, 3);
+                case 2 -> firstMissingLevelCoverage(pending, 4);
+                case 3 -> firstMissingLevelCoverage(pending, 5);
+                case 4 -> firstMissingLevelCoverage(pending, 6);
+                default -> firstDetachedFarRefinementCandidate(pending);
             };
 
             if (candidate != null
                     && candidate.ring().lodLevel() >= 2
-                    && candidate.ring().lodLevel() <= 6
-                    && CACHE.get(candidate.key()) == null) {
+                    && candidate.ring().lodLevel() <= 6) {
                 return candidate;
             }
         }
@@ -1640,9 +1645,56 @@ public final class WorldgenSurfaceSampler {
             return fallback;
         }
 
-        WantedTile l2 = firstMissingFallbackCoverage(pending);
-        if (l2 != null) {
-            return l2;
+        WantedTile refine = firstDetachedFarRefinementCandidate(pending);
+        if (refine != null) {
+            return refine;
+        }
+
+        return firstMissingFallbackCoverage(pending);
+    }
+
+    private static WantedTile firstMissingLevelCoverage(
+            LodTileKey pending,
+            int lodLevel
+    ) {
+        for (WantedTile wanted : wantedTiles) {
+            if (wanted.key().equals(pending)
+                    || wanted.prefetch()
+                    || wanted.ring().lodLevel() != lodLevel) {
+                continue;
+            }
+
+            if (isTileMissing(wanted.key())) {
+                return wanted;
+            }
+        }
+
+        return null;
+    }
+
+    private static WantedTile firstDetachedFarRefinementCandidate(
+            LodTileKey pending
+    ) {
+        for (int attempt = 0; attempt < 4; attempt++) {
+            int level = 3 + (detachedFarRefineLevelStep % 4);
+            detachedFarRefineLevelStep =
+                    (detachedFarRefineLevelStep + 1) % 4;
+
+            for (WantedTile wanted : wantedTiles) {
+                if (wanted.key().equals(pending)
+                        || wanted.prefetch()
+                        || wanted.ring().lodLevel() != level
+                        || DETACHED_COVERAGE_JOBS.containsKey(wanted.key())) {
+                    continue;
+                }
+
+                WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+                if (tile != null
+                        && tile.sampleSpacing()
+                                > wanted.ring().sampleSpacing()) {
+                    return wanted;
+                }
+            }
         }
 
         return null;
@@ -2165,12 +2217,17 @@ public final class WorldgenSurfaceSampler {
     ) {
         LodTileKey key = wanted.key();
         if (wanted.ring().lodLevel() < 2
-                || CACHE.containsKey(key)
                 || DETACHED_COVERAGE_JOBS.containsKey(key)) {
             return false;
         }
 
         WorldgenSurfaceTile existing = CACHE.get(key);
+        if (existing != null
+                && existing.sampleSpacing()
+                        <= wanted.ring().sampleSpacing()) {
+            return false;
+        }
+
         int spacing = nextGenerationSpacing(wanted, existing);
         GenerationJob job = new GenerationJob(
                 key,

@@ -347,3 +347,16 @@
 - [x] invalidate cache with v26 for cold-start comparison
 - [ ] benchmark 30s / 60s / 120s coverage against M6.4 and M6.5
 - [ ] validate no sky slits while moving sideways along the vanilla/LOD boundary
+
+
+## M6.7 far fidelity stream
+- [x] halve settled far spacing to L3 2b / L4 4b / L5 8b / L6 16b
+- [x] make first-visible far geometry twice as dense as M6.6 through the denser targets
+- [x] give L2, L3, L4, L5 and L6 independent detached coverage phases instead of letting L5 wait behind L4
+- [x] reserve one detached streaming phase for live far refinement while coverage is still progressing
+- [x] allow detached coverage workers to refine an existing coarse L3-L6 tile without removing its current visible mesh
+- [x] round-robin far refinement across L3-L6 so the horizon improves everywhere instead of finishing one whole ring first
+- [x] invalidate cache with v27 for a clean visual/timing comparison
+- [ ] compare 45s screenshot against M6.6 for L5 population and far silhouette quality
+- [ ] benchmark settled far refinement cost before increasing density again
+- [ ] begin actual block-atlas/UV surface rendering once this geometry ladder is acceptable
