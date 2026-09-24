@@ -308,7 +308,7 @@
 ## M6.4 streaming core + HUD
 - [x] compact HUD by default with F8 toggle to the full telemetry panel
 - [x] force the vanilla/Sodium chunk fade option to zero while Everview is active
-- [x] force RenderSection.setFadeDuration to zero regardless of caller
+- [x] remove unsupported direct fade-method injections; enforce the supported vanilla/Sodium chunk-fade option at zero
 - [x] widen vanilla/LOD overlap from 32b to 64b
 - [x] keep LOD under freshly uploaded vanilla for a 120ms opaque handoff grace window
 - [x] widen the exact L1 band from ~192b to roughly 500b beyond the vanilla edge
@@ -319,3 +319,17 @@
 - [ ] benchmark cold-start tiles/s and time to first complete 16K horizon
 - [ ] add cross-LOD shared height sample cache to eliminate duplicate worldgen calls
 - [ ] move material/mesh finishing off the server lane after thread-safety validation
+
+
+## M6.5 saturated detail pipeline
+- [x] raise detached exact L1 concurrency from 2 to up to 4 independent tile workers
+- [x] allow a larger provisional exact-geometry lead so exact workers do not stall behind appearance debt
+- [x] service exact-appearance debt continuously during coverage instead of waiting for the far cascade to finish
+- [x] add a shared deterministic world-column height cache reused across L1-L6 and refinement passes
+- [x] bound shared height storage at 1.25M columns
+- [x] expose exact-worker saturation and shared-height reuse in compact/full HUD telemetry
+- [x] invalidate M6.4 cache with v25 for a clean cold-start benchmark
+- [ ] benchmark exact workers staying active during the first two minutes
+- [ ] benchmark shared-height hit rate as L3/L6 bootstrap refines
+- [ ] detach multiple L2-L6 tile-height jobs concurrently instead of parallelizing only one coverage tile at a time
+- [ ] move appearance/mesh finishing into its own bounded pipeline after thread-safety validation

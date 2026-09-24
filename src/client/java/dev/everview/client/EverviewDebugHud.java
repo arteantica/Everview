@@ -68,7 +68,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSnapshot far
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M6.4 | F8 details");
+        lines.add("Everview M6.5 | F8 details");
 
         if (!far.available()) {
             lines.add("LOD worldgen unavailable");
@@ -91,9 +91,13 @@ public final class EverviewDebugHud {
                 front.desired(),
                 tilesPerSecond
         ));
+        WorldgenSurfaceSampler.RefinementReuseStatus reuse =
+                WorldgenSurfaceSampler.refinementReuseStatus();
         lines.add(String.format(
-                "Gen %.1f ms | geometry %.3f ms | %s",
+                "Gen %.1f ms | exact %d/%d | geometry %.3f ms | %s",
                 far.sliceBudgetMs(),
+                reuse.exactJobsActive(),
+                WorldgenSurfaceSampler.exactWorkerCount(),
                 metrics.drawMs(),
                 stream.highSpeedCoverageMode() ? "FAST COVERAGE" : "NORMAL"
         ));
@@ -109,10 +113,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M6.4 DEV | STREAMING CORE");
+        lines.add("Everview M6.5 DEV | SATURATED DETAIL PIPELINE");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Streaming: async L2-L6 height workers | progressive 4x far bootstrap");
+        lines.add("Streaming: saturated exact lane | shared cross-LOD heights | progressive far bootstrap");
         lines.add("Handoff: 64b overlap | upload grace | chunk fade forced OFF");
         lines.add("LOD targets: L1 1b | L2 2b | L3 4b | L4 8b | L5 16b | L6 32b");
         lines.add(String.format(
@@ -324,11 +328,23 @@ public final class EverviewDebugHud {
             ));
             lines.add("Height workers: exact "
                     + reuse.exactJobsActive()
-                    + "/2 | coverage "
+                    + "/"
+                    + WorldgenSurfaceSampler.exactWorkerCount()
+                    + " | coverage "
                     + WorldgenSurfaceSampler.coverageWorkerCount()
                     + (reuse.serverExactFallback()
                             ? " | SERVER FALLBACK"
                             : ""));
+
+            WorldgenSurfaceSampler.SharedHeightCacheStatus shared =
+                    WorldgenSurfaceSampler.sharedHeightCacheStatus();
+            lines.add(String.format(
+                    "Shared heights: %,d entries | %,d hits / %,d misses | %.1f%% reuse",
+                    shared.entries(),
+                    shared.hits(),
+                    shared.misses(),
+                    shared.hitPercent()
+            ));
         } else {
             lines.add("Far WORLDGEN: unavailable (singleplayer test path)");
         }

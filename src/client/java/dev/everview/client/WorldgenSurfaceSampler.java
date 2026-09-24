@@ -24,6 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Budgeted progressive distant-worldgen sampler.
@@ -50,12 +51,20 @@ public final class WorldgenSurfaceSampler {
     public static final long NORMAL_MAX_SLICE_BUDGET_NANOS = 12_000_000L;
     public static final long MAX_SLICE_BUDGET_NANOS = 16_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 128;
-    private static final int EXACT_HEIGHT_WORKERS = 2;
+    private static final int EXACT_HEIGHT_WORKERS = Math.max(
+            2,
+            Math.min(
+                    4,
+                    Runtime.getRuntime().availableProcessors() / 4
+            )
+    );
     private static final int COVERAGE_HEIGHT_WORKERS = Math.max(
             2,
             Math.min(
                     8,
-                    Runtime.getRuntime().availableProcessors() - 2
+                    Runtime.getRuntime().availableProcessors()
+                            - EXACT_HEIGHT_WORKERS
+                            - 2
             )
     );
     private static final int MAX_DETACHED_EXACT_JOBS = EXACT_HEIGHT_WORKERS;
@@ -75,7 +84,10 @@ public final class WorldgenSurfaceSampler {
     private static final int REMAINING_COVERAGE_BURST = 8;
     private static final int INITIAL_COVERAGE_CYCLE = 7;
     private static final int EXACT_GEOMETRY_BURST = 2;
-    private static final int MAX_PROVISIONAL_EXACT_TILES = 8;
+    private static final int MAX_PROVISIONAL_EXACT_TILES = 32;
+    private static final int APPEARANCE_SERVICE_THRESHOLD = 4;
+    private static final int APPEARANCE_COVERAGE_BURST = 4;
+    private static final int SHARED_HEIGHT_CACHE_LIMIT = 1_250_000;
     private static final int L1_PREFETCH_BLOCKS = 64;
     private static final int L2_PREFETCH_BLOCKS = 128;
     private static final int L1_BOOTSTRAP_SPACING = 4;
@@ -95,6 +107,10 @@ public final class WorldgenSurfaceSampler {
             new LinkedHashMap<>(512, 0.75F, true);
     private static final Map<LodTileKey, L1SampleGrid> L1_SAMPLE_CACHE =
             new LinkedHashMap<>(512, 0.75F, true);
+    private static final ConcurrentHashMap<Long, Integer>
+            SHARED_HEIGHT_CACHE = new ConcurrentHashMap<>(262_144);
+    private static final AtomicLong SHARED_HEIGHT_HITS = new AtomicLong();
+    private static final AtomicLong SHARED_HEIGHT_MISSES = new AtomicLong();
     private static final ConcurrentLinkedQueue<CompletedTile> COMPLETED =
             new ConcurrentLinkedQueue<>();
     private static final ExecutorService EXACT_HEIGHT_EXECUTOR =
@@ -180,6 +196,7 @@ public final class WorldgenSurfaceSampler {
     private static int balancedCoverageStep;
     private static int initialCoverageCycleStep;
     private static int exactGeometryBurstStep;
+    private static int appearanceCoverageStep;
 
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
@@ -196,6 +213,26 @@ public final class WorldgenSurfaceSampler {
 
     public static int coverageWorkerCount() {
         return COVERAGE_HEIGHT_WORKERS;
+    }
+
+    public static int exactWorkerCount() {
+        return EXACT_HEIGHT_WORKERS;
+    }
+
+    public static SharedHeightCacheStatus sharedHeightCacheStatus() {
+        long hits = SHARED_HEIGHT_HITS.get();
+        long misses = SHARED_HEIGHT_MISSES.get();
+        long total = hits + misses;
+        double hitPercent = total == 0L
+                ? 0.0
+                : hits * 100.0 / total;
+
+        return new SharedHeightCacheStatus(
+                SHARED_HEIGHT_CACHE.size(),
+                hits,
+                misses,
+                hitPercent
+        );
     }
 
     public static StreamingStatus streamingStatus() {
@@ -843,6 +880,9 @@ public final class WorldgenSurfaceSampler {
         epoch++;
         CACHE.clear();
         L1_SAMPLE_CACHE.clear();
+        SHARED_HEIGHT_CACHE.clear();
+        SHARED_HEIGHT_HITS.set(0L);
+        SHARED_HEIGHT_MISSES.set(0L);
         COMPLETED.clear();
         activeRings = List.of();
         wantedTiles = List.of();
@@ -879,6 +919,7 @@ public final class WorldgenSurfaceSampler {
         balancedCoverageStep = 0;
         initialCoverageCycleStep = 0;
         exactGeometryBurstStep = 0;
+        appearanceCoverageStep = 0;
         adaptiveSliceBudgetNanos = BASE_SLICE_BUDGET_NANOS;
         serverTickMs = 0.0;
         clientFrameMs = 0.0;
@@ -1321,6 +1362,34 @@ public final class WorldgenSurfaceSampler {
 
     private static WantedTile findNextMissing() {
         LodTileKey pending = currentJob == null ? null : currentJob.key;
+
+        // M6.5 keeps exact L1 geometry workers saturated while guaranteeing
+        // that the server lane continuously pays down exact-appearance debt.
+        // M6.4 could hit the provisional cap with exact workers idle because
+        // coverage returned before appearance work was ever considered.
+        if (!highSpeedCoverageMode) {
+            int provisional = provisionalExactTileCount();
+            WantedTile appearanceDebt = provisional
+                    >= APPEARANCE_SERVICE_THRESHOLD
+                    ? firstExactAppearanceRefinement(pending)
+                    : null;
+
+            if (appearanceDebt != null) {
+                boolean hardDebt =
+                        provisional >= MAX_PROVISIONAL_EXACT_TILES - 4;
+
+                if (hardDebt
+                        || appearanceCoverageStep
+                                >= APPEARANCE_COVERAGE_BURST) {
+                    appearanceCoverageStep = 0;
+                    return appearanceDebt;
+                }
+
+                appearanceCoverageStep++;
+            } else {
+                appearanceCoverageStep = 0;
+            }
+        }
 
         // -2) Normal startup now builds three layers together:
         // 4 near tiles : 2 L3 shield tiles : 1 global L6 horizon tile.
@@ -2339,14 +2408,13 @@ public final class WorldgenSurfaceSampler {
             int fineIndex = job.fineGridIndex(gx, gz);
 
             if (job.sampleGrid == null || fineIndex < 0) {
-                int y = generator.getBaseHeight(
-                        worldX,
-                        worldZ,
-                        Heightmap.Types.WORLD_SURFACE_WG,
+                int y = sampleHeightCached(
                         level,
-                        randomState
+                        generator,
+                        randomState,
+                        worldX,
+                        worldZ
                 );
-                y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
 
                 var biome = level.getNoiseBiome(worldX >> 2, y >> 2, worldZ >> 2);
                 var appearance = MinecraftSurfacePalette.sample(
@@ -2373,14 +2441,13 @@ public final class WorldgenSurfaceSampler {
                     y = grid.heights[fineIndex];
                     job.reusedSamples++;
                 } else {
-                    y = generator.getBaseHeight(
-                            worldX,
-                            worldZ,
-                            Heightmap.Types.WORLD_SURFACE_WG,
-                            level,
-                            randomState
-                    );
-                    y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
+                    y = sampleHeightCached(
+                        level,
+                        generator,
+                        randomState,
+                        worldX,
+                        worldZ
+                );
                     grid.heights[fineIndex] = y;
                     grid.heightSampled[fineIndex] = true;
                     job.generatedSamples++;
@@ -2947,6 +3014,46 @@ public final class WorldgenSurfaceSampler {
         });
     }
 
+    private static int sampleHeightCached(
+            ServerLevel level,
+            net.minecraft.world.level.chunk.ChunkGenerator generator,
+            net.minecraft.world.level.levelgen.RandomState randomState,
+            int worldX,
+            int worldZ
+    ) {
+        long key = packWorldColumn(worldX, worldZ);
+        Integer cached = SHARED_HEIGHT_CACHE.get(key);
+
+        if (cached != null) {
+            SHARED_HEIGHT_HITS.incrementAndGet();
+            return cached;
+        }
+
+        int y = generator.getBaseHeight(
+                worldX,
+                worldZ,
+                Heightmap.Types.WORLD_SURFACE_WG,
+                level,
+                randomState
+        );
+        y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
+        SHARED_HEIGHT_MISSES.incrementAndGet();
+
+        if (SHARED_HEIGHT_CACHE.size() < SHARED_HEIGHT_CACHE_LIMIT) {
+            Integer raced = SHARED_HEIGHT_CACHE.putIfAbsent(key, y);
+            if (raced != null) {
+                return raced;
+            }
+        }
+
+        return y;
+    }
+
+    private static long packWorldColumn(int worldX, int worldZ) {
+        return ((long) worldX << 32)
+                ^ (worldZ & 0xFFFF_FFFFL);
+    }
+
     private static HeightPart computeHeightPart(
             ServerLevel level,
             net.minecraft.world.level.chunk.ChunkGenerator generator,
@@ -2979,14 +3086,13 @@ public final class WorldgenSurfaceSampler {
             int worldX = job.originX + gx * job.sampleSpacing;
             int worldZ = job.originZ + gz * job.sampleSpacing;
 
-            int y = generator.getBaseHeight(
-                    worldX,
-                    worldZ,
-                    Heightmap.Types.WORLD_SURFACE_WG,
-                    level,
-                    randomState
-            );
-            y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
+            int y = sampleHeightCached(
+                        level,
+                        generator,
+                        randomState,
+                        worldX,
+                        worldZ
+                );
 
             indices[i] = sampleIndex;
             heights[i] = y;
@@ -4484,6 +4590,14 @@ public final class WorldgenSurfaceSampler {
             int provisionalExactTiles,
             int exactJobsActive,
             boolean serverExactFallback
+    ) {
+    }
+
+    public record SharedHeightCacheStatus(
+            int entries,
+            long hits,
+            long misses,
+            double hitPercent
     ) {
     }
 
