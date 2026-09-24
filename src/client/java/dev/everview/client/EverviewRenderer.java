@@ -50,6 +50,7 @@ import java.util.Set;
  * draws into that existing pass instead of trying to create a nested pass.
  */
 public final class EverviewRenderer {
+    public static boolean renderEnabled = true;
     private static final Vector4f COLOR_MODULATOR = new Vector4f(1.0F, 1.0F, 1.0F, 1.0F);
     private static final Vector3f MODEL_OFFSET = new Vector3f();
     private static final Matrix4f TEXTURE_MATRIX = new Matrix4f();
@@ -85,12 +86,12 @@ public final class EverviewRenderer {
     private static final Map<ChunkKey, VanillaHandoffState>
             VANILLA_HANDOFF_STATES = new HashMap<>();
     private static ClientLevel compileHintLevel;
-    private static final Map<EverviewGpuRegionCache.GpuTile, FinerMask>
-            FINER_MASK_CACHE = new IdentityHashMap<>();
-    private static long maskResidencyRevision = Long.MIN_VALUE;
-    private static long maskRingSignature = Long.MIN_VALUE;
-    private static double maskCameraX = Double.NaN;
-    private static double maskCameraZ = Double.NaN;
+    private static final Map<EverviewGpuRegionCache.GpuRegion, HandoffPlan> HANDOFF_PLANS = new IdentityHashMap<>();
+    private static final Map<SectionKey, Boolean> FRAME_VISIBILITY = new HashMap<>();
+    private static final Map<ChunkKey, ColumnOwnershipResult> FRAME_COLUMNS = new HashMap<>();
+    private static final Map<ChunkKey, Long> COMPILED_COLUMNS = new HashMap<>();
+    private static EverviewRenderState previousState = EverviewRenderState.EMPTY;
+    private static long lastPrune;
 
     private EverviewRenderer() {
     }
@@ -108,8 +109,9 @@ public final class EverviewRenderer {
                 return;
             }
 
+            if (!renderEnabled) { EverviewFrameProfiler.begin(); return; }
             WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
-            if (!snapshot.tiles().isEmpty()) {
+            {
                 Camera camera = client.gameRenderer.mainCamera();
                 EverviewGpuRegionCache.prepareFrame(
                         client.level,
@@ -121,526 +123,133 @@ public final class EverviewRenderer {
     }
 
     public static void drawPersistentTerrain(RenderPass renderPass) {
+        long frameStarted = System.nanoTime();
         Minecraft client = Minecraft.getInstance();
         Camera camera = client.gameRenderer.mainCamera();
-
-        if (client.level == null
-                || client.player == null
-                || !camera.isInitialized()) {
-            return;
-        }
-
+        if (client.level == null || client.player == null || !camera.isInitialized()) return;
+        if (!renderEnabled) { EverviewMetrics.beginRenderFrame(); EverviewFrameProfiler.finishDraw(frameStarted); return; }
         if (client.level != compileHintLevel) {
-            RECENTLY_COMPILED_SECTIONS.clear();
-            VANILLA_HANDOFF_STATES.clear();
-            FINER_MASK_CACHE.clear();
+            RECENTLY_COMPILED_SECTIONS.clear(); COMPILED_COLUMNS.clear();
+            VANILLA_HANDOFF_STATES.clear(); HANDOFF_PLANS.clear();
             compileHintLevel = client.level;
         }
-        pruneCompileHints();
-        pruneVanillaHandoffStates();
-
-        WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
-        if (snapshot.tiles().isEmpty()) {
-            return;
+        if (frameStarted - lastPrune > 250_000_000L) {
+            pruneCompileHints(); pruneVanillaHandoffStates();
+            COMPILED_COLUMNS.values().removeIf(time -> frameStarted - time > RECENT_COMPILE_HINT_NANOS);
+            lastPrune = frameStarted;
         }
-
-        updateEnvironmentColorModulator(client, camera);
+        EverviewRenderState state = EverviewGpuRegionCache.renderState();
+        if (state != previousState) {
+            Set<EverviewGpuRegionCache.GpuRegion> live = new HashSet<>();
+            for (var plan : state.regions()) live.add(plan.region());
+            HANDOFF_PLANS.keySet().retainAll(live);
+            // Ownership can change in unchanged GPU regions when their neighbors arrive.
+            HANDOFF_PLANS.clear(); previousState = state;
+        }
         EverviewMetrics.beginRenderFrame();
-
-        var cameraPos = camera.position();
-        double cameraX = cameraPos.x();
-        double cameraY = cameraPos.y();
-        double cameraZ = cameraPos.z();
+        lastVanillaOwnedBatches = lastLoadedWaitingBatches = lastVisibleLodBatches = 0;
+        lastFinerOwnedBatches = state.maskedBatches();
+        FRAME_VISIBILITY.clear(); FRAME_COLUMNS.clear();
+        updateEnvironmentColorModulator(client, camera);
+        double x = camera.position().x(), y = camera.position().y(), z = camera.position().z();
+        double vanillaRadius = client.options.getEffectiveRenderDistance() * 16.0;
         var frustum = camera.getCullFrustum();
-
-        long residencyRevision =
-                EverviewGpuRegionCache.residencyRevision();
-        long ringSignature = 1L;
-        for (int level = 1; level <= 6; level++) {
-            WorldgenLodRing ring = snapshot.ringForLevel(level);
-            if (ring != null) {
-                ringSignature = ringSignature * 31L
-                        + ring.innerRadiusBlocks();
-                ringSignature = ringSignature * 31L
-                        + ring.outerRadiusBlocks();
-                ringSignature = ringSignature * 31L
-                        + ring.tileSize();
-            }
-        }
-
-        if (maskResidencyRevision != residencyRevision
-                || maskRingSignature != ringSignature
-                || maskCameraX != cameraX
-                || maskCameraZ != cameraZ) {
-            FINER_MASK_CACHE.clear();
-            maskResidencyRevision = residencyRevision;
-            maskRingSignature = ringSignature;
-            maskCameraX = cameraX;
-            maskCameraZ = cameraZ;
-        }
-
-        renderPass.setPipeline(
-                RenderSystem.getCompiledPipeline(
-                        EverviewGpuPipeline.TERRAIN
-                )
-        );
+        renderPass.setPipeline(RenderSystem.getCompiledPipeline(EverviewGpuPipeline.TERRAIN));
         RenderSystem.bindDefaultUniforms(renderPass);
+        RenderSystem.AutoStorageIndexBuffer quadIndices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
 
-        RenderSystem.AutoStorageIndexBuffer quadIndices =
-                RenderSystem.getSequentialBuffer(
-                        PrimitiveTopology.QUADS
-                );
-
-        WorldgenLodRing l1Ring = snapshot.ringForLevel(1);
-        WorldgenLodRing l2Ring = snapshot.ringForLevel(2);
-        WorldgenLodRing l3Ring = snapshot.ringForLevel(3);
-        WorldgenLodRing l4Ring = snapshot.ringForLevel(4);
-        WorldgenLodRing l5Ring = snapshot.ringForLevel(5);
-
-        Set<Long> residentL1Tiles = new HashSet<>();
-        Set<Long> residentL2Tiles = new HashSet<>();
-        Set<Long> residentL3Tiles = new HashSet<>();
-        Set<Long> residentL4Tiles = new HashSet<>();
-        Set<Long> residentL5Tiles = new HashSet<>();
-
-        Map<SectionKey, Boolean> vanillaVisibility =
-                new HashMap<>();
-        Map<ChunkKey, ColumnOwnershipResult> vanillaColumns =
-                new HashMap<>();
-
-        int vanillaOwnedBatches = 0;
-        int finerOwnedBatches = 0;
-        int visibleLodBatches = 0;
-        int loadedWaitingBatches = 0;
-
-        double vanillaRadius =
-                client.options.getEffectiveRenderDistance() * 16.0D;
-
-        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
-            if (EverviewGpuRegionCache.getResident(tile) == null) {
+        for (var plan : state.regions()) {
+            long stage = System.nanoTime();
+            boolean visible = frustum.isVisible(plan.bounds());
+            EverviewFrameProfiler.visibility += System.nanoTime() - stage;
+            if (!visible) {
+                for (var tile : plan.tiles()) EverviewMetrics.recordCulledTile(tile.tile().source().lodLevel());
                 continue;
             }
-
-            long packed = packTile(tile.tileX(), tile.tileZ());
-            switch (tile.lodLevel()) {
-                case 1 -> residentL1Tiles.add(packed);
-                case 2 -> residentL2Tiles.add(packed);
-                case 3 -> residentL3Tiles.add(packed);
-                case 4 -> residentL4Tiles.add(packed);
-                case 5 -> residentL5Tiles.add(packed);
-                default -> {
-                }
+            boolean handoff = plan.region().lodLevel() <= 3 && intersects(plan.bounds(), x, z, vanillaRadius + VANILLA_OWNERSHIP_MARGIN_BLOCKS);
+            EverviewRenderState.NativeCommands commands = plan.commands();
+            if (handoff) {
+                stage = System.nanoTime();
+                HandoffPlan dynamic = HANDOFF_PLANS.computeIfAbsent(plan.region(), ignored -> new HandoffPlan());
+                long commandsBefore = EverviewFrameProfiler.commands;
+                commands = dynamic.update(client, plan, x, y, z, vanillaRadius);
+                EverviewFrameProfiler.ownership += System.nanoTime() - stage - (EverviewFrameProfiler.commands - commandsBefore);
             }
-        }
-
-        Map<EverviewGpuRegionCache.GpuRegion, RegionDrawPlan>
-                regionPlans = new LinkedHashMap<>();
-
-        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
-            WorldgenLodRing ring =
-                    snapshot.ringForLevel(tile.lodLevel());
-            if (ring == null
-                    || !tileBelongsToRing(
-                            tile,
-                            ring,
-                            cameraX,
-                            cameraZ
-                    )) {
-                continue;
-            }
-
-            // Frustum visibility controls submission only. It does not feed
-            // back into residency or quality selection.
-            AABB bounds = new AABB(
-                    tile.minX(),
-                    tile.minY() - 4.0,
-                    tile.minZ(),
-                    tile.maxX(),
-                    tile.maxY() + 4.0,
-                    tile.maxZ()
-            );
-
-            if (!frustum.isVisible(bounds)) {
-                EverviewMetrics.recordCulledTile(tile.lodLevel());
-                continue;
-            }
-
-            EverviewGpuRegionCache.GpuTile gpuTile =
-                    EverviewGpuRegionCache.getResident(tile);
-            if (gpuTile == null) {
-                continue;
-            }
-
-            long tileStarted = System.nanoTime();
-
-            boolean vanillaOwnership = tile.lodLevel() <= 3
-                    && tileIntersectsVanillaOwnershipArea(
-                            tile,
-                            cameraX,
-                            cameraZ,
-                            vanillaRadius
-                    );
-
-            FinerMask finerMask = tile.lodLevel() == 1
-                    || !mayIntersectFinerRing(
-                            tile,
-                            snapshot,
-                            cameraX,
-                            cameraZ
-                    )
-                    ? FinerMask.NONE
-                    : FINER_MASK_CACHE.computeIfAbsent(
-                            gpuTile,
-                            ignored -> classifyFinerCoverage(
-                                    gpuTile,
-                                    tile.lodLevel(),
-                                    l1Ring,
-                                    l2Ring,
-                                    l3Ring,
-                                    l4Ring,
-                                    l5Ring,
-                                    residentL1Tiles,
-                                    residentL2Tiles,
-                                    residentL3Tiles,
-                                    residentL4Tiles,
-                                    residentL5Tiles,
-                                    cameraX,
-                                    cameraZ
-                            )
-                    );
-
-            FinerCoverage finerCoverage = finerMask.coverage();
-            if (finerCoverage == FinerCoverage.FULL) {
-                finerOwnedBatches += gpuTile.drawBatches().size();
-                EverviewMetrics.recordRenderCpuNanos(
-                        System.nanoTime() - tileStarted
-                );
-                continue;
-            }
-
-            RegionDrawPlan plan = regionPlans.computeIfAbsent(
-                    gpuTile.region(),
-                    RegionDrawPlan::new
-            );
-
-            boolean drewAny = false;
-            int drawnQuads = 0;
-
-            if (!vanillaOwnership
-                    && finerCoverage == FinerCoverage.NONE) {
-                plan.add(
-                        gpuTile.firstIndex(),
-                        gpuTile.indexCount(),
-                        false
-                );
-                EverviewMetrics.recordSubmission(tile.lodLevel());
-                drewAny = true;
-                drawnQuads = gpuTile.indexCount() / 6;
+            if (commands.ranges().isEmpty()) continue;
+            stage = System.nanoTime();
+            var region = plan.region();
+            GpuBuffer indexBuffer = quadIndices.getBuffer(region.indexCount());
+            // Each region retains independent transform/index state; never reuse mutable draw data.
+            Matrix4f modelView = RenderSystem.getModelViewMatrixCopy();
+            modelView.translate((float) (region.originX() - x), (float) (-y - BASE_TERRAIN_BIAS), (float) (region.originZ() - z));
+            GpuBufferSlice transform = RenderSystem.getDynamicUniforms().writeTransform(modelView, COLOR_MODULATOR, MODEL_OFFSET, TEXTURE_MATRIX);
+            renderPass.setVertexBuffer(0, region.vertexBuffer().slice());
+            renderPass.setIndexBuffer(indexBuffer, quadIndices.type());
+            renderPass.setUniform("DynamicTransforms", transform);
+            if (commands.ranges().size() == 1) {
+                var range = commands.ranges().getFirst();
+                renderPass.drawIndexed(range.count(), 1, range.first(), 0, 0);
             } else {
-                int rangeFirstIndex = -1;
-                int rangeIndexCount = 0;
-                boolean rangeTouchesVanillaHandoff = false;
-
-                int batchIndex = 0;
-                for (EverviewGpuTileCache.DrawBatch batch
-                        : gpuTile.drawBatches()) {
-                    boolean ownedByFinerLod =
-                            finerMask.owns(batchIndex++);
-
-                    ColumnOwnershipResult vanillaResult =
-                            vanillaOwnership
-                                    && batch.vanillaSensitive()
-                            ? vanillaOwnsBatch(
-                                    client,
-                                    batch,
-                                    vanillaVisibility,
-                                    vanillaColumns,
-                                    cameraX,
-                                    cameraY,
-                                    cameraZ
-                            )
-                            : ColumnOwnershipResult.NOT_OWNED;
-
-                    boolean ownedByVanilla =
-                            vanillaResult.owned();
-
-                    if (ownedByFinerLod) {
-                        finerOwnedBatches++;
-                    }
-                    if (ownedByVanilla) {
-                        vanillaOwnedBatches++;
-                    }
-                    if (vanillaResult.loadedWaiting()) {
-                        loadedWaitingBatches++;
-                    }
-
-                    if (ownedByFinerLod || ownedByVanilla) {
-                        if (rangeIndexCount > 0) {
-                            plan.add(
-                                    rangeFirstIndex,
-                                    rangeIndexCount,
-                                    rangeTouchesVanillaHandoff
-                            );
-                            rangeFirstIndex = -1;
-                            rangeIndexCount = 0;
-                            rangeTouchesVanillaHandoff = false;
-                        }
-                        continue;
-                    }
-
-                    if (!drewAny) {
-                        EverviewMetrics.recordSubmission(
-                                tile.lodLevel()
-                        );
-                        drewAny = true;
-                    }
-
-                    if (rangeIndexCount == 0) {
-                        rangeFirstIndex = batch.firstIndex();
-                        rangeIndexCount = batch.indexCount();
-                        rangeTouchesVanillaHandoff =
-                                vanillaOwnership
-                                        && batch.vanillaSensitive();
-                    } else if (rangeFirstIndex + rangeIndexCount
-                            == batch.firstIndex()) {
-                        rangeIndexCount += batch.indexCount();
-                        rangeTouchesVanillaHandoff |=
-                                vanillaOwnership
-                                        && batch.vanillaSensitive();
-                    } else {
-                        plan.add(
-                                rangeFirstIndex,
-                                rangeIndexCount,
-                                rangeTouchesVanillaHandoff
-                        );
-                        rangeFirstIndex = batch.firstIndex();
-                        rangeIndexCount = batch.indexCount();
-                        rangeTouchesVanillaHandoff =
-                                vanillaOwnership
-                                        && batch.vanillaSensitive();
-                    }
-
-                    drawnQuads += batch.indexCount() / 6;
-                    visibleLodBatches++;
-                }
-
-                if (rangeIndexCount > 0) {
-                    plan.add(
-                            rangeFirstIndex,
-                            rangeIndexCount,
-                            rangeTouchesVanillaHandoff
-                    );
-                }
+                renderPass.multiDrawIndexed(quadIndices.type().bytes == 2 ? commands.offsets16() : commands.offsets32(),
+                        commands.counts(), commands.baseVertices(), commands.ranges().size());
             }
-
-            if (drewAny) {
-                double centerX =
-                        (tile.minX() + tile.maxX()) * 0.5;
-                double centerZ =
-                        (tile.minZ() + tile.maxZ()) * 0.5;
-                double distance = Math.hypot(
-                        centerX - cameraX,
-                        centerZ - cameraZ
-                );
-
-                EverviewMetrics.recordTileDraw(
-                        tile.lodLevel(),
-                        System.nanoTime() - tileStarted,
-                        drawnQuads,
-                        distance
-                );
-            } else {
-                EverviewMetrics.recordRenderCpuNanos(
-                        System.nanoTime() - tileStarted
-                );
+            EverviewFrameProfiler.submission += System.nanoTime() - stage;
+            EverviewMetrics.recordDrawCall(handoff);
+            for (var tile : plan.tiles()) {
+                var source = tile.tile().source();
+                EverviewMetrics.recordSubmission(source.lodLevel());
+                EverviewMetrics.recordTileDraw(source.lodLevel(), 0, 0,
+                        Math.hypot((source.minX() + source.maxX()) * .5 - x, (source.minZ() + source.maxZ()) * .5 - z));
             }
+            EverviewMetrics.recordSubmittedQuads(region.lodLevel(), commands.quads());
+            lastVisibleLodBatches += commands.ranges().size();
         }
-
-        for (RegionDrawPlan plan : regionPlans.values()) {
-            if (plan.isEmpty()) {
-                continue;
-            }
-
-            long regionStarted = System.nanoTime();
-            plan.coalesce();
-
-            EverviewGpuRegionCache.GpuRegion region =
-                    plan.region();
-
-            GpuBuffer indexBuffer =
-                    quadIndices.getBuffer(region.indexCount());
-
-            Matrix4f modelView =
-                    RenderSystem.getModelViewMatrixCopy();
-            double verticalBias = BASE_TERRAIN_BIAS
-                    + Math.max(0, region.lodLevel() - 1)
-                            * RING_LAYER_BIAS;
-
-            modelView.translate(
-                    (float) (region.originX() - cameraX),
-                    (float) (-cameraY - verticalBias),
-                    (float) (region.originZ() - cameraZ)
-            );
-
-            GpuBufferSlice dynamicTransforms =
-                    RenderSystem.getDynamicUniforms()
-                            .writeTransform(
-                                    modelView,
-                                    COLOR_MODULATOR,
-                                    MODEL_OFFSET,
-                                    TEXTURE_MATRIX
-                            );
-
-            renderPass.setVertexBuffer(
-                    0,
-                    region.vertexBuffer().slice()
-            );
-            renderPass.setIndexBuffer(
-                    indexBuffer,
-                    quadIndices.type()
-            );
-            renderPass.setUniform(
-                    "DynamicTransforms",
-                    dynamicTransforms
-            );
-
-            List<DrawRange> ranges = plan.ranges();
-            if (ranges.size() == 1) {
-                DrawRange range = ranges.getFirst();
-                renderPass.drawIndexed(
-                        range.indexCount(),
-                        1,
-                        range.firstIndex(),
-                        0,
-                        0
-                );
-            } else {
-                try (MemoryStack stack = MemoryStack.stackPush()) {
-                    PointerBuffer firstIndexOffsets =
-                            stack.mallocPointer(ranges.size());
-                    IntBuffer indexCounts =
-                            stack.mallocInt(ranges.size());
-                    IntBuffer baseVertices =
-                            stack.mallocInt(ranges.size());
-
-                    long indexStride = quadIndices.type().bytes;
-                    for (int i = 0; i < ranges.size(); i++) {
-                        DrawRange range = ranges.get(i);
-                        firstIndexOffsets.put(
-                                i,
-                                range.firstIndex() * indexStride
-                        );
-                        indexCounts.put(i, range.indexCount());
-                        baseVertices.put(i, 0);
-                    }
-
-                    renderPass.multiDrawIndexed(
-                            firstIndexOffsets,
-                            indexCounts,
-                            baseVertices,
-                            ranges.size()
-                    );
-                }
-            }
-
-            EverviewMetrics.recordDrawCall(
-                    plan.touchesVanillaHandoff()
-            );
-            EverviewMetrics.recordRenderCpuNanos(
-                    System.nanoTime() - regionStarted
-            );
-        }
-
-        lastVanillaOwnedBatches = vanillaOwnedBatches;
-        lastFinerOwnedBatches = finerOwnedBatches;
-        lastVisibleLodBatches = visibleLodBatches;
-        lastLoadedWaitingBatches = loadedWaitingBatches;
+        EverviewMetrics.recordRenderCpuNanos(System.nanoTime() - frameStarted);
+        EverviewFrameProfiler.finishDraw(frameStarted);
     }
 
-    private record DrawRange(
-            int firstIndex,
-            int indexCount,
-            boolean handoff
-    ) {
+    private static boolean intersects(AABB bounds, double x, double z, double radius) {
+        double dx = Math.max(bounds.minX - x, Math.max(0, x - bounds.maxX));
+        double dz = Math.max(bounds.minZ - z, Math.max(0, z - bounds.maxZ));
+        return dx * dx + dz * dz <= radius * radius;
     }
 
-    private static final class RegionDrawPlan {
-        private final EverviewGpuRegionCache.GpuRegion region;
-        private final List<DrawRange> ranges = new ArrayList<>();
-        private boolean touchesVanillaHandoff;
+    /** Only vanilla's small, live handoff band needs readiness probes each frame. */
+    private static final class HandoffPlan {
+        private BitSet owned = new BitSet();
+        private BitSet scratch = new BitSet();
+        private EverviewRenderState.NativeCommands commands;
 
-        private RegionDrawPlan(
-                EverviewGpuRegionCache.GpuRegion region
-        ) {
-            this.region = region;
-        }
-
-        private void add(
-                int firstIndex,
-                int indexCount,
-                boolean handoff
-        ) {
-            if (indexCount <= 0) {
-                return;
-            }
-            ranges.add(new DrawRange(
-                    firstIndex,
-                    indexCount,
-                    handoff
-            ));
-            touchesVanillaHandoff |= handoff;
-        }
-
-        private void coalesce() {
-            if (ranges.size() < 2) {
-                return;
-            }
-
-            ranges.sort(Comparator.comparingInt(
-                    DrawRange::firstIndex
-            ));
-
-            List<DrawRange> merged =
-                    new ArrayList<>(ranges.size());
-            DrawRange current = ranges.getFirst();
-
-            for (int i = 1; i < ranges.size(); i++) {
-                DrawRange next = ranges.get(i);
-                if (current.firstIndex()
-                        + current.indexCount()
-                        == next.firstIndex()) {
-                    current = new DrawRange(
-                            current.firstIndex(),
-                            current.indexCount()
-                                    + next.indexCount(),
-                            current.handoff()
-                                    || next.handoff()
-                    );
-                } else {
-                    merged.add(current);
-                    current = next;
+        private EverviewRenderState.NativeCommands update(Minecraft client, EverviewRenderState.RegionCommands plan,
+                                                           double x, double y, double z, double radius) {
+            scratch.clear();
+            int index = 0;
+            for (var tile : plan.tiles()) {
+                boolean near = intersects(tile.bounds(), x, z, radius + VANILLA_OWNERSHIP_MARGIN_BLOCKS);
+                for (var batch : tile.batches()) {
+                    if (near && batch.vanillaSensitive()) {
+                        var result = vanillaOwnsBatch(client, batch, FRAME_VISIBILITY, FRAME_COLUMNS, x, y, z);
+                        if (result.owned()) { scratch.set(index); lastVanillaOwnedBatches++; }
+                        if (result.loadedWaiting()) lastLoadedWaitingBatches++;
+                    }
+                    index++;
                 }
             }
-            merged.add(current);
-
-            ranges.clear();
-            ranges.addAll(merged);
-        }
-
-        private boolean isEmpty() {
-            return ranges.isEmpty();
-        }
-
-        private EverviewGpuRegionCache.GpuRegion region() {
-            return region;
-        }
-
-        private List<DrawRange> ranges() {
-            return ranges;
-        }
-
-        private boolean touchesVanillaHandoff() {
-            return touchesVanillaHandoff;
+            if (commands == null || !scratch.equals(owned)) {
+                long start = System.nanoTime();
+                if (scratch.isEmpty()) commands = plan.commands();
+                else {
+                    List<EverviewRenderState.Range> ranges = new ArrayList<>();
+                    index = 0;
+                    for (var tile : plan.tiles()) for (var batch : tile.batches()) {
+                        if (!scratch.get(index++)) EverviewRenderState.append(ranges, batch.firstIndex(), batch.indexCount());
+                    }
+                    commands = EverviewRenderState.NativeCommands.build(ranges);
+                }
+                BitSet swap = owned; owned = scratch; scratch = swap;
+                EverviewFrameProfiler.commands += System.nanoTime() - start;
+            }
+            return commands;
         }
     }
 
@@ -736,6 +345,7 @@ public final class EverviewRenderer {
         int sectionY = Math.floorDiv(origin.getY(), 16);
         int chunkZ = Math.floorDiv(origin.getZ(), 16);
 
+        COMPILED_COLUMNS.put(new ChunkKey(chunkX, chunkZ), System.nanoTime());
         RECENTLY_COMPILED_SECTIONS.put(
                 new SectionKey(chunkX, sectionY, chunkZ),
                 System.nanoTime()
@@ -993,19 +603,8 @@ public final class EverviewRenderer {
             int chunkZ,
             long maxAgeNanos
     ) {
-        long now = System.nanoTime();
-
-        for (Map.Entry<SectionKey, Long> entry
-                : RECENTLY_COMPILED_SECTIONS.entrySet()) {
-            SectionKey section = entry.getKey();
-            if (section.chunkX() == chunkX
-                    && section.chunkZ() == chunkZ
-                    && now - entry.getValue() <= maxAgeNanos) {
-                return true;
-            }
-        }
-
-        return false;
+        Long time = COMPILED_COLUMNS.get(new ChunkKey(chunkX, chunkZ));
+        return time != null && System.nanoTime() - time <= maxAgeNanos;
     }
 
     private static boolean vanillaSurfaceColumnVisible(
@@ -1152,454 +751,4 @@ public final class EverviewRenderer {
     ) {
     }
 
-    private static boolean mayIntersectFinerRing(
-            WorldgenSurfaceTile tile,
-            WorldgenSurfaceSnapshot snapshot,
-            double cameraX,
-            double cameraZ
-    ) {
-        WorldgenLodRing adjacent = snapshot.ringForLevel(tile.lodLevel() - 1);
-        WorldgenLodRing shield = tile.lodLevel() >= 4
-                ? snapshot.ringForLevel(3) : null;
-        double outer = Math.max(
-                adjacent == null ? 0 : adjacent.outerRadiusBlocks(),
-                shield == null ? 0 : shield.outerRadiusBlocks()
-        );
-        double nearestX = Math.max(tile.minX(), Math.min(cameraX, tile.maxX()));
-        double nearestZ = Math.max(tile.minZ(), Math.min(cameraZ, tile.maxZ()));
-        // Conservative rejection only. Ownership at an annulus edge is still
-        // decided by the existing chunk/region rules below.
-        return Math.hypot(nearestX - cameraX, nearestZ - cameraZ)
-                <= outer + tile.tileSize();
-    }
-
-    private static FinerMask classifyFinerCoverage(
-            EverviewGpuRegionCache.GpuTile gpuTile,
-            int lodLevel,
-            WorldgenLodRing l1Ring,
-            WorldgenLodRing l2Ring,
-            WorldgenLodRing l3Ring,
-            WorldgenLodRing l4Ring,
-            WorldgenLodRing l5Ring,
-            Set<Long> residentL1Tiles,
-            Set<Long> residentL2Tiles,
-            Set<Long> residentL3Tiles,
-            Set<Long> residentL4Tiles,
-            Set<Long> residentL5Tiles,
-            double cameraX,
-            double cameraZ
-    ) {
-        boolean anyOwned = false;
-        boolean anyVisible = false;
-        BitSet finerOwned = null;
-        int batchIndex = 0;
-
-        for (EverviewGpuTileCache.DrawBatch batch
-                : gpuTile.drawBatches()) {
-            boolean owned = finerOwnsBatch(
-                    batch,
-                    lodLevel,
-                    l1Ring,
-                    l2Ring,
-                    l3Ring,
-                    l4Ring,
-                    l5Ring,
-                    residentL1Tiles,
-                    residentL2Tiles,
-                    residentL3Tiles,
-                    residentL4Tiles,
-                    residentL5Tiles,
-                    cameraX,
-                    cameraZ
-            );
-
-            anyOwned |= owned;
-            anyVisible |= !owned;
-            if (owned) {
-                if (finerOwned == null) {
-                    finerOwned = new BitSet(gpuTile.drawBatches().size());
-                }
-                finerOwned.set(batchIndex);
-            }
-            batchIndex++;
-        }
-
-        if (anyOwned && !anyVisible) {
-            return FinerMask.FULL;
-        }
-
-        return anyOwned
-                ? new FinerMask(FinerCoverage.PARTIAL, finerOwned)
-                : FinerMask.NONE;
-    }
-
-    private static boolean finerOwnsBatch(
-            EverviewGpuTileCache.DrawBatch batch,
-            int lodLevel,
-            WorldgenLodRing l1Ring,
-            WorldgenLodRing l2Ring,
-            WorldgenLodRing l3Ring,
-            WorldgenLodRing l4Ring,
-            WorldgenLodRing l5Ring,
-            Set<Long> residentL1Tiles,
-            Set<Long> residentL2Tiles,
-            Set<Long> residentL3Tiles,
-            Set<Long> residentL4Tiles,
-            Set<Long> residentL5Tiles,
-            double cameraX,
-            double cameraZ
-    ) {
-        if (lodLevel == 2 && l1Ring != null) {
-            return l1OwnsL2Batch(
-                    batch,
-                    l1Ring,
-                    residentL1Tiles,
-                    cameraX,
-                    cameraZ
-            );
-        }
-
-        if (lodLevel < 3 || !batch.underlayRegion()) {
-            return false;
-        }
-
-        if (lodLevel >= 4 && l3Ring != null
-                && l3OwnsCoarseRegion(
-                        batch,
-                        lodLevel,
-                        l3Ring,
-                        residentL3Tiles,
-                        cameraX,
-                        cameraZ
-                )) {
-            return true;
-        }
-
-        WorldgenLodRing finerRing = switch (lodLevel) {
-            case 3 -> l2Ring;
-            case 4 -> l3Ring;
-            case 5 -> l4Ring;
-            case 6 -> l5Ring;
-            default -> null;
-        };
-        Set<Long> finerTiles = switch (lodLevel) {
-            case 3 -> residentL2Tiles;
-            case 4 -> residentL3Tiles;
-            case 5 -> residentL4Tiles;
-            case 6 -> residentL5Tiles;
-            default -> Set.of();
-        };
-
-        return finerRing != null
-                && finerRingOwnsRegion(
-                        batch.regionTileX(),
-                        batch.regionTileZ(),
-                        finerRing,
-                        finerTiles,
-                        cameraX,
-                        cameraZ
-                );
-    }
-
-    private enum FinerCoverage {
-        NONE,
-        PARTIAL,
-        FULL
-    }
-
-    private record FinerMask(FinerCoverage coverage, BitSet ownedBatches) {
-        private static final FinerMask NONE =
-                new FinerMask(FinerCoverage.NONE, null);
-        private static final FinerMask FULL =
-                new FinerMask(FinerCoverage.FULL, null);
-
-        private boolean owns(int index) {
-            return ownedBatches != null && ownedBatches.get(index);
-        }
-    }
-
-    private static boolean hasCoveredL2Batch(
-            EverviewGpuRegionCache.GpuTile gpuTile,
-            WorldgenLodRing l1Ring,
-            Set<Long> residentL1Tiles,
-            double cameraX,
-            double cameraZ
-    ) {
-        for (EverviewGpuTileCache.DrawBatch batch : gpuTile.drawBatches()) {
-            if (l1OwnsL2Batch(
-                    batch,
-                    l1Ring,
-                    residentL1Tiles,
-                    cameraX,
-                    cameraZ
-            )) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static boolean l1OwnsL2Batch(
-            EverviewGpuTileCache.DrawBatch batch,
-            WorldgenLodRing l1Ring,
-            Set<Long> residentL1Tiles,
-            double cameraX,
-            double cameraZ
-    ) {
-        if (!batch.vanillaSensitive()) {
-            return false;
-        }
-
-        boolean aOwned = finerRingOwnsChunk(
-                batch.chunkAX(),
-                batch.chunkAZ(),
-                l1Ring,
-                residentL1Tiles,
-                cameraX,
-                cameraZ
-        );
-
-        if (!batch.boundary()) {
-            return aOwned;
-        }
-
-        boolean bOwned = finerRingOwnsChunk(
-                batch.chunkBX(),
-                batch.chunkBZ(),
-                l1Ring,
-                residentL1Tiles,
-                cameraX,
-                cameraZ
-        );
-
-        // A wall exactly on a finer-tile boundary stays as fallback until both
-        // sides are owned. This favors overlap over ever exposing a seam.
-        return aOwned && bOwned;
-    }
-
-    private static boolean finerRingOwnsChunk(
-            int chunkX,
-            int chunkZ,
-            WorldgenLodRing finerRing,
-            Set<Long> residentFinerTiles,
-            double cameraX,
-            double cameraZ
-    ) {
-        int blockX = chunkX * 16 + 8;
-        int blockZ = chunkZ * 16 + 8;
-        int tileX = Math.floorDiv(blockX, finerRing.tileSize());
-        int tileZ = Math.floorDiv(blockZ, finerRing.tileSize());
-
-        return finerRingOwnsRegion(
-                tileX,
-                tileZ,
-                finerRing,
-                residentFinerTiles,
-                cameraX,
-                cameraZ
-        );
-    }
-
-    private static boolean hasCoveredByL3Region(
-            EverviewGpuRegionCache.GpuTile gpuTile,
-            int coarseLevel,
-            WorldgenLodRing l3Ring,
-            Set<Long> residentL3Tiles,
-            double cameraX,
-            double cameraZ
-    ) {
-        for (EverviewGpuTileCache.DrawBatch batch : gpuTile.drawBatches()) {
-            if (batch.underlayRegion()
-                    && l3OwnsCoarseRegion(
-                            batch,
-                            coarseLevel,
-                            l3Ring,
-                            residentL3Tiles,
-                            cameraX,
-                            cameraZ
-                    )) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static boolean l3OwnsCoarseRegion(
-            EverviewGpuTileCache.DrawBatch batch,
-            int coarseLevel,
-            WorldgenLodRing l3Ring,
-            Set<Long> residentL3Tiles,
-            double cameraX,
-            double cameraZ
-    ) {
-        int regionSize = switch (coarseLevel) {
-            case 4 -> L4_UNDERLAY_REGION_SIZE;
-            case 5 -> L5_UNDERLAY_REGION_SIZE;
-            case 6 -> L6_UNDERLAY_REGION_SIZE;
-            default -> 0;
-        };
-        if (regionSize == 0) {
-            return false;
-        }
-
-        int minBlockX = batch.regionTileX() * regionSize;
-        int minBlockZ = batch.regionTileZ() * regionSize;
-        int maxBlockX = minBlockX + regionSize - 1;
-        int maxBlockZ = minBlockZ + regionSize - 1;
-
-        int minTileX = Math.floorDiv(minBlockX, l3Ring.tileSize());
-        int minTileZ = Math.floorDiv(minBlockZ, l3Ring.tileSize());
-        int maxTileX = Math.floorDiv(maxBlockX, l3Ring.tileSize());
-        int maxTileZ = Math.floorDiv(maxBlockZ, l3Ring.tileSize());
-
-        for (int tileZ = minTileZ; tileZ <= maxTileZ; tileZ++) {
-            for (int tileX = minTileX; tileX <= maxTileX; tileX++) {
-                if (!finerRingOwnsRegion(
-                        tileX,
-                        tileZ,
-                        l3Ring,
-                        residentL3Tiles,
-                        cameraX,
-                        cameraZ
-                )) {
-                    return false;
-                }
-            }
-        }
-
-        return true;
-    }
-
-    private static boolean hasCoveredUnderlayRegion(
-            EverviewGpuRegionCache.GpuTile gpuTile,
-            WorldgenLodRing finerRing,
-            Set<Long> residentFinerTiles,
-            double cameraX,
-            double cameraZ
-    ) {
-        for (EverviewGpuTileCache.DrawBatch batch : gpuTile.drawBatches()) {
-            if (batch.underlayRegion()
-                    && finerRingOwnsRegion(
-                            batch.regionTileX(),
-                            batch.regionTileZ(),
-                            finerRing,
-                            residentFinerTiles,
-                            cameraX,
-                            cameraZ
-                    )) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static boolean finerRingOwnsRegion(
-            int tileX,
-            int tileZ,
-            WorldgenLodRing finerRing,
-            Set<Long> residentFinerTiles,
-            double cameraX,
-            double cameraZ
-    ) {
-        return virtualFinerTileBelongsToRing(
-                        tileX,
-                        tileZ,
-                        finerRing,
-                        cameraX,
-                        cameraZ
-                )
-                && residentFinerTiles.contains(packTile(tileX, tileZ));
-    }
-
-    private static boolean virtualFinerTileBelongsToRing(
-            int tileX,
-            int tileZ,
-            WorldgenLodRing ring,
-            double cameraX,
-            double cameraZ
-    ) {
-        double minX = tileX * (double) ring.tileSize();
-        double minZ = tileZ * (double) ring.tileSize();
-        double maxX = minX + ring.tileSize();
-        double maxZ = minZ + ring.tileSize();
-
-        double centerX = (minX + maxX) * 0.5;
-        double centerZ = (minZ + maxZ) * 0.5;
-        double centerDistance = Math.hypot(
-                centerX - cameraX,
-                centerZ - cameraZ
-        );
-
-        double nearestX = Math.max(minX, Math.min(cameraX, maxX));
-        double nearestZ = Math.max(minZ, Math.min(cameraZ, maxZ));
-        double nearestDistance = Math.hypot(
-                nearestX - cameraX,
-                nearestZ - cameraZ
-        );
-
-        return centerDistance >= ring.innerRadiusBlocks()
-                && nearestDistance <= ring.outerRadiusBlocks();
-    }
-
-    private static long packTile(int tileX, int tileZ) {
-        return ((long) tileX << 32) ^ (tileZ & 0xFFFF_FFFFL);
-    }
-
-    /**
-     * M3.5.2 keeps center ownership only at the vanilla -> L1 inner boundary,
-     * where it already proved stable in M3.3.2. Every LOD-to-LOD boundary uses
-     * tile/annulus intersection instead. The sampler already generates those
-     * intersecting boundary tiles; rendering them removes the empty wedges that
-     * center-only ownership can leave when neighboring rings use different tile
-     * sizes.
-     */
-    private static boolean tileBelongsToRing(
-            WorldgenSurfaceTile tile,
-            WorldgenLodRing ring,
-            double cameraX,
-            double cameraZ
-    ) {
-        double minX = tile.minX();
-        double minZ = tile.minZ();
-        double maxX = tile.maxX();
-        double maxZ = tile.maxZ();
-
-        double nearestX = Math.max(minX, Math.min(cameraX, maxX));
-        double nearestZ = Math.max(minZ, Math.min(cameraZ, maxZ));
-        double nearestDistance = Math.hypot(
-                nearestX - cameraX,
-                nearestZ - cameraZ
-        );
-
-        double farthestDx = Math.max(
-                Math.abs(minX - cameraX),
-                Math.abs(maxX - cameraX)
-        );
-        double farthestDz = Math.max(
-                Math.abs(minZ - cameraZ),
-                Math.abs(maxZ - cameraZ)
-        );
-        double farthestDistance = Math.hypot(farthestDx, farthestDz);
-
-        if (ring.lodLevel() == 1) {
-            double centerX = (minX + maxX) * 0.5;
-            double centerZ = (minZ + maxZ) * 0.5;
-            double centerDistance = Math.hypot(
-                    centerX - cameraX,
-                    centerZ - cameraZ
-            );
-
-            // Preserve the stable M3.3.2 vanilla handoff: L1 does not move
-            // farther inward than center ownership allows. Its outer edge may
-            // overlap L2, however, so there is always terrain under that seam.
-            return centerDistance >= ring.innerRadiusBlocks()
-                    && nearestDistance <= ring.outerRadiusBlocks();
-        }
-
-        return nearestDistance <= ring.outerRadiusBlocks()
-                && farthestDistance >= ring.innerRadiusBlocks();
-    }
 }

@@ -55,9 +55,9 @@ public final class EverviewGpuTileCache {
     private static final int VIEW_YAW_QUANTUM_DEGREES = 12;
     private static final int VIEW_PITCH_QUANTUM_DEGREES = 10;
     private static final int L3_UNDERLAY_REGION_SIZE = 128;
-    private static final int L4_UNDERLAY_REGION_SIZE = 256;
-    private static final int L5_UNDERLAY_REGION_SIZE = 512;
-    private static final int L6_UNDERLAY_REGION_SIZE = 1_024;
+    private static final int L4_UNDERLAY_REGION_SIZE = 128;
+    private static final int L5_UNDERLAY_REGION_SIZE = 128;
+    private static final int L6_UNDERLAY_REGION_SIZE = 128;
 
     // Insertion order is deliberate. M7.3 no longer relies on accidental
     // access-order LRU behavior; ownership discovery touches every resident
@@ -845,6 +845,9 @@ public final class EverviewGpuTileCache {
         WorldgenSurfaceTile.Geometry geometry = tile.geometry();
         int[] vertices = geometry.vertices();
         int[] colors = geometry.colors();
+        if (tile.lodLevel() >= 4 && fitsOwnershipCells(vertices)) {
+            return prepareAlignedRegionGeometry(tile, geometry, regionOriginX, regionOriginZ, firstIndexBase);
+        }
 
         Map<BatchKey, List<QuadPiece>> groupedQuads =
                 new LinkedHashMap<>();
@@ -924,12 +927,13 @@ public final class EverviewGpuTileCache {
                 groupedQuads.computeIfAbsent(
                         key,
                         ignored -> new ArrayList<>()
-                ).add(piece);
+                ).add(new QuadPiece(piece.vertices(), piece.colors(), geometry.materials()[quadOffset / 3]));
             }
         }
 
         int[] outVertices = new int[emittedQuadCount * 12];
         int[] outColors = new int[emittedQuadCount * 4];
+        byte[] outMaterials = new byte[emittedQuadCount * 4];
         List<DrawBatch> drawBatches =
                 new ArrayList<>(groupedQuads.size());
 
@@ -954,6 +958,7 @@ public final class EverviewGpuTileCache {
                             quadVertices[i + 1];
                     outVertices[vertexInt++] =
                             quadVertices[i + 2] - regionOriginZ;
+                    outMaterials[vertex] = piece.material();
                     outColors[vertex++] = quadColors[v];
                 }
             }
@@ -981,9 +986,66 @@ public final class EverviewGpuTileCache {
                 tile,
                 outVertices,
                 outColors,
+                outMaterials,
                 emittedQuadCount * 6,
                 List.copyOf(drawBatches)
         );
+    }
+
+    /** The adaptive mesher emits aligned leaves. Pack these without per-quad lists/arrays. */
+    private static boolean fitsOwnershipCells(int[] vertices) {
+        for (int q = 0; q < vertices.length; q += 12) {
+            int minX = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
+            for (int v = 0; v < 12; v += 3) {
+                minX = Math.min(minX, vertices[q + v]); maxX = Math.max(maxX, vertices[q + v]);
+                minZ = Math.min(minZ, vertices[q + v + 2]); maxZ = Math.max(maxZ, vertices[q + v + 2]);
+            }
+            if (minX < maxX && Math.floorDiv(minX, 128) != Math.floorDiv(maxX - 1, 128)) return false;
+            if (minZ < maxZ && Math.floorDiv(minZ, 128) != Math.floorDiv(maxZ - 1, 128)) return false;
+        }
+        return true;
+    }
+
+    private static PreparedGeometry prepareAlignedRegionGeometry(WorldgenSurfaceTile tile,
+            WorldgenSurfaceTile.Geometry geometry, int originX, int originZ, int indexBase) {
+        int quads = geometry.vertices().length / 12;
+        int cells = tile.tileSize() / 128;
+        int[] counts = new int[cells * cells];
+        int[] keys = new int[quads];
+        for (int q = 0; q < quads; q++) {
+            int x = Integer.MAX_VALUE, z = Integer.MAX_VALUE;
+            for (int v = 0; v < 12; v += 3) {
+                x = Math.min(x, geometry.vertices()[q * 12 + v]);
+                z = Math.min(z, geometry.vertices()[q * 12 + v + 2]);
+            }
+            int cx = Math.min(cells - 1, Math.max(0, (x - tile.minX()) / 128));
+            int cz = Math.min(cells - 1, Math.max(0, (z - tile.minZ()) / 128));
+            keys[q] = cz * cells + cx; counts[keys[q]]++;
+        }
+        int[] offsets = new int[counts.length];
+        List<DrawBatch> batches = new ArrayList<>(counts.length);
+        int cursor = 0;
+        for (int i = 0; i < counts.length; i++) {
+            offsets[i] = cursor;
+            if (counts[i] != 0) batches.add(new DrawBatch(indexBase + cursor * 6, counts[i] * 6,
+                    false, true, 0, 0, 0, false, 0, 0, true,
+                    Math.floorDiv(tile.minX(), 128) + i % cells, Math.floorDiv(tile.minZ(), 128) + i / cells));
+            cursor += counts[i];
+        }
+        int[] xyz = new int[quads * 12], rgb = new int[quads * 4];
+        byte[] materials = new byte[quads * 4];
+        for (int q = 0; q < quads; q++) {
+            int output = offsets[keys[q]]++;
+            for (int v = 0; v < 4; v++) {
+                int src = q * 12 + v * 3, dst = output * 12 + v * 3;
+                xyz[dst] = geometry.vertices()[src] - originX;
+                xyz[dst + 1] = geometry.vertices()[src + 1];
+                xyz[dst + 2] = geometry.vertices()[src + 2] - originZ;
+                rgb[output * 4 + v] = geometry.colors()[q * 4 + v];
+                materials[output * 4 + v] = geometry.materials()[q * 4 + v];
+            }
+        }
+        return new PreparedGeometry(tile, xyz, rgb, materials, quads * 6, List.copyOf(batches));
     }
 
     private static GpuTile upload(WorldgenSurfaceTile tile) {
@@ -1655,10 +1717,8 @@ public final class EverviewGpuTileCache {
         return new QuadPiece(pieceVertices, pieceColors);
     }
 
-    private record QuadPiece(
-            int[] vertices,
-            int[] colors
-    ) {
+    private record QuadPiece(int[] vertices, int[] colors, byte material) {
+        private QuadPiece(int[] vertices, int[] colors) { this(vertices, colors, (byte) 0); }
     }
 
     private static BatchKey classifyBatch(int[] vertices, int quadOffset) {
@@ -1951,6 +2011,7 @@ public final class EverviewGpuTileCache {
             WorldgenSurfaceTile source,
             int[] vertices,
             int[] colors,
+            byte[] materials,
             int indexCount,
             List<DrawBatch> drawBatches
     ) {

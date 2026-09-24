@@ -111,6 +111,10 @@ public final class EverviewMetrics {
      * than to one logical tile. M9.5 uses this for the multi-draw encoding
      * phase so Geometry CPU remains comparable to earlier builds.
      */
+    public static void recordSubmittedQuads(int level, int quads) {
+        if (validLod(level)) ringEmittedQuads[level] += quads;
+    }
+
     public static void recordRenderCpuNanos(long nanos) {
         frameDrawNanos += nanos;
         drawMs = frameDrawNanos / 1_000_000.0;

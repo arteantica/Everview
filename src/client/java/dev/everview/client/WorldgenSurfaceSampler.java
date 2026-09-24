@@ -565,10 +565,12 @@ public final class WorldgenSurfaceSampler {
             startDiskLoad(server, clientLevel.dimension());
         }
 
+        long integrationStarted = System.nanoTime();
         pollDiskIo();
         drainCompletedCompactions();
         updateAdaptiveBudget(client, server);
         drainCompleted();
+        EverviewFrameProfiler.generationIntegration = System.nanoTime() - integrationStarted;
 
         int centerX = client.player.getBlockX();
         int centerZ = client.player.getBlockZ();
@@ -649,7 +651,7 @@ public final class WorldgenSurfaceSampler {
             for (WantedTile wanted : wantedTiles) {
                 keys.add(wanted.key());
             }
-            wantedKeys = keys;
+            if (!keys.equals(wantedKeys)) wantedKeys = keys;
 
             if (initialFillStartedNanos == 0L && !wantedTiles.isEmpty()) {
                 initialFillStartedNanos = System.nanoTime();
@@ -1190,6 +1192,7 @@ public final class WorldgenSurfaceSampler {
     private static void reset() {
         scheduleDetachedSaveIfDirty();
         epoch++;
+        meshContentRevision++;
         CACHE.clear();
         ACCOUNTED_MESH_BYTES.clear();
         cacheResidentBytes = 0L;
@@ -3999,7 +4002,7 @@ public final class WorldgenSurfaceSampler {
         int y = generator.getBaseHeight(
                 worldX,
                 worldZ,
-                Heightmap.Types.WORLD_SURFACE_WG,
+                Heightmap.Types.OCEAN_FLOOR_WG,
                 level,
                 randomState
         );
@@ -4068,28 +4071,52 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static MeshData buildMesh(GenerationJob job, int seaLevel) {
-        if (job.ring.lodLevel() == 1
-                && job.sampleSpacing == L1_EXACT_SPACING) {
+        // Heights are solid-surface samples. Fluid coverage never comes from a nearby
+        // borrowed biome/material, and never from a coarse-cell majority vote.
+        for (int i = 0; i < job.totalSamples; i++) {
+            boolean wet = job.heights[i] < seaLevel;
+            byte material = job.sampleMaterials[i];
+            boolean waterMaterial = material == MinecraftSurfacePalette.MATERIAL_WATER
+                    || material == MinecraftSurfacePalette.MATERIAL_ICE;
+            if (wet && !waterMaterial) {
+                job.sampleMaterials[i] = MinecraftSurfacePalette.MATERIAL_WATER;
+                job.sampleColors[i] = 0x3B6E98;
+            } else if (!wet && waterMaterial) {
+                job.sampleMaterials[i] = MinecraftSurfacePalette.MATERIAL_GRASS;
+                job.sampleColors[i] = 0x6F9D50;
+            }
+        }
+        if (job.ring.lodLevel() == 1 && job.sampleSpacing == L1_EXACT_SPACING) {
             return buildBlockColumnMesh(job, seaLevel);
         }
+        return buildAdaptiveMesh(job, seaLevel);
+    }
 
-        if (job.ring.lodLevel() >= 5
-                && job.sampleSpacing < job.ring.sampleSpacing()) {
-            // Focus-refined far terrain must stop looking like a smooth
-            // heightfield. Horizontal plateaus plus vertical walls preserve a
-            // Minecraft-like stepped silhouette when the user zooms in.
-            return buildTerracedMesh(job, seaLevel);
-        }
-
-        if (job.ring.lodLevel() >= 3) {
-            return buildMinecraftFacetedMesh(job, seaLevel);
-        }
-
-        if (job.sampleSpacing <= 8) {
-            return buildTerracedMesh(job, seaLevel);
-        }
-
-        return buildSmoothMesh(job);
+    private static MeshData buildAdaptiveMesh(GenerationJob job, int seaLevel) {
+        MeshBuilder mesh = new MeshBuilder(Math.max(16, job.cellCount / 2));
+        double error = switch (job.ring.lodLevel()) {
+            case 1, 2, 3 -> 0.5;
+            case 4 -> 1.0;
+            case 5 -> 2.0;
+            default -> 4.0;
+        };
+        new dev.everview.core.AdaptiveSurfaceMesh(job.cellsAcross, job.sampleSpacing, seaLevel,
+                job.heights, job.sampleMaterials, job.sampleColors, error,
+                (x0, z0, x1, z1, y00, y01, y11, y10, material, color) -> {
+                    // No height quantization or averaged plateaus. The simplified
+                    // triangles retain all sampled features within their error bound.
+                    double dx = ((y10 + y11) - (y00 + y01)) * .5 / Math.max(1, x1 - x0);
+                    double dz = ((y01 + y11) - (y00 + y10)) * .5 / Math.max(1, z1 - z0);
+                    double normal = Math.sqrt(dx * dx + 1 + dz * dz);
+                    float shade = material == MinecraftSurfacePalette.MATERIAL_WATER ? .96f
+                            : (float) (.74 + Math.max(0, (dx * .45 + .86 + dz * .24) / normal) * .28);
+                    int lit = MinecraftSurfacePalette.applyLighting(color, shade);
+                    mesh.addQuad(job.originX + x0, y00, job.originZ + z0,
+                            job.originX + x0, y01, job.originZ + z1,
+                            job.originX + x1, y11, job.originZ + z1,
+                            job.originX + x1, y10, job.originZ + z0, lit, material);
+                }).build();
+        return mesh.finish();
     }
 
     /**
@@ -5147,6 +5174,7 @@ public final class WorldgenSurfaceSampler {
             LodTileKey key,
             WorldgenSurfaceTile tile
     ) {
+        meshContentRevision++;
         WorldgenSurfaceTile previous = CACHE.put(key, tile);
         if (previous != null) {
             cacheResidentBytes -= ACCOUNTED_MESH_BYTES.remove(previous);
@@ -5265,21 +5293,29 @@ public final class WorldgenSurfaceSampler {
         }
     }
 
+    private static long meshContentRevision;
+    private static long snapshotMeshRevision = Long.MIN_VALUE;
+    private static Set<LodTileKey> snapshotWantedKeys;
+    private static List<WorldgenSurfaceTile> publishedTiles = List.of();
+    private static Map<Integer, Integer> publishedReady = Map.of();
+    private static Map<Integer, Integer> publishedDesired = Map.of();
+
     private static void rebuildSnapshot() {
-        List<WorldgenSurfaceTile> active = new ArrayList<>();
-        Map<Integer, Integer> desiredByLevel = new HashMap<>();
-        Map<Integer, Integer> readyByLevel = new HashMap<>();
-
-        for (WantedTile wanted : wantedTiles) {
-            int level = wanted.ring().lodLevel();
-            desiredByLevel.merge(level, 1, Integer::sum);
-
-            WorldgenSurfaceTile tile = CACHE.get(wanted.key());
-            if (tile != null) {
-                active.add(tile);
-                readyByLevel.merge(level, 1, Integer::sum);
+        if (meshContentRevision != snapshotMeshRevision || snapshotWantedKeys != wantedKeys) {
+            List<WorldgenSurfaceTile> active = new ArrayList<>();
+            Map<Integer, Integer> desired = new HashMap<>(), ready = new HashMap<>();
+            for (WantedTile wanted : wantedTiles) {
+                int level = wanted.ring().lodLevel();
+                desired.merge(level, 1, Integer::sum);
+                WorldgenSurfaceTile tile = CACHE.get(wanted.key());
+                if (tile != null) { active.add(tile); ready.merge(level, 1, Integer::sum); }
             }
+            publishedTiles = List.copyOf(active);
+            publishedDesired = desired; publishedReady = ready;
+            snapshotMeshRevision = meshContentRevision; snapshotWantedKeys = wantedKeys;
         }
+        List<WorldgenSurfaceTile> active = publishedTiles;
+        Map<Integer, Integer> desiredByLevel = publishedDesired, readyByLevel = publishedReady;
 
         List<WorldgenRingStatus> ringStatuses = new ArrayList<>();
         for (WorldgenLodRing ring : activeRings) {

@@ -63,11 +63,8 @@ public final class MinecraftSurfacePalette {
                 MinecraftSurfacePalette::classifyBiome
         );
 
-        if (worldY < seaLevel
-                || (worldY <= seaLevel + 1 && profile.waterBiome())) {
-            if (profile.frozen()
-                    && worldY >= seaLevel - 1
-                    && profile.waterBiome()) {
+        if (worldY < seaLevel) {
+            if (profile.frozen() && profile.waterBiome()) {
                 return new SampleAppearance(ICE, MATERIAL_ICE);
             }
             if (profile.swamp()) {

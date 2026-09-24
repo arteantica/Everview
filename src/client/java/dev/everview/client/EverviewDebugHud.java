@@ -29,15 +29,24 @@ public final class EverviewDebugHud {
     );
 
     private static boolean expanded;
+    private static long refreshedAt;
+    private static List<String> cachedLines = List.of();
+    private static int cachedWidth;
+    private static final KeyMapping RENDER_TOGGLE = new KeyMapping("key.everview.render_toggle",
+            InputConstants.Type.KEYBOARD, InputConstants.KEY_F9, KeyMapping.Category.MISC);
 
     private EverviewDebugHud() {
     }
 
     public static void register() {
         KeyMappingHelper.registerKeyMapping(TOGGLE_KEY);
+        KeyMappingHelper.registerKeyMapping(RENDER_TOGGLE);
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (TOGGLE_KEY.consumeClick()) {
-                expanded = !expanded;
+                expanded = !expanded; refreshedAt = 0;
+            }
+            while (RENDER_TOGGLE.consumeClick()) {
+                EverviewRenderer.renderEnabled = !EverviewRenderer.renderEnabled; refreshedAt = 0;
             }
         });
         HudElementRegistry.addLast(HUD_ID, EverviewDebugHud::extractRenderState);
@@ -54,13 +63,18 @@ public final class EverviewDebugHud {
             return;
         }
 
-        EverviewMetrics.Snapshot metrics = EverviewMetrics.snapshot();
-        WorldgenSurfaceSnapshot far = WorldgenSurfaceSampler.snapshot();
-        List<String> lines = expanded
-                ? expandedLines(metrics, far)
-                : compactLines(metrics, far);
-
-        drawPanel(graphics, client, lines);
+        long started = System.nanoTime();
+        // Diagnostics used to rescan the hierarchy and format dozens of lines every frame.
+        if (started - refreshedAt >= 250_000_000L) {
+            EverviewMetrics.Snapshot metrics = EverviewMetrics.snapshot();
+            WorldgenSurfaceSnapshot far = WorldgenSurfaceSampler.snapshot();
+            cachedLines = expanded ? expandedLines(metrics, far) : compactLines(metrics, far);
+            cachedWidth = 0;
+            for (String line : cachedLines) cachedWidth = Math.max(cachedWidth, client.font.width(line));
+            refreshedAt = started;
+        }
+        drawPanel(graphics, client, cachedLines);
+        EverviewFrameProfiler.hud = System.nanoTime() - started;
     }
 
     private static List<String> compactLines(
@@ -68,7 +82,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSnapshot far
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M9.5 | F8 details");
+        lines.add("Everview M9.6 | F8 details | F9 LOD " + (EverviewRenderer.renderEnabled ? "ON" : "OFF (A/B)"));
 
         if (!far.available()) {
             lines.add("LOD worldgen unavailable");
@@ -94,11 +108,11 @@ public final class EverviewDebugHud {
         WorldgenSurfaceSampler.RefinementReuseStatus reuse =
                 WorldgenSurfaceSampler.refinementReuseStatus();
         lines.add(String.format(
-                "Gen %.1f ms | exact %d/%d | geometry %.3f ms | %s",
+                "Gen %.1f ms | exact %d/%d | LOD CPU avg %.3f ms | %s",
                 far.sliceBudgetMs(),
                 reuse.exactJobsActive(),
                 WorldgenSurfaceSampler.exactWorkerCount(),
-                metrics.drawMs(),
+                EverviewFrameProfiler.meanMs(),
                 stream.highSpeedCoverageMode() ? "FAST COVERAGE" : "NORMAL"
         ));
 
@@ -113,14 +127,14 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M9.5 DEV | SPATIAL RESIDENCY + REGION MULTIDRAW");
+        lines.add("Everview M9.6 DEV | PERSISTENT COVERAGE + ADAPTIVE TERRAIN");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Renderer: 2x2 region buffers | 360 spatial residency | real multi-draw | artifact-safe masks");
+        lines.add("Renderer: persistent region commands | transactional ownership | 360 spatial residency");
         lines.add("Handoff: 64b overlap | 350ms visible-stability gate | chunk fade forced OFF");
         lines.add("LOD targets: L1 1b | L2 2b | L3 2b | L4 4b | L5 8b | L6 16b");
         lines.add("First-visible: L1 4b -> 1b | L2 4b | L3 4b | L4 8b | L5 8b | L6 16b");
-        lines.add("View focus: L1 exact to 2K | L5 -> 4b stepped | L6 -> 8b stepped | GPU <= 2.30 GiB");
+        lines.add("Adaptive error: L3 0.5b | L4 1b | L5 2b | L6 4b | GPU target/hard 1024/1152 MiB");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),
@@ -267,7 +281,7 @@ public final class EverviewDebugHud {
                     stream.globalFloorDesired(),
                     stream.highSpeedCoverageMode() ? "COVERAGE" : "NORMAL",
                     frontier,
-                    stream.nearCoverageComplete() ? "SOLID" : "GAP",
+                    stream.nearCoverageComplete() ? "NEAR READY" : "NEAR PENDING",
                     stream.staleJobsCancelled()
             ));
 
@@ -417,8 +431,21 @@ public final class EverviewDebugHud {
         lines.add("Draw calls: " + metrics.drawCalls()
                 + " | handoff " + metrics.handoffDrawCalls()
                 + " | fast " + metrics.fastTileDrawCalls());
-        lines.add("Geometry CPU: " + formatMs(metrics.drawMs())
-                + " | target: " + EverviewClient.TARGET_DISTANCE_BLOCKS);
+        lines.add(String.format("LOD CPU: %.3f ms | 240-frame mean %.3f | HUD %.3f | F9 A/B %s",
+                EverviewFrameProfiler.ms(EverviewFrameProfiler.prepareTotal + EverviewFrameProfiler.drawTotal),
+                EverviewFrameProfiler.meanMs(), EverviewFrameProfiler.ms(EverviewFrameProfiler.hud),
+                EverviewRenderer.renderEnabled ? "ON" : "OFF"));
+        lines.add(String.format("CPU ms: cull %.3f | residency %.3f | ownership %.3f | commands %.3f",
+                EverviewFrameProfiler.ms(EverviewFrameProfiler.visibility), EverviewFrameProfiler.ms(EverviewFrameProfiler.residency),
+                EverviewFrameProfiler.ms(EverviewFrameProfiler.ownership), EverviewFrameProfiler.ms(EverviewFrameProfiler.commands)));
+        lines.add(String.format("CPU ms: upload %.3f | integrate %.3f | submit %.3f | tick integration %.3f",
+                EverviewFrameProfiler.ms(EverviewFrameProfiler.upload), EverviewFrameProfiler.ms(EverviewFrameProfiler.integration),
+                EverviewFrameProfiler.ms(EverviewFrameProfiler.submission), EverviewFrameProfiler.ms(EverviewFrameProfiler.generationIntegration)));
+        lines.add(String.format("Workers ms (last job): spatial %.2f | ownership %.2f | pack %.2f | budget deferred %d",
+                EverviewFrameProfiler.ms(EverviewFrameProfiler.selectionWorker), EverviewFrameProfiler.ms(EverviewFrameProfiler.ownershipWorker),
+                EverviewFrameProfiler.ms(EverviewFrameProfiler.packingWorker), EverviewFrameProfiler.deferredUploads));
+        lines.add("Drawable cells: " + EverviewGpuRegionCache.renderState().coverageCells()
+                + " | pending near quality is distinct from missing drawable coverage");
 
         return lines;
     }
@@ -432,13 +459,7 @@ public final class EverviewDebugHud {
         int y = 6;
         int pad = 4;
         int lineHeight = client.font.lineHeight + 2;
-        int width = 0;
-
-        for (String line : lines) {
-            width = Math.max(width, client.font.width(line));
-        }
-
-        int panelWidth = width + pad * 2;
+        int panelWidth = cachedWidth + pad * 2;
         int panelHeight = lines.size() * lineHeight + pad * 2;
 
         graphics.fill(x, y, x + panelWidth, y + panelHeight, 0xA0000000);
