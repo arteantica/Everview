@@ -68,7 +68,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSnapshot far
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M7.4 | F8 details");
+        lines.add("Everview M8.0 | F8 details");
 
         if (!far.available()) {
             lines.add("LOD worldgen unavailable");
@@ -113,14 +113,14 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M7.4 DEV | PERSISTENT VIEW + FAR FOCUS");
+        lines.add("Everview M8.0 DEV | STEPPED TERRAIN + RENDER BUDGET");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Renderer: view-aware uploads | persistent 360 cache | stale-mesh fallback | seam shield");
-        lines.add("Handoff: 64b overlap | upload grace | chunk fade forced OFF");
+        lines.add("Renderer: 64b L1 tiles | persistent 360 cache | stepped focused far mesh | seam shield");
+        lines.add("Handoff: 64b overlap | 350ms visible-stability gate | chunk fade forced OFF");
         lines.add("LOD targets: L1 1b | L2 2b | L3 2b | L4 4b | L5 8b | L6 16b");
         lines.add("First-visible: L1 4b | L2 4b | L3 4b | L4 8b | L5 8b | L6 16b");
-        lines.add("View focus: L5 -> 4b | L6 -> 8b | retained GPU target 3840 / hard 4096");
+        lines.add("View focus: narrow cone | L5 -> 4b stepped | L6 -> 8b stepped | GPU 3840 / 4096");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),

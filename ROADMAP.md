@@ -457,3 +457,20 @@
 - [ ] verify repeated 360s show no unload/reload holes and settle without hard eviction
 - [ ] verify zoomed far mountains lose the 16b rounded silhouette in viewed directions
 - [ ] profile draw calls after stable 360 residency before adding L7/L8 horizon shells
+
+
+## M8.0 stepped terrain + render budget
+- [x] treat the rounded far silhouette as a topology problem, not just a density problem
+- [x] switch focused L5/L6 refinement from sloped heightfield facets to horizontal plateaus plus vertical Minecraft-like step faces
+- [x] narrow expensive far-focus refinement to roughly the central 50 degrees of the current view
+- [x] enlarge exact L1 GPU tiles from 32b to 64b while retaining 1b samples and 16b vanilla ownership masks
+- [x] reduce L1 tile/transform/fast-draw pressure by roughly 4x without lowering exact terrain resolution
+- [x] resize L1 fine sample grids to 65x65 and reduce L1 grid-cache count
+- [x] require 350ms of continuous vanilla renderer visibility before retiring the underlying LOD column
+- [x] keep LOD + vanilla overlapped during that stability window so vanilla wins depth instead of exposing a one-frame sky flash
+- [x] invalidate old geometry with disk cache v30
+- [x] raise disk per-tile vertex safety bound for focused stepped far meshes
+- [ ] compare settled draw calls / geometry CPU / FPS against M7.4
+- [ ] verify LOD-to-vanilla transitions no longer flash missing sky for one frame
+- [ ] verify zoomed focused far mountains read as stepped Minecraft terrain instead of rounded pyramids
+- [ ] next major renderer phase: regional multi-tile batching / indirect submission if draw calls remain the dominant cost
