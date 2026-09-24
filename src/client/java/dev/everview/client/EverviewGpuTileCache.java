@@ -466,7 +466,7 @@ public final class EverviewGpuTileCache {
             Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
             // If an unusually dense scene exceeds even the hard limit,
             // release near detail before touching the L3/L6 safety layers.
-            int level = entry.getKey().lodLevel();
+            int level = entry.getKey().level();
             if (level == 3 || level == 6) {
                 continue;
             }
