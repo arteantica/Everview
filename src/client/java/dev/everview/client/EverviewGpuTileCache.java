@@ -536,11 +536,15 @@ public final class EverviewGpuTileCache {
         while (iterator.hasNext()) {
             Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
 
-            if (!covered.contains(entry.getKey())
-                    || RESIDENCY_WANTED.contains(entry.getKey())) {
+            if (!covered.contains(entry.getKey())) {
                 continue;
             }
 
+            // M9.3 lets fully covered L2/L4/L5/L6 leave GPU memory even when
+            // the camera would normally want them resident. L3 is excluded
+            // from the covered set and remains the permanent 360-degree safety
+            // shield. If finer coverage later disappears, suppression is
+            // rebuilt and the coarse tile can be uploaded again from CPU cache.
             removeResident(entry.getValue());
             iterator.remove();
             removed++;
