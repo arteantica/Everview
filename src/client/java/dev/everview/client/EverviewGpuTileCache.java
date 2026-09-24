@@ -499,7 +499,12 @@ public final class EverviewGpuTileCache {
         Set<LodTileKey> covered = new HashSet<>();
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
-            if (tile.lodLevel() <= 1) {
+            // M9.1: L3 is the 360-degree turn shield. Never suppress/prune it
+            // merely because finer L1/L2 is resident in the current view.
+            // Keeping L3 uploaded lets the renderer reveal a ready fallback
+            // immediately during a 180/360 turn instead of showing sky while
+            // view-specific fine meshes upload again.
+            if (tile.lodLevel() <= 1 || tile.lodLevel() == 3) {
                 continue;
             }
 
@@ -531,7 +536,8 @@ public final class EverviewGpuTileCache {
         while (iterator.hasNext()) {
             Map.Entry<LodTileKey, GpuTile> entry = iterator.next();
 
-            if (!covered.contains(entry.getKey())) {
+            if (!covered.contains(entry.getKey())
+                    || RESIDENCY_WANTED.contains(entry.getKey())) {
                 continue;
             }
 
