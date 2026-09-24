@@ -68,7 +68,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSnapshot far
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M9.1 | F8 details");
+        lines.add("Everview M9.2 | F8 details");
 
         if (!far.available()) {
             lines.add("LOD worldgen unavailable");
@@ -113,10 +113,10 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M9.1 DEV | STABLE STREAMING + REGIONAL CACHE");
+        lines.add("Everview M9.2 DEV | EXACT GENERATION ENGINE");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
-        lines.add("Renderer: 128b L1 | 360 L3 turn shield | sticky view residency | byte-capped GPU");
+        lines.add("Renderer: 128b L1 | parallel exact batches | 360 L3 turn shield | byte-capped GPU");
         lines.add("Handoff: 64b overlap | 350ms visible-stability gate | chunk fade forced OFF");
         lines.add("LOD targets: L1 1b | L2 2b | L3 2b | L4 4b | L5 8b | L6 16b");
         lines.add("First-visible: L1 4b -> 1b | L2 4b | L3 4b | L4 8b | L5 8b | L6 16b");
@@ -328,16 +328,18 @@ public final class EverviewDebugHud {
                     WorldgenSurfaceSampler.maxProvisionalExactTiles(),
                     reuse.totalAppearanceGeneratedSamples()
             ));
-            lines.add("Height workers: exact "
+            lines.add("Height workers: exact tiles "
                     + reuse.exactJobsActive()
+                    + " | exact workers "
+                    + WorldgenSurfaceSampler.exactWorkerBudgetCurrent()
                     + "/"
                     + WorldgenSurfaceSampler.exactWorkerCount()
-                    + " | coverage jobs "
+                    + " | "
+                    + WorldgenSurfaceSampler.exactWorkersPerTileCurrent()
+                    + "/tile | coverage "
                     + WorldgenSurfaceSampler.detachedCoverageJobsActive()
                     + "/"
                     + WorldgenSurfaceSampler.detachedCoverageJobsMax()
-                    + " | workers "
-                    + WorldgenSurfaceSampler.coverageWorkerCount()
                     + (reuse.serverExactFallback()
                             ? " | SERVER FALLBACK"
                             : ""));
