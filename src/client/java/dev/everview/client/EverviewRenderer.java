@@ -54,6 +54,8 @@ public final class EverviewRenderer {
     private static final double RING_LAYER_BIAS = 1.25D;
     private static final long RECENT_COMPILE_HINT_NANOS = 1_500_000_000L;
     private static final long VANILLA_HANDOFF_GRACE_NANOS = 250_000_000L;
+    private static final long VANILLA_VISIBLE_STABILITY_NANOS = 350_000_000L;
+    private static final long VANILLA_HANDOFF_STATE_TTL_NANOS = 5_000_000_000L;
     private static final int VANILLA_EDGE_NEIGHBORHOOD_BLOCKS = 160;
     private static final double VANILLA_OWNERSHIP_MARGIN_BLOCKS = 64.0D;
     private static final double VANILLA_3D_HANDOFF_MARGIN_BLOCKS = 96.0D;
@@ -71,6 +73,8 @@ public final class EverviewRenderer {
 
     private static final Map<SectionKey, Long> RECENTLY_COMPILED_SECTIONS =
             new HashMap<>();
+    private static final Map<ChunkKey, VanillaHandoffState>
+            VANILLA_HANDOFF_STATES = new HashMap<>();
     private static ClientLevel compileHintLevel;
 
     private EverviewRenderer() {
@@ -111,9 +115,11 @@ public final class EverviewRenderer {
 
         if (client.level != compileHintLevel) {
             RECENTLY_COMPILED_SECTIONS.clear();
+            VANILLA_HANDOFF_STATES.clear();
             compileHintLevel = client.level;
         }
         pruneCompileHints();
+        pruneVanillaHandoffStates();
 
         WorldgenSurfaceSnapshot snapshot = WorldgenSurfaceSampler.snapshot();
         if (snapshot.tiles().isEmpty()) {
@@ -626,6 +632,7 @@ public final class EverviewRenderer {
                 : client.level.getChunkSource().getChunkNow(chunkX, chunkZ);
 
         if (chunk == null) {
+            VANILLA_HANDOFF_STATES.remove(key);
             columns.put(key, ColumnOwnershipResult.NOT_OWNED);
             return ColumnOwnershipResult.NOT_OWNED;
         }
@@ -695,16 +702,39 @@ public final class EverviewRenderer {
             );
         }
 
-        // Keep the LOD under a freshly uploaded vanilla column for a tiny
-        // overlap window. Vanilla is already opaque and wins depth, but this
-        // prevents a one-frame sky crack while moving across the handoff edge.
-        boolean grace = visible && recentlyCompiledColumn(
+        // Renderer visibility can become true slightly before the vanilla
+        // presentation is visually stable. Never remove the LOD on the first
+        // visible frame. Keep an opaque overlap for a short continuous window;
+        // vanilla already rendered earlier in this same pass and wins depth.
+        // This makes the transition vanilla-over-LOD -> vanilla-only instead
+        // of LOD -> one-frame sky -> vanilla.
+        long now = System.nanoTime();
+
+        if (!visible) {
+            VANILLA_HANDOFF_STATES.remove(key);
+            ColumnOwnershipResult result =
+                    new ColumnOwnershipResult(false, true);
+            columns.put(key, result);
+            return result;
+        }
+
+        VanillaHandoffState state = VANILLA_HANDOFF_STATES.get(key);
+        if (state == null) {
+            state = new VanillaHandoffState(now, now);
+            VANILLA_HANDOFF_STATES.put(key, state);
+        } else {
+            state.lastSeenNanos = now;
+        }
+
+        boolean stable = now - state.firstVisibleNanos
+                >= VANILLA_VISIBLE_STABILITY_NANOS;
+        boolean grace = recentlyCompiledColumn(
                 chunkX,
                 chunkZ,
                 VANILLA_HANDOFF_GRACE_NANOS
         );
 
-        ColumnOwnershipResult result = visible && !grace
+        ColumnOwnershipResult result = stable && !grace
                 ? new ColumnOwnershipResult(true, false)
                 : new ColumnOwnershipResult(false, true);
         columns.put(key, result);
@@ -742,6 +772,18 @@ public final class EverviewRenderer {
         }
 
         return true;
+    }
+
+    private static void pruneVanillaHandoffStates() {
+        if (VANILLA_HANDOFF_STATES.isEmpty()) {
+            return;
+        }
+
+        long now = System.nanoTime();
+        VANILLA_HANDOFF_STATES.entrySet().removeIf(
+                entry -> now - entry.getValue().lastSeenNanos
+                        > VANILLA_HANDOFF_STATE_TTL_NANOS
+        );
     }
 
     private static boolean recentlyCompiledColumn(
@@ -886,6 +928,19 @@ public final class EverviewRenderer {
             int chunkX,
             int chunkZ
     ) {
+    }
+
+    private static final class VanillaHandoffState {
+        private final long firstVisibleNanos;
+        private long lastSeenNanos;
+
+        private VanillaHandoffState(
+                long firstVisibleNanos,
+                long lastSeenNanos
+        ) {
+            this.firstVisibleNanos = firstVisibleNanos;
+            this.lastSeenNanos = lastSeenNanos;
+        }
     }
 
     private record SectionKey(
