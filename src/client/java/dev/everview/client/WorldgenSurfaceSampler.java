@@ -12,6 +12,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.levelgen.Heightmap;
 
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -5133,11 +5134,23 @@ public final class WorldgenSurfaceSampler {
         if (tiles.isEmpty()) {
             return;
         }
+        // Large warm loads can include meshes evicted immediately by the
+        // cache budget. A compaction task must not retain that whole load
+        // (several GiB of geometry) until the last tile has been processed.
+        List<WeakReference<WorldgenSurfaceTile>> pending =
+                new ArrayList<>(tiles.size());
+        for (WorldgenSurfaceTile tile : tiles) {
+            pending.add(new WeakReference<>(tile));
+        }
         long scheduledEpoch = epoch;
         MESH_COMPACTION_EXECUTOR.execute(() -> {
-            for (WorldgenSurfaceTile tile : tiles) {
+            for (WeakReference<WorldgenSurfaceTile> reference : pending) {
                 if (scheduledEpoch != epoch) {
                     return;
+                }
+                WorldgenSurfaceTile tile = reference.get();
+                if (tile == null) {
+                    continue;
                 }
                 try {
                     long saved = tile.compactGeometry();

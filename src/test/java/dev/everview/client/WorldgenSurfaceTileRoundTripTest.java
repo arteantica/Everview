@@ -1,10 +1,17 @@
 package dev.everview.client;
 
+import org.junit.jupiter.api.Test;
+
 import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 
 /** Run directly as a smoke test for an active mesh compacting during upload. */
 public final class WorldgenSurfaceTileRoundTripTest {
+    @Test
+    void compactedMeshSurvivesConcurrentReads() {
+        main(new String[0]);
+    }
+
     public static void main(String[] args) {
         int quads = 4096;
         int[] vertices = new int[quads * 12];
