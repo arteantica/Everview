@@ -53,24 +53,22 @@ public final class WorldgenSurfaceSampler {
     public static final long NORMAL_MAX_SLICE_BUDGET_NANOS = 12_000_000L;
     public static final long MAX_SLICE_BUDGET_NANOS = 16_000_000L;
     public static final int MAX_SAMPLES_PER_SLICE = 128;
-    // M9 biases worker capacity toward exact L1 while leaving explicit CPU
-    // headroom for Minecraft's render/server threads. On a 16-thread desktop
-    // this resolves to 5 exact + 6 coverage workers instead of saturating the
-    // machine with the old 4 + 8 split.
+    // M9.1 keeps explicit scheduling headroom for Minecraft. M9.0 could run
+    // 5 exact + 6 coverage + 3 appearance workers on a 16-thread CPU while
+    // the render and integrated-server threads were also busy, which matched
+    // the observed progressive FPS collapse as the world became dense.
     private static final int EXACT_HEIGHT_WORKERS = Math.max(
             2,
             Math.min(
-                    6,
-                    Runtime.getRuntime().availableProcessors() / 3
+                    4,
+                    Runtime.getRuntime().availableProcessors() / 4
             )
     );
     private static final int COVERAGE_HEIGHT_WORKERS = Math.max(
             2,
             Math.min(
-                    6,
-                    Runtime.getRuntime().availableProcessors()
-                            - EXACT_HEIGHT_WORKERS
-                            - 4
+                    3,
+                    Runtime.getRuntime().availableProcessors() / 5
             )
     );
     private static final int MAX_DETACHED_EXACT_JOBS = EXACT_HEIGHT_WORKERS;
@@ -79,10 +77,10 @@ public final class WorldgenSurfaceSampler {
             Math.min(8, COVERAGE_HEIGHT_WORKERS)
     );
     private static final int APPEARANCE_WORKERS = Math.max(
-            2,
+            1,
             Math.min(
-                    3,
-                    Runtime.getRuntime().availableProcessors() / 5
+                    2,
+                    Runtime.getRuntime().availableProcessors() / 8
             )
     );
     private static final int MAX_DETACHED_APPEARANCE_JOBS =
@@ -130,8 +128,8 @@ public final class WorldgenSurfaceSampler {
     // Persist useful work while streaming instead of waiting for the complete
     // 16K initial fill. This is the warm-rejoin contract for M9.
     private static final long DISK_AUTOSAVE_INTERVAL_NANOS =
-            3_000_000_000L;
-    private static final int DISK_AUTOSAVE_MIN_DIRTY_TILES = 16;
+            4_000_000_000L;
+    private static final int DISK_AUTOSAVE_MIN_DIRTY_TILES = 8;
     private static final int VIEW_SECTOR_COUNT = 16;
     private static final double VIEW_SECTOR_DEGREES = 360.0 / VIEW_SECTOR_COUNT;
     private static final int COVERAGE_FRONTIER_BUCKET_BLOCKS = 64;
@@ -203,8 +201,9 @@ public final class WorldgenSurfaceSampler {
     private static long diskCacheSeed;
     private static String diskCacheDimension = "";
     private static boolean diskLoadReady;
-    private static boolean cacheDirty;
-    private static int dirtyTilesSinceSave;
+    private static final Map<LodTileKey, WorldgenSurfaceTile>
+            DISK_DIRTY_TILES = new LinkedHashMap<>();
+    private static List<WorldgenSurfaceTile> diskSaveBatch = List.of();
     private static long lastDiskSaveStartedNanos;
     private static int diskLoadedTiles;
     private static double diskLoadMs;
@@ -299,6 +298,35 @@ public final class WorldgenSurfaceSampler {
 
     public static int maxProvisionalExactTiles() {
         return MAX_PROVISIONAL_EXACT_TILES;
+    }
+
+    private static int activeExactJobBudget() {
+        if (clientFrameMs >= 18.0) {
+            return Math.min(1, MAX_DETACHED_EXACT_JOBS);
+        }
+        if (clientFrameMs >= 12.0) {
+            return Math.min(2, MAX_DETACHED_EXACT_JOBS);
+        }
+        if (clientFrameMs >= 8.0) {
+            return Math.min(3, MAX_DETACHED_EXACT_JOBS);
+        }
+        return MAX_DETACHED_EXACT_JOBS;
+    }
+
+    private static int activeCoverageJobBudget() {
+        if (clientFrameMs >= 14.0) {
+            return 1;
+        }
+        if (clientFrameMs >= 9.0) {
+            return Math.min(2, MAX_DETACHED_COVERAGE_JOBS);
+        }
+        return MAX_DETACHED_COVERAGE_JOBS;
+    }
+
+    private static int activeAppearanceJobBudget() {
+        return clientFrameMs >= 12.0
+                ? 1
+                : MAX_DETACHED_APPEARANCE_JOBS;
     }
 
     public static SharedHeightCacheStatus sharedHeightCacheStatus() {
