@@ -159,13 +159,21 @@ public final class EverviewRenderer {
         int finerOwnedBatches = 0;
         int visibleLodBatches = 0;
         int loadedWaitingBatches = 0;
+        int maxResidentIndexCount = 0;
         double vanillaRadius =
                 client.options.getEffectiveRenderDistance() * 16.0D;
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
-            if (EverviewGpuTileCache.getResident(tile) == null) {
+            EverviewGpuTileCache.GpuTile resident =
+                    EverviewGpuTileCache.getResident(tile);
+            if (resident == null) {
                 continue;
             }
+
+            maxResidentIndexCount = Math.max(
+                    maxResidentIndexCount,
+                    resident.indexCount()
+            );
 
             if (tile.lodLevel() == 1) {
                 residentL1Tiles.add(packTile(tile.tileX(), tile.tileZ()));
@@ -179,6 +187,24 @@ public final class EverviewRenderer {
                 residentL5Tiles.add(packTile(tile.tileX(), tile.tileZ()));
             }
         }
+
+        if (maxResidentIndexCount <= 0) {
+            return;
+        }
+
+        // M9.3 grows one sequential quad-index buffer to the largest resident
+        // tile once, then reuses it for every LOD draw this frame. M9.2 asked
+        // the allocator for an index buffer and rebound it for every tile.
+        GpuBuffer sharedIndexBuffer =
+                quadIndices.getBuffer(maxResidentIndexCount);
+        renderPass.setIndexBuffer(
+                sharedIndexBuffer,
+                quadIndices.type()
+        );
+
+        Matrix4f baseModelView =
+                RenderSystem.getModelViewMatrixCopy();
+        Matrix4f tileModelView = new Matrix4f();
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
             WorldgenLodRing ring = snapshot.ringForLevel(tile.lodLevel());
@@ -213,39 +239,6 @@ public final class EverviewRenderer {
             }
 
             long started = System.nanoTime();
-            GpuBuffer indexBuffer =
-                    quadIndices.getBuffer(gpuTile.indexCount());
-
-            Matrix4f modelView = RenderSystem.getModelViewMatrixCopy();
-            double verticalBias = BASE_TERRAIN_BIAS
-                    + Math.max(0, tile.lodLevel() - 1)
-                    * RING_LAYER_BIAS;
-            modelView.translate(
-                    (float) (tile.minX() - cameraX),
-                    (float) (-cameraY - verticalBias),
-                    (float) (tile.minZ() - cameraZ)
-            );
-
-            GpuBufferSlice dynamicTransforms =
-                    RenderSystem.getDynamicUniforms().writeTransform(
-                            modelView,
-                            COLOR_MODULATOR,
-                            MODEL_OFFSET,
-                            TEXTURE_MATRIX
-                    );
-
-            renderPass.setVertexBuffer(
-                    0,
-                    gpuTile.vertexBuffer().slice()
-            );
-            renderPass.setIndexBuffer(
-                    indexBuffer,
-                    quadIndices.type()
-            );
-            renderPass.setUniform(
-                    "DynamicTransforms",
-                    dynamicTransforms
-            );
 
             boolean vanillaOwnership = tile.lodLevel() <= 3
                     && tileIntersectsVanillaOwnershipArea(
@@ -276,6 +269,37 @@ public final class EverviewRenderer {
                 finerOwnedBatches += gpuTile.drawBatches().size();
                 continue;
             }
+
+            // Only allocate/write a transform and bind a vertex buffer after
+            // ownership has established that this tile can draw something.
+            // With dense L1/L2 refinement hundreds of coarse tiles can be
+            // completely covered; M9.2 still paid the state/setup cost for all
+            // of them every frame.
+            double verticalBias = BASE_TERRAIN_BIAS
+                    + Math.max(0, tile.lodLevel() - 1)
+                    * RING_LAYER_BIAS;
+            tileModelView.set(baseModelView).translate(
+                    (float) (tile.minX() - cameraX),
+                    (float) (-cameraY - verticalBias),
+                    (float) (tile.minZ() - cameraZ)
+            );
+
+            GpuBufferSlice dynamicTransforms =
+                    RenderSystem.getDynamicUniforms().writeTransform(
+                            tileModelView,
+                            COLOR_MODULATOR,
+                            MODEL_OFFSET,
+                            TEXTURE_MATRIX
+                    );
+
+            renderPass.setVertexBuffer(
+                    0,
+                    gpuTile.vertexBuffer().slice()
+            );
+            renderPass.setUniform(
+                    "DynamicTransforms",
+                    dynamicTransforms
+            );
 
             boolean drewAny = false;
             int drawnQuads = 0;
