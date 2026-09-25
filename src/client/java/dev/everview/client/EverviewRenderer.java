@@ -143,8 +143,7 @@ public final class EverviewRenderer {
             Set<EverviewGpuRegionCache.GpuRegion> live = new HashSet<>();
             for (var plan : state.regions()) live.add(plan.region());
             HANDOFF_PLANS.keySet().retainAll(live);
-            // Ownership can change in unchanged GPU regions when their neighbors arrive.
-            HANDOFF_PLANS.clear(); previousState = state;
+            previousState = state;
         }
         EverviewMetrics.beginRenderFrame();
         lastVanillaOwnedBatches = lastLoadedWaitingBatches = lastVisibleLodBatches = 0;
@@ -204,6 +203,19 @@ public final class EverviewRenderer {
             EverviewMetrics.recordSubmittedQuads(region.lodLevel(), commands.quads());
             lastVisibleLodBatches += commands.ranges().size();
         }
+        var stitches = EverviewGpuRegionCache.stitches();
+        if (stitches != null) {
+            long started = System.nanoTime();
+            GpuBuffer indices = quadIndices.getBuffer(stitches.indices());
+            Matrix4f modelView = RenderSystem.getModelViewMatrixCopy();
+            modelView.translate((float)(stitches.originX()-x), (float)(-y-BASE_TERRAIN_BIAS), (float)(stitches.originZ()-z));
+            renderPass.setVertexBuffer(0, stitches.vertices().slice());
+            renderPass.setIndexBuffer(indices, quadIndices.type());
+            renderPass.setUniform("DynamicTransforms", RenderSystem.getDynamicUniforms().writeTransform(modelView,COLOR_MODULATOR,MODEL_OFFSET,TEXTURE_MATRIX));
+            renderPass.drawIndexed(stitches.indices(),1,0,0,0);
+            EverviewMetrics.recordDrawCall(false);
+            EverviewFrameProfiler.submission += System.nanoTime() - started;
+        }
         EverviewMetrics.recordRenderCpuNanos(System.nanoTime() - frameStarted);
         EverviewFrameProfiler.finishDraw(frameStarted);
     }
@@ -219,9 +231,11 @@ public final class EverviewRenderer {
         private BitSet owned = new BitSet();
         private BitSet scratch = new BitSet();
         private EverviewRenderState.NativeCommands commands;
+        private EverviewRenderState.RegionCommands previousPlan;
 
         private EverviewRenderState.NativeCommands update(Minecraft client, EverviewRenderState.RegionCommands plan,
                                                            double x, double y, double z, double radius) {
+            if (previousPlan != plan) { commands = null; previousPlan = plan; }
             scratch.clear();
             int index = 0;
             for (var tile : plan.tiles()) {

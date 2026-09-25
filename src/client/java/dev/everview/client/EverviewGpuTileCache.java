@@ -1493,10 +1493,10 @@ public final class EverviewGpuTileCache {
         double tz1 = (z1 - minZ) / (double) Math.max(1, maxZ - minZ);
 
         int[] outVertices = new int[] {
-                x0, bilerpInt(y00, y10, y01, y11, tx0, tz0), z0,
-                x0, bilerpInt(y00, y10, y01, y11, tx0, tz1), z1,
-                x1, bilerpInt(y00, y10, y01, y11, tx1, tz1), z1,
-                x1, bilerpInt(y00, y10, y01, y11, tx1, tz0), z0
+                x0, triangleHeight(y00, y10, y01, y11, tx0, tz0), z0,
+                x0, triangleHeight(y00, y10, y01, y11, tx0, tz1), z1,
+                x1, triangleHeight(y00, y10, y01, y11, tx1, tz1), z1,
+                x1, triangleHeight(y00, y10, y01, y11, tx1, tz0), z0
         };
 
         int[] outColors = new int[] {
@@ -1542,6 +1542,10 @@ public final class EverviewGpuTileCache {
         throw new IllegalStateException(
                 "Everview surface quad missing expected color corner"
         );
+    }
+
+    private static int triangleHeight(int a, int d, int b, int c, double u, double v) {
+        return (int) Math.round(v >= u ? a + (b-a)*v + (c-b)*u : a + (d-a)*u + (c-d)*v);
     }
 
     private static int bilerpInt(

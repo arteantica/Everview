@@ -414,6 +414,8 @@ public final class EverviewDebugHud {
                 gpu.uploadMs(),
                 gpu.prepareMs()
         ));
+        lines.add(String.format("CPU metadata %.1f MiB | seam GPU %.1f MiB | GPU includes in-flight retired buffers",
+                gpu.cpuMetadataMiB(), gpu.seamGpuMiB()));
         lines.add(String.format(
                 "Spatial residency: wanted %d | degraded %d | rebuild %d | %s",
                 gpu.residencyWantedTiles(),
@@ -444,8 +446,8 @@ public final class EverviewDebugHud {
         lines.add(String.format("Workers ms (last job): spatial %.2f | ownership %.2f | pack %.2f | budget deferred %d",
                 EverviewFrameProfiler.ms(EverviewFrameProfiler.selectionWorker), EverviewFrameProfiler.ms(EverviewFrameProfiler.ownershipWorker),
                 EverviewFrameProfiler.ms(EverviewFrameProfiler.packingWorker), EverviewFrameProfiler.deferredUploads));
-        lines.add("Drawable cells: " + EverviewGpuRegionCache.renderState().coverageCells()
-                + " | pending near quality is distinct from missing drawable coverage");
+        lines.add("Drawable 128b cells: " + EverviewGpuRegionCache.renderState().coverageCells()
+                + " | missing in 16K disk at last commit: " + EverviewGpuRegionCache.renderState().missingCells());
 
         return lines;
     }

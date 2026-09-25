@@ -3,6 +3,7 @@ package dev.everview.client;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.renderpearl.api.buffers.GpuBuffer;
 import dev.everview.core.LodTileKey;
+import dev.everview.core.CoveragePolicy;
 import net.minecraft.client.Camera;
 import net.minecraft.client.multiplayer.ClientLevel;
 
@@ -44,6 +45,11 @@ public final class EverviewGpuRegionCache {
     private static int positionX = Integer.MIN_VALUE, positionZ = Integer.MIN_VALUE;
     private static int requestedX, requestedZ;
     private static long residentBytes, residencyRevision;
+    private static long nextOwnershipRetry, lastOwnershipErrorLog;
+    private static final long STITCH_RESERVE = 64L * 1024 * 1024;
+    private static StitchBuffer stitches;
+    public record StitchBuffer(GpuBuffer vertices, int originX, int originZ, int indices, long bytes) {}
+    public static StitchBuffer stitches() { return stitches; }
     private static int regionRebuildsThisFrame, tileUploadsThisFrame, staleRegionsThisFrame;
     private static int residencySelectionRebuildsThisFrame, degradedFineTilesThisFrame, wantedTiles;
     private static long uploadNanosThisFrame, prepareNanosThisFrame;
@@ -72,20 +78,40 @@ public final class EverviewGpuRegionCache {
         int cellZ = Math.floorDiv((int) Math.floor(z), POSITION_REBUILD_QUANTUM_BLOCKS);
 
         long integrationStarted = System.nanoTime();
-        if (ownershipFuture != null && ownershipFuture.isDone()) {
+        if (ownershipFuture != null && ownershipFuture.isDone() && started >= nextOwnershipRetry) {
             try {
                 // Old commands/buffers stay usable until this one atomic publication.
-                renderState = ownershipFuture.join();
+                EverviewRenderState replacement = ownershipFuture.join();
+                var preparedStitches = replacement.stitches();
+                if (preparedStitches.vertices().remaining() > STITCH_RESERVE / 2) {
+                    throw new IllegalStateException("transition mesh exceeds reserved budget");
+                }
+                long seamUpload = System.nanoTime();
+                StitchBuffer nextStitches = preparedStitches.indexCount() == 0 ? null : new StitchBuffer(
+                        RenderSystem.getDevice().createBuffer(() -> "Everview ownership transitions",
+                                GpuBuffer.USAGE_COPY_DST | GpuBuffer.USAGE_VERTEX, preparedStitches.vertices()),
+                        preparedStitches.originX(), preparedStitches.originZ(), preparedStitches.indexCount(), preparedStitches.vertices().limit());
+                uploadNanosThisFrame += System.nanoTime() - seamUpload;
+                if (stitches != null) stitches.vertices().close();
+                stitches = nextStitches;
+                renderState = replacement;
                 for (GpuRegion old : RETIRED) { residentBytes -= old.bytes(); old.close(); }
                 RETIRED.clear();
                 residencyRevision++;
+                nextOwnershipRetry = 0;
                 EverviewFrameProfiler.ownershipBuilds++;
                 ownershipFuture = null;
-            } catch (CompletionException error) {
-                EverviewClient.LOGGER.error("Everview ownership transaction failed; retaining last drawable state", error);
+            } catch (RuntimeException error) {
+                EverviewFrameProfiler.deferredUploads++;
+                if (started - lastOwnershipErrorLog > 5_000_000_000L) {
+                    EverviewClient.LOGGER.error("Everview ownership transaction failed; retaining last drawable state", error);
+                    lastOwnershipErrorLog = started;
+                }
+                nextOwnershipRetry = started + 1_000_000_000L;
                 // Retry the same transaction. Never close buffers referenced by the old state.
                 List<GpuRegion> retry = List.copyOf(REGIONS.values());
-                ownershipFuture = CompletableFuture.supplyAsync(() -> EverviewRenderState.build(retry), PLANNER);
+                EverviewRenderState previous = renderState;
+                ownershipFuture = CompletableFuture.supplyAsync(() -> EverviewRenderState.build(retry, previous, x, z), PLANNER);
             }
         }
         EverviewFrameProfiler.integration = System.nanoTime() - integrationStarted;
@@ -110,7 +136,8 @@ public final class EverviewGpuRegionCache {
         // No pressure-triggered retry loop: budget is applied once inside each immutable plan.
         if (selectionFuture == null && (snapshot.tiles() != lastSources || cellX != positionX || cellZ != positionZ)) {
             requestedSources = snapshot.tiles(); requestedX = cellX; requestedZ = cellZ;
-            Set<LodTileKey> resident = Set.copyOf(TILES.keySet());
+            Map<LodTileKey, WorldgenSurfaceTile> resident = new HashMap<>();
+            for (var entry : TILES.entrySet()) resident.put(entry.getKey(), entry.getValue().source());
             selectionFuture = CompletableFuture.supplyAsync(() -> select(snapshot, x, z, resident), PLANNER);
         }
         EverviewFrameProfiler.residency = System.nanoTime() - residencyStarted;
@@ -135,7 +162,7 @@ public final class EverviewGpuRegionCache {
                 GpuRegion old = REGIONS.get(desired.key());
                 // Also protect tiles removed from a shrinking region, not just whole regions.
                 if (old != null && !canReplace(old, desired, x, z)) continue;
-                if (residentBytes + prepared.vertices().remaining() > MAX_GPU_BYTES
+                if (!CoveragePolicy.mayUpload(residentBytes, prepared.vertices().remaining(), MAX_GPU_BYTES - STITCH_RESERVE)
                         || TILES.size() + desired.tiles().size() - (old == null ? 0 : old.tileViews().size()) > MAX_RESIDENT_TILES) {
                     EverviewFrameProfiler.deferredUploads++;
                     continue;
@@ -155,7 +182,8 @@ public final class EverviewGpuRegionCache {
             }
             if (changed) {
                 List<GpuRegion> transaction = List.copyOf(REGIONS.values());
-                ownershipFuture = CompletableFuture.supplyAsync(() -> EverviewRenderState.build(transaction), PLANNER);
+                EverviewRenderState previous = renderState;
+                ownershipFuture = CompletableFuture.supplyAsync(() -> EverviewRenderState.build(transaction, previous, x, z), PLANNER);
             }
         }
         long pendingBytes = 0;
@@ -207,13 +235,12 @@ public final class EverviewGpuRegionCache {
 
     private static boolean hasDrawableParentOrOutside(WorldgenSurfaceTile tile, double x, double z) {
         // Leave a full base-tile guard beyond the intended 16K disk. Eviction is position-only.
-        if (nearestDistance(tile, x, z) > 16_384 + 2_048 + RESIDENCY_HYSTERESIS_BLOCKS) return true;
-        for (int level = tile.lodLevel() + 1; level <= 6; level++) {
-            int size = level <= 2 ? 128 : 128 << (level - 2);
-            GpuTile parent = TILES.get(new LodTileKey(level, Math.floorDiv(tile.minX(), size), Math.floorDiv(tile.minZ(), size)));
-            if (parent != null && !parent.region().vertexBuffer().isClosed()) return true;
-        }
-        return false;
+        return CoveragePolicy.mayRetire(tile.lodLevel(), tile.minX(), tile.minZ(),
+                nearestDistance(tile, x, z) > 16_384 + 2_048 + RESIDENCY_HYSTERESIS_BLOCKS,
+                key -> {
+                    GpuTile parent = TILES.get(key);
+                    return parent != null && !parent.region().vertexBuffer().isClosed();
+                });
     }
 
     private static boolean retireSafeRegions(double x, double z) {
@@ -259,7 +286,7 @@ public final class EverviewGpuRegionCache {
                 packed.put((byte) (color >> 16)).put((byte) (color >> 8)).put((byte) color).put((byte) 255);
             }
             tiles.add(new PreparedTile(geometry.source(), first, geometry.indexCount(), geometry.drawBatches(),
-                    TerrainSurfaceData.from(geometry)));
+                    TerrainSurfaceData.from(geometry), TerrainEdges.from(geometry, originX, originZ)));
             first += geometry.indexCount();
         }
         packed.flip();
@@ -274,7 +301,7 @@ public final class EverviewGpuRegionCache {
         GpuRegion region = new GpuRegion(key, buffer, prepared.indices(), prepared.vertices().limit(),
                 prepared.originX(), prepared.originZ(), prepared.desired().tiles(), new ArrayList<>());
         for (PreparedTile tile : prepared.tiles()) region.tileViews().add(new GpuTile(tile.source(), region,
-                tile.first(), tile.count(), tile.batches(), tile.surfaceData()));
+                tile.first(), tile.count(), tile.batches(), tile.surfaceData(), tile.edges()));
         return region;
     }
 
@@ -294,14 +321,20 @@ public final class EverviewGpuRegionCache {
     public static long residencyRevision() { return residencyRevision; }
     public static EverviewRenderState renderState() { return renderState; }
     public static Stats stats() {
-        return new Stats(REGIONS.size(), TILES.size(), residentBytes, regionRebuildsThisFrame,
+        long metadataBytes = 0;
+        for (GpuRegion region : REGIONS.values()) for (GpuTile tile : region.tileViews())
+            metadataBytes += tile.surfaceData().bytes() + tile.edges().estimatedBytes();
+        for (GpuRegion region : RETIRED) for (GpuTile tile : region.tileViews())
+            metadataBytes += tile.surfaceData().bytes() + tile.edges().estimatedBytes();
+        return new Stats(REGIONS.size(), TILES.size(), residentBytes + (stitches == null ? 0 : stitches.bytes()), regionRebuildsThisFrame,
                 tileUploadsThisFrame, uploadNanosThisFrame / 1e6, prepareNanosThisFrame / 1e6,
                 staleRegionsThisFrame, 0, residencySelectionRebuildsThisFrame, degradedFineTilesThisFrame,
-                wantedTiles, residencyComplete);
+                wantedTiles, residencyComplete, metadataBytes, stitches == null ? 0 : stitches.bytes());
     }
 
     public static void clear() {
         renderState = EverviewRenderState.EMPTY;
+        if (stitches != null) { stitches.vertices().close(); stitches = null; }
         for (GpuRegion region : REGIONS.values()) region.close();
         for (GpuRegion region : RETIRED) region.close();
         for (PendingRegion pending : PENDING.values()) pending.future().cancel(false);
@@ -314,18 +347,19 @@ public final class EverviewGpuRegionCache {
         lastSources = requestedSources = null; lastLevel = null;
         positionX = positionZ = Integer.MIN_VALUE;
         residentBytes = 0; residencyRevision++; residencyComplete = false;
+        nextOwnershipRetry = lastOwnershipErrorLog = 0;
     }
 
     private static Selection select(
             WorldgenSurfaceSnapshot snapshot,
             double cameraX,
-            double cameraZ, Set<LodTileKey> residentKeys
+            double cameraZ, Map<LodTileKey, WorldgenSurfaceTile> residentSources
     ) {
         long started = System.nanoTime();
         int degraded = 0;
 
         Map<Long, WorldgenSurfaceTile> bestByCell = new HashMap<>();
-        Map<LodTileKey, WorldgenSurfaceTile> sourceByKey = new HashMap<>();
+        Map<LodTileKey, WorldgenSurfaceTile> sourceByKey = new HashMap<>(residentSources);
 
         for (WorldgenSurfaceTile tile : snapshot.tiles()) {
             LodTileKey key = keyOf(tile);
@@ -336,7 +370,7 @@ public final class EverviewGpuRegionCache {
                 continue;
             }
 
-            boolean alreadyResident = residentKeys.contains(key);
+            boolean alreadyResident = residentSources.containsKey(key);
             int hysteresis = alreadyResident
                     ? RESIDENCY_HYSTERESIS_BLOCKS : 0;
 
@@ -388,8 +422,9 @@ public final class EverviewGpuRegionCache {
 
         // The outermost floor is a coverage reserve, independent of fine quality.
         // It remains uploaded even where children currently hide it.
-        for (WorldgenSurfaceTile tile : snapshot.tiles()) {
-            if (tile.lodLevel() == 6) selected.add(tile);
+        for (WorldgenSurfaceTile tile : sourceByKey.values()) {
+            if (tile.lodLevel() == 6 && nearestDistance(tile, cameraX, cameraZ)
+                    <= 16_384 + 2_048 + RESIDENCY_HYSTERESIS_BLOCKS) selected.add(tile);
         }
         long estimate = estimatedSelectionBytes(selected);
         if (estimate > TARGET_GPU_BYTES
@@ -714,7 +749,8 @@ public final class EverviewGpuRegionCache {
             int firstIndex,
             int indexCount,
             List<EverviewGpuTileCache.DrawBatch> drawBatches,
-            TerrainSurfaceData surfaceData
+            TerrainSurfaceData surfaceData,
+            TerrainEdges edges
     ) {
     }
 
@@ -738,8 +774,12 @@ public final class EverviewGpuRegionCache {
             int residencySelectionRebuildsThisFrame,
             int degradedFineTilesThisFrame,
             int residencyWantedTiles,
-            boolean residencyComplete
+            boolean residencyComplete,
+            long cpuMetadataBytes,
+            long seamGpuBytes
     ) {
+        public double cpuMetadataMiB() { return cpuMetadataBytes / (1024.0 * 1024.0); }
+        public double seamGpuMiB() { return seamGpuBytes / (1024.0 * 1024.0); }
         public double residentMiB() {
             return residentBytes / (1024.0 * 1024.0);
         }
@@ -747,7 +787,7 @@ public final class EverviewGpuRegionCache {
 
     private record Selection(Map<RegionKey, DesiredRegion> regions, List<DesiredRegion> ordered, int wanted, int degraded) {}
     private record PreparedTile(WorldgenSurfaceTile source, int first, int count,
-                                List<EverviewGpuTileCache.DrawBatch> batches, TerrainSurfaceData surfaceData) {}
+                                List<EverviewGpuTileCache.DrawBatch> batches, TerrainSurfaceData surfaceData, TerrainEdges edges) {}
     private record PreparedRegionCpu(DesiredRegion desired, int originX, int originZ,
                                      List<PreparedTile> tiles, int indices, ByteBuffer vertices) {}
     private record PendingRegion(DesiredRegion desired, CompletableFuture<PreparedRegionCpu> future) {}

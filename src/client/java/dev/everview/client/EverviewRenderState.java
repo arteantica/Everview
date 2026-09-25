@@ -9,12 +9,18 @@ import java.nio.IntBuffer;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.BitSet;
+import java.util.IdentityHashMap;
 
 /** Immutable upload/ownership/command transaction. Built on a worker, published on the render thread. */
-public record EverviewRenderState(List<RegionCommands> regions, int coverageCells, int maskedBatches) {
-    public static final EverviewRenderState EMPTY = new EverviewRenderState(List.of(), 0, 0);
+public record EverviewRenderState(List<RegionCommands> regions, int coverageCells, int maskedBatches,
+                                 int missingCells, DrawableCoverage coverage,
+                                 Map<EverviewGpuRegionCache.GpuRegion, RegionCommands> cached, TerrainStitches.Prepared stitches) {
+    public static final EverviewRenderState EMPTY = new EverviewRenderState(List.of(), 0, 0, 0, new DrawableCoverage(), Map.of(), null);
 
-    public static EverviewRenderState build(List<EverviewGpuRegionCache.GpuRegion> residents) {
+    public static EverviewRenderState build(List<EverviewGpuRegionCache.GpuRegion> residents,
+                                            EverviewRenderState previous, double x, double z) {
         long started = System.nanoTime();
         DrawableCoverage coverage = new DrawableCoverage();
         for (var region : residents) for (var tile : region.tileViews()) {
@@ -23,23 +29,46 @@ public record EverviewRenderState(List<RegionCommands> regions, int coverageCell
         }
         List<RegionCommands> regions = new ArrayList<>();
         int masked = 0;
+        Map<EverviewGpuRegionCache.GpuRegion, RegionCommands> cached = new IdentityHashMap<>();
         for (var region : residents) {
+            BitSet mask = coverage.finerMask(region.lodLevel(), region.originX(), region.originZ(),
+                    region.tileViews().getFirst().source().tileSize() * 2);
+            RegionCommands old = previous.cached().get(region);
+            if (old != null && old.mask().equals(mask)) {
+                cached.put(region, old); masked += old.masked();
+                if (!old.commands().ranges().isEmpty()) regions.add(old);
+                continue;
+            }
+            int regionMasked = 0;
             List<TileCommands> tiles = new ArrayList<>();
             List<Range> ranges = new ArrayList<>();
             AABB bounds = null;
             for (var tile : region.tileViews()) {
                 var source = tile.source();
-                List<EverviewGpuTileCache.DrawBatch> visible = new ArrayList<>();
+                boolean allFiner = true, anyFiner = false;
+                for (int cz = Math.floorDiv(source.minZ(), 128); cz < Math.floorDiv(source.maxZ(), 128); cz++) {
+                    for (int cx = Math.floorDiv(source.minX(), 128); cx < Math.floorDiv(source.maxX(), 128); cx++) {
+                        boolean finer = coverage.finerOwns(source.lodLevel(), cx, cz);
+                        allFiner &= finer; anyFiner |= finer;
+                    }
+                }
+                if (allFiner) { regionMasked += tile.drawBatches().size(); continue; }
+                List<EverviewGpuTileCache.DrawBatch> visible;
                 List<Range> tileRanges = new ArrayList<>();
+                if (!anyFiner) {
+                    visible = tile.drawBatches(); append(tileRanges, tile.firstIndex(), tile.indexCount());
+                } else {
+                    visible = new ArrayList<>();
                 for (var batch : tile.drawBatches()) {
                     int cellX = source.lodLevel() <= 2 ? Math.floorDiv(source.minX(), 128) : batch.regionTileX();
                     int cellZ = source.lodLevel() <= 2 ? Math.floorDiv(source.minZ(), 128) : batch.regionTileZ();
                     if (coverage.finerOwns(source.lodLevel(), cellX, cellZ)) {
-                        masked++;
+                        regionMasked++;
                     } else {
                         visible.add(batch);
                         append(tileRanges, batch.firstIndex(), batch.indexCount());
                     }
+                }
                 }
                 if (tileRanges.isEmpty()) continue;
                 AABB tileBounds = new AABB(source.minX(), source.minY() - 8.0, source.minZ(),
@@ -48,11 +77,15 @@ public record EverviewRenderState(List<RegionCommands> regions, int coverageCell
                 tiles.add(new TileCommands(tile, tileBounds, List.copyOf(visible), List.copyOf(tileRanges)));
                 ranges.addAll(tileRanges);
             }
-            if (ranges.isEmpty()) continue;
-            regions.add(new RegionCommands(region, bounds, List.copyOf(tiles), NativeCommands.build(ranges)));
+            RegionCommands commands = new RegionCommands(region, bounds, List.copyOf(tiles), NativeCommands.build(ranges), mask, regionMasked);
+            cached.put(region, commands); masked += regionMasked;
+            if (!ranges.isEmpty()) regions.add(commands);
         }
+        var stitches = TerrainStitches.build(residents, coverage, x, z);
+        int missing = coverage.missingInDisk(x, z, 16_384);
         EverviewFrameProfiler.ownershipWorker = System.nanoTime() - started;
-        return new EverviewRenderState(List.copyOf(regions), coverage.cells(), masked);
+        return new EverviewRenderState(List.copyOf(regions), coverage.cells(), masked,
+                missing, coverage, Map.copyOf(cached), stitches);
     }
 
     public static void append(List<Range> ranges, int first, int count) {
@@ -71,7 +104,7 @@ public record EverviewRenderState(List<RegionCommands> regions, int coverageCell
     public record TileCommands(EverviewGpuRegionCache.GpuTile tile, AABB bounds,
                                List<EverviewGpuTileCache.DrawBatch> batches, List<Range> ranges) {}
     public record RegionCommands(EverviewGpuRegionCache.GpuRegion region, AABB bounds,
-                                 List<TileCommands> tiles, NativeCommands commands) {}
+                                 List<TileCommands> tiles, NativeCommands commands, BitSet mask, int masked) {}
 
     /** Both index widths are retained; the shared sequential index buffer can grow later. */
     public record NativeCommands(List<Range> ranges, PointerBuffer offsets16, PointerBuffer offsets32,
