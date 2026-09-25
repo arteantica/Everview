@@ -28,17 +28,19 @@ public record EverviewRenderState(List<RegionCommands> regions, int coverageCell
             coverage.add(source.lodLevel(), source.minX(), source.minZ(), source.tileSize());
         }
         List<RegionCommands> regions = new ArrayList<>();
-        int masked = 0;
+        int masked = 0, reused = 0, rebuilt = 0;
         Map<EverviewGpuRegionCache.GpuRegion, RegionCommands> cached = new IdentityHashMap<>();
         for (var region : residents) {
             BitSet mask = coverage.finerMask(region.lodLevel(), region.originX(), region.originZ(),
                     region.tileViews().getFirst().source().tileSize() * 2);
             RegionCommands old = previous.cached().get(region);
             if (old != null && old.mask().equals(mask)) {
+                reused++;
                 cached.put(region, old); masked += old.masked();
                 if (!old.commands().ranges().isEmpty()) regions.add(old);
                 continue;
             }
+            rebuilt++;
             int regionMasked = 0;
             List<TileCommands> tiles = new ArrayList<>();
             List<Range> ranges = new ArrayList<>();
@@ -83,6 +85,9 @@ public record EverviewRenderState(List<RegionCommands> regions, int coverageCell
         }
         var stitches = TerrainStitches.build(residents, coverage, x, z);
         int missing = coverage.missingInDisk(x, z, 16_384);
+        EverviewFrameProfiler.reusedRegions = reused;
+        EverviewFrameProfiler.rebuiltRegions = rebuilt;
+        EverviewFrameProfiler.seamIndices = stitches.indexCount();
         EverviewFrameProfiler.ownershipWorker = System.nanoTime() - started;
         return new EverviewRenderState(List.copyOf(regions), coverage.cells(), masked,
                 missing, coverage, Map.copyOf(cached), stitches);
@@ -115,10 +120,11 @@ public record EverviewRenderState(List<RegionCommands> regions, int coverageCell
             List<Range> merged = new ArrayList<>();
             for (Range range : ordered) append(merged, range.first(), range.count());
             int n = merged.size();
-            PointerBuffer offsets16 = BufferUtils.createPointerBuffer(n);
-            PointerBuffer offsets32 = BufferUtils.createPointerBuffer(n);
-            IntBuffer counts = BufferUtils.createIntBuffer(n);
-            IntBuffer bases = BufferUtils.createIntBuffer(n);
+            // Some native allocators reject a zero-capacity pointer buffer.
+            PointerBuffer offsets16 = BufferUtils.createPointerBuffer(Math.max(1, n));
+            PointerBuffer offsets32 = BufferUtils.createPointerBuffer(Math.max(1, n));
+            IntBuffer counts = BufferUtils.createIntBuffer(Math.max(1, n));
+            IntBuffer bases = BufferUtils.createIntBuffer(Math.max(1, n));
             int quads = 0;
             for (int i = 0; i < n; i++) {
                 Range range = merged.get(i);

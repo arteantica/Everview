@@ -2801,6 +2801,7 @@ public final class WorldgenSurfaceSampler {
 
                     int y = grid.heights[fineIndex];
                     job.heights[sampleIndex] = y;
+                    job.water[sampleIndex] = job.sampleGrid.water[fineIndex];
                     job.minY = Math.min(job.minY, y);
                     job.maxY = Math.max(job.maxY, y);
                     job.reusedSamples++;
@@ -3073,6 +3074,7 @@ public final class WorldgenSurfaceSampler {
                     && job.sampleGrid.heightSampled[fineIndex]) {
                 int y = job.sampleGrid.heights[fineIndex];
                 job.heights[sampleIndex] = y;
+                job.water[sampleIndex] = job.sampleGrid.water[fineIndex];
                 job.minY = Math.min(job.minY, y);
                 job.maxY = Math.max(job.maxY, y);
                 job.reusedSamples++;
@@ -3131,7 +3133,9 @@ public final class WorldgenSurfaceSampler {
 
         for (int i = 0; i < result.sampleIndices().length; i++) {
             int sampleIndex = result.sampleIndices()[i];
-            int y = result.heights()[i];
+            int packed = result.heights()[i];
+            int y = packed >> 1;
+            job.water[sampleIndex] = (packed & 1) != 0;
             int gx = sampleIndex % job.samplesAcross;
             int gz = sampleIndex / job.samplesAcross;
             int fineIndex = job.fineGridIndex(gx, gz);
@@ -3139,6 +3143,7 @@ public final class WorldgenSurfaceSampler {
             job.heights[sampleIndex] = y;
             if (fineIndex >= 0) {
                 job.sampleGrid.heights[fineIndex] = y;
+                job.sampleGrid.water[fineIndex] = job.water[sampleIndex];
                 job.sampleGrid.heightSampled[fineIndex] = true;
             }
             job.minY = Math.min(job.minY, y);
@@ -3313,7 +3318,7 @@ public final class WorldgenSurfaceSampler {
             int fineIndex = job.fineGridIndex(gx, gz);
 
             if (job.sampleGrid == null || fineIndex < 0) {
-                int y = sampleHeightCached(
+                int packed = sampleHeightCached(
                         level,
                         generator,
                         randomState,
@@ -3322,6 +3327,8 @@ public final class WorldgenSurfaceSampler {
                         job.sampleSpacing
                 );
 
+                int y = packed >> 1;
+                job.water[sampleIndex] = (packed & 1) != 0;
                 var biome = sampleBiomeCached(
                                 level,
                                 worldX,
@@ -3350,9 +3357,10 @@ public final class WorldgenSurfaceSampler {
                 int y;
                 if (grid.heightSampled[fineIndex]) {
                     y = grid.heights[fineIndex];
+                    job.water[sampleIndex] = grid.water[fineIndex];
                     job.reusedSamples++;
                 } else {
-                    y = sampleHeightCached(
+                    int packed = sampleHeightCached(
                         level,
                         generator,
                         randomState,
@@ -3360,7 +3368,10 @@ public final class WorldgenSurfaceSampler {
                         worldZ,
                         job.sampleSpacing
                 );
+                    y = packed >> 1;
+                    job.water[sampleIndex] = (packed & 1) != 0;
                     grid.heights[fineIndex] = y;
+                    grid.water[fineIndex] = job.water[sampleIndex];
                     grid.heightSampled[fineIndex] = true;
                     job.generatedSamples++;
                     processed++;
@@ -3560,7 +3571,9 @@ public final class WorldgenSurfaceSampler {
 
         for (int i = 0; i < result.sampleIndices().length; i++) {
             int sampleIndex = result.sampleIndices()[i];
-            int y = result.heights()[i];
+            int packed = result.heights()[i];
+            int y = packed >> 1;
+            job.water[sampleIndex] = (packed & 1) != 0;
             job.heights[sampleIndex] = y;
 
             if (job.sampleGrid != null) {
@@ -3569,6 +3582,7 @@ public final class WorldgenSurfaceSampler {
                 int fineIndex = job.fineGridIndex(gx, gz);
                 if (fineIndex >= 0) {
                     job.sampleGrid.heights[fineIndex] = y;
+                    job.sampleGrid.water[fineIndex] = job.water[sampleIndex];
                     job.sampleGrid.heightSampled[fineIndex] = true;
                 }
             }
@@ -3681,6 +3695,7 @@ public final class WorldgenSurfaceSampler {
                         && job.sampleGrid.heightSampled[fineIndex]) {
                     int y = job.sampleGrid.heights[fineIndex];
                     job.heights[sampleIndex] = y;
+                    job.water[sampleIndex] = job.sampleGrid.water[fineIndex];
                     job.minY = Math.min(job.minY, y);
                     job.maxY = Math.max(job.maxY, y);
                     job.reusedSamples++;
@@ -3754,7 +3769,9 @@ public final class WorldgenSurfaceSampler {
 
         for (int i = 0; i < result.sampleIndices().length; i++) {
             int sampleIndex = result.sampleIndices()[i];
-            int y = result.heights()[i];
+            int packed = result.heights()[i];
+            int y = packed >> 1;
+            job.water[sampleIndex] = (packed & 1) != 0;
             int gx = sampleIndex % job.samplesAcross;
             int gz = sampleIndex / job.samplesAcross;
             int fineIndex = job.fineGridIndex(gx, gz);
@@ -3762,6 +3779,7 @@ public final class WorldgenSurfaceSampler {
             job.heights[sampleIndex] = y;
             if (fineIndex >= 0) {
                 job.sampleGrid.heights[fineIndex] = y;
+                job.sampleGrid.water[fineIndex] = job.water[sampleIndex];
                 job.sampleGrid.heightSampled[fineIndex] = true;
             }
             job.minY = Math.min(job.minY, y);
@@ -4007,18 +4025,32 @@ public final class WorldgenSurfaceSampler {
                 randomState
         );
         y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
+        int sea = level.getSeaLevel();
+        boolean wet;
+        if (y < sea - 2) {
+            wet = true;
+        } else if (y <= sea + 2) {
+            // At a shallow shore the ocean-floor height alone cannot tell a
+            // one-block fluid layer from dry land at the same elevation.
+            int visible = generator.getBaseHeight(worldX, worldZ,
+                    Heightmap.Types.WORLD_SURFACE_WG, level, randomState);
+            wet = visible > y;
+        } else {
+            wet = false;
+        }
+        int packed = (y << 1) | (wet ? 1 : 0);
         if (reusableColumn) {
             SHARED_HEIGHT_MISSES.incrementAndGet();
 
             if (SHARED_HEIGHT_CACHE.size() < SHARED_HEIGHT_CACHE_LIMIT) {
-                Integer raced = SHARED_HEIGHT_CACHE.putIfAbsent(key, y);
+                Integer raced = SHARED_HEIGHT_CACHE.putIfAbsent(key, packed);
                 if (raced != null) {
                     return raced;
                 }
             }
         }
 
-        return y;
+        return packed;
     }
 
     private static long packWorldColumn(int worldX, int worldZ) {
@@ -4074,7 +4106,7 @@ public final class WorldgenSurfaceSampler {
         // Heights are solid-surface samples. Fluid coverage never comes from a nearby
         // borrowed biome/material, and never from a coarse-cell majority vote.
         for (int i = 0; i < job.totalSamples; i++) {
-            boolean wet = job.heights[i] < seaLevel;
+            boolean wet = job.water[i];
             byte material = job.sampleMaterials[i];
             boolean waterMaterial = material == MinecraftSurfacePalette.MATERIAL_WATER
                     || material == MinecraftSurfacePalette.MATERIAL_ICE;
@@ -4101,7 +4133,7 @@ public final class WorldgenSurfaceSampler {
             default -> 4.0;
         };
         new dev.everview.core.AdaptiveSurfaceMesh(job.cellsAcross, job.sampleSpacing, seaLevel,
-                job.heights, job.sampleMaterials, job.sampleColors, error,
+                job.heights, job.sampleMaterials, job.sampleColors, job.water, error,
                 (x0, z0, x1, z1, y00, y01, y11, y10, material, color) -> {
                     // No height quantization or averaged plateaus. The simplified
                     // triangles retain all sampled features within their error bound.
@@ -4291,6 +4323,7 @@ public final class WorldgenSurfaceSampler {
             int seaLevel
     ) {
         return material == MinecraftSurfacePalette.MATERIAL_WATER
+                || material == MinecraftSurfacePalette.MATERIAL_ICE
                 ? seaLevel
                 : job.heights[sample];
     }
@@ -4483,691 +4516,6 @@ public final class WorldgenSurfaceSampler {
                 wallColor,
                 wallMaterial
         );
-    }
-
-    /**
-     * M6.0 distant terrain renderer.
-     *
-     * L3-L6 keep the real sampled terrain silhouette but stop interpolating
-     * biome colors across giant quads. Each coarse cell gets one Minecraft-like
-     * material/color and an integer-quantized surface. The result reads as
-     * distant Minecraft terrain instead of a continuous watercolor heightfield.
-     */
-    private static MeshData buildMinecraftFacetedMesh(
-            GenerationJob job,
-            int seaLevel
-    ) {
-        int cells = job.cellsAcross;
-        int spacing = job.sampleSpacing;
-        int verticalQuantum = switch (job.ring.lodLevel()) {
-            case 3 -> 1;
-            case 4 -> 2;
-            case 5 -> 4;
-            default -> 8;
-        };
-
-        MeshBuilder mesh = new MeshBuilder(job.cellCount);
-
-        for (int gz = 0; gz < cells; gz++) {
-            int z0 = job.originZ + gz * spacing;
-            int z1 = z0 + spacing;
-
-            for (int gx = 0; gx < cells; gx++) {
-                int x0 = job.originX + gx * spacing;
-                int x1 = x0 + spacing;
-
-                int i00 = gz * job.samplesAcross + gx;
-                int i10 = i00 + 1;
-                int i01 = (gz + 1) * job.samplesAcross + gx;
-                int i11 = i01 + 1;
-
-                int raw00 = displaySampleHeight(job, i00, seaLevel);
-                int raw10 = displaySampleHeight(job, i10, seaLevel);
-                int raw01 = displaySampleHeight(job, i01, seaLevel);
-                int raw11 = displaySampleHeight(job, i11, seaLevel);
-
-                float dx = ((raw10 + raw11) - (raw00 + raw01))
-                        * 0.5F / Math.max(1, spacing);
-                float dz = ((raw01 + raw11) - (raw00 + raw10))
-                        * 0.5F / Math.max(1, spacing);
-                float maxRise = Math.max(
-                        Math.max(Math.abs(raw10 - raw00), Math.abs(raw01 - raw00)),
-                        Math.max(Math.abs(raw11 - raw10), Math.abs(raw11 - raw01))
-                );
-                float steepness = Math.min(
-                        1.0F,
-                        maxRise / Math.max(1.0F, spacing * 0.85F)
-                );
-
-                byte material = dominantMaterial(job, i00, i10, i01, i11);
-                if (material == MinecraftSurfacePalette.MATERIAL_GRASS
-                        && steepness > 0.55F) {
-                    material = MinecraftSurfacePalette.MATERIAL_STONE;
-                }
-
-                int y00;
-                int y10;
-                int y01;
-                int y11;
-
-                if (material == MinecraftSurfacePalette.MATERIAL_WATER
-                        || material == MinecraftSurfacePalette.MATERIAL_ICE) {
-                    y00 = seaLevel;
-                    y10 = seaLevel;
-                    y01 = seaLevel;
-                    y11 = seaLevel;
-                } else {
-                    y00 = quantizeHeight(raw00, verticalQuantum);
-                    y10 = quantizeHeight(raw10, verticalQuantum);
-                    y01 = quantizeHeight(raw01, verticalQuantum);
-                    y11 = quantizeHeight(raw11, verticalQuantum);
-                }
-
-                float invLength = 1.0F
-                        / (float) Math.sqrt(dx * dx + 1.0F + dz * dz);
-                float nx = -dx * invLength;
-                float ny = invLength;
-                float nz = -dz * invLength;
-                float lightDot =
-                        nx * -0.45F + ny * 0.86F + nz * -0.24F;
-                float shade = 0.74F
-                        + Math.max(0.0F, lightDot) * 0.28F;
-
-                int baseColor;
-                if (material == MinecraftSurfacePalette.MATERIAL_STONE
-                        && job.sampleMaterials[i00]
-                                != MinecraftSurfacePalette.MATERIAL_STONE
-                        && job.sampleMaterials[i10]
-                                != MinecraftSurfacePalette.MATERIAL_STONE
-                        && job.sampleMaterials[i01]
-                                != MinecraftSurfacePalette.MATERIAL_STONE
-                        && job.sampleMaterials[i11]
-                                != MinecraftSurfacePalette.MATERIAL_STONE) {
-                    baseColor = MinecraftSurfacePalette.stoneColor();
-                } else {
-                    baseColor = representativeColor(
-                            job,
-                            material,
-                            i00,
-                            i10,
-                            i01,
-                            i11
-                    );
-                }
-
-                int centerX = x0 + spacing / 2;
-                int centerZ = z0 + spacing / 2;
-                int centerY = Math.round(
-                        (y00 + y10 + y01 + y11) * 0.25F
-                );
-
-                int color = MaterialTerrainShading.apply(
-                        MinecraftSurfacePalette.applyLighting(
-                                baseColor,
-                                material == MinecraftSurfacePalette.MATERIAL_WATER
-                                        || material == MinecraftSurfacePalette.MATERIAL_ICE
-                                        ? 0.96F
-                                        : shade
-                        ),
-                        material,
-                        centerX,
-                        centerY,
-                        centerZ,
-                        spacing
-                );
-
-                // One flat material color per coarse facet. Geometry can slope
-                // between real sampled heights, but color no longer turns a
-                // 128/256-block cell into one giant interpolated gradient blob.
-                mesh.addQuad(
-                        x0, y00, z0,
-                        x0, y01, z1,
-                        x1, y11, z1,
-                        x1, y10, z0,
-                        color,
-                        material
-                );
-            }
-        }
-
-        return mesh.finish();
-    }
-
-    private static int displaySampleHeight(
-            GenerationJob job,
-            int sampleIndex,
-            int seaLevel
-    ) {
-        byte material = job.sampleMaterials[sampleIndex];
-        return material == MinecraftSurfacePalette.MATERIAL_WATER
-                || material == MinecraftSurfacePalette.MATERIAL_ICE
-                ? seaLevel
-                : job.heights[sampleIndex];
-    }
-
-    private static int quantizeHeight(int y, int quantum) {
-        if (quantum <= 1) {
-            return y;
-        }
-
-        return Math.round(y / (float) quantum) * quantum;
-    }
-
-    private static MeshData buildSmoothMesh(GenerationJob job) {
-        int[] vertices = new int[job.cellCount * 12];
-        int[] colors = new int[job.cellCount * 4];
-        byte[] materials = new byte[job.cellCount * 4];
-        int vertexOut = 0;
-        int colorOut = 0;
-        int spacing = job.sampleSpacing;
-
-        for (int gz = 0; gz < job.cellsAcross; gz++) {
-            int z0 = job.originZ + gz * spacing;
-            int z1 = z0 + spacing;
-
-            for (int gx = 0; gx < job.cellsAcross; gx++) {
-                int x0 = job.originX + gx * spacing;
-                int x1 = x0 + spacing;
-
-                int i00 = gz * job.samplesAcross + gx;
-                int i10 = i00 + 1;
-                int i01 = (gz + 1) * job.samplesAcross + gx;
-                int i11 = i01 + 1;
-
-                int y00 = job.heights[i00];
-                int y10 = job.heights[i10];
-                int y01 = job.heights[i01];
-                int y11 = job.heights[i11];
-
-                float dx = ((y10 + y11) - (y00 + y01)) * 0.5F / spacing;
-                float dz = ((y01 + y11) - (y00 + y10)) * 0.5F / spacing;
-                float invLength = 1.0F / (float) Math.sqrt(dx * dx + 1.0F + dz * dz);
-
-                float nx = -dx * invLength;
-                float ny = invLength;
-                float nz = -dz * invLength;
-
-                // Fixed northwest/up light gives terrain readable shape before
-                // shader-aware lighting is introduced.
-                float lightDot = nx * -0.45F + ny * 0.86F + nz * -0.24F;
-                float shade = 0.72F + Math.max(0.0F, lightDot) * 0.30F;
-
-                float maxRise = Math.max(
-                        Math.max(Math.abs(y10 - y00), Math.abs(y01 - y00)),
-                        Math.max(Math.abs(y11 - y10), Math.abs(y11 - y01))
-                );
-                float steepness = Math.min(1.0F, maxRise / Math.max(1.0F, spacing * 0.95F));
-
-                byte m00 = displayMaterial(job, i00, steepness);
-                byte m01 = displayMaterial(job, i01, steepness);
-                byte m11 = displayMaterial(job, i11, steepness);
-                byte m10 = displayMaterial(job, i10, steepness);
-
-                int c00 = MaterialTerrainShading.apply(
-                        shadeSample(job, i00, shade, steepness),
-                        m00, x0, y00, z0, job.sampleSpacing
-                );
-                int c01 = MaterialTerrainShading.apply(
-                        shadeSample(job, i01, shade, steepness),
-                        m01, x0, y01, z1, job.sampleSpacing
-                );
-                int c11 = MaterialTerrainShading.apply(
-                        shadeSample(job, i11, shade, steepness),
-                        m11, x1, y11, z1, job.sampleSpacing
-                );
-                int c10 = MaterialTerrainShading.apply(
-                        shadeSample(job, i10, shade, steepness),
-                        m10, x1, y10, z0, job.sampleSpacing
-                );
-
-                vertices[vertexOut++] = x0;
-                vertices[vertexOut++] = y00;
-                vertices[vertexOut++] = z0;
-                materials[colorOut] = m00;
-                colors[colorOut++] = c00;
-
-                vertices[vertexOut++] = x0;
-                vertices[vertexOut++] = y01;
-                vertices[vertexOut++] = z1;
-                materials[colorOut] = m01;
-                colors[colorOut++] = c01;
-
-                vertices[vertexOut++] = x1;
-                vertices[vertexOut++] = y11;
-                vertices[vertexOut++] = z1;
-                materials[colorOut] = m11;
-                colors[colorOut++] = c11;
-
-                vertices[vertexOut++] = x1;
-                vertices[vertexOut++] = y10;
-                vertices[vertexOut++] = z0;
-                materials[colorOut] = m10;
-                colors[colorOut++] = c10;
-            }
-        }
-
-        return new MeshData(vertices, colors, materials, job.cellCount);
-    }
-
-    /**
-     * Bootstrap/intermediate near rings retain the coarse terraced surface.
-     * Exact 1-block L1 is handled separately by buildBlockColumnMesh(), while
-     * 2/4/8-block tiles continue using representative plateaus and skirts.
-     */
-    private static MeshData buildTerracedMesh(GenerationJob job, int seaLevel) {
-        int cells = job.cellsAcross;
-        int spacing = job.sampleSpacing;
-        int[] topY = new int[job.cellCount];
-        int[] topColor = new int[job.cellCount];
-        byte[] topMaterial = new byte[job.cellCount];
-
-        for (int gz = 0; gz < cells; gz++) {
-            for (int gx = 0; gx < cells; gx++) {
-                int cell = gz * cells + gx;
-                int i00 = gz * job.samplesAcross + gx;
-                int i10 = i00 + 1;
-                int i01 = (gz + 1) * job.samplesAcross + gx;
-                int i11 = i01 + 1;
-
-                byte material = dominantMaterial(job, i00, i10, i01, i11);
-                topMaterial[cell] = material;
-
-                int y = representativeHeight(
-                        job,
-                        material,
-                        seaLevel,
-                        i00,
-                        i10,
-                        i01,
-                        i11
-                );
-                topY[cell] = y;
-
-                int baseColor = representativeColor(
-                        job,
-                        material,
-                        i00,
-                        i10,
-                        i01,
-                        i11
-                );
-
-                int y00 = job.heights[i00];
-                int y10 = job.heights[i10];
-                int y01 = job.heights[i01];
-                int y11 = job.heights[i11];
-
-                float dx = ((y10 + y11) - (y00 + y01)) * 0.5F / spacing;
-                float dz = ((y01 + y11) - (y00 + y10)) * 0.5F / spacing;
-                float invLength = 1.0F / (float) Math.sqrt(dx * dx + 1.0F + dz * dz);
-                float lightDot =
-                        (-dx * invLength) * -0.45F
-                                + invLength * 0.86F
-                                + (-dz * invLength) * -0.24F;
-                float shade = 0.76F + Math.max(0.0F, lightDot) * 0.26F;
-
-                int x = job.originX + gx * spacing + spacing / 2;
-                int z = job.originZ + gz * spacing + spacing / 2;
-                int lit = MinecraftSurfacePalette.applyLighting(baseColor, shade);
-                topColor[cell] = MaterialTerrainShading.apply(
-                        lit,
-                        material,
-                        x,
-                        y,
-                        z,
-                        job.sampleSpacing
-                );
-            }
-        }
-
-        MeshBuilder mesh = new MeshBuilder(job.cellCount * 3);
-
-        // Flat top faces.
-        for (int gz = 0; gz < cells; gz++) {
-            int z0 = job.originZ + gz * spacing;
-            int z1 = z0 + spacing;
-
-            for (int gx = 0; gx < cells; gx++) {
-                int x0 = job.originX + gx * spacing;
-                int x1 = x0 + spacing;
-                int cell = gz * cells + gx;
-                int y = topY[cell];
-
-                mesh.addQuad(
-                        x0, y, z0,
-                        x0, y, z1,
-                        x1, y, z1,
-                        x1, y, z0,
-                        topColor[cell],
-                        topMaterial[cell]
-                );
-            }
-        }
-
-        // Internal east/west boundaries. One face per shared edge.
-        for (int gz = 0; gz < cells; gz++) {
-            int z0 = job.originZ + gz * spacing;
-            int z1 = z0 + spacing;
-
-            for (int gx = 0; gx < cells - 1; gx++) {
-                int left = gz * cells + gx;
-                int right = left + 1;
-                int leftY = topY[left];
-                int rightY = topY[right];
-
-                if (leftY == rightY) {
-                    continue;
-                }
-
-                int high = leftY > rightY ? left : right;
-                int highY = Math.max(leftY, rightY);
-                int lowY = Math.min(leftY, rightY);
-                int x = job.originX + (gx + 1) * spacing;
-
-                int color = sideColor(
-                        topColor[high],
-                        topMaterial[high],
-                        highY - lowY,
-                        0.82F
-                );
-
-                mesh.addQuad(
-                        x, lowY, z0,
-                        x, lowY, z1,
-                        x, highY, z1,
-                        x, highY, z0,
-                        color,
-                        wallMaterial(topMaterial[high])
-                );
-            }
-        }
-
-        // Internal north/south boundaries.
-        for (int gz = 0; gz < cells - 1; gz++) {
-            int z = job.originZ + (gz + 1) * spacing;
-
-            for (int gx = 0; gx < cells; gx++) {
-                int north = gz * cells + gx;
-                int south = north + cells;
-                int northY = topY[north];
-                int southY = topY[south];
-
-                if (northY == southY) {
-                    continue;
-                }
-
-                int high = northY > southY ? north : south;
-                int highY = Math.max(northY, southY);
-                int lowY = Math.min(northY, southY);
-                int x0 = job.originX + gx * spacing;
-                int x1 = x0 + spacing;
-
-                int color = sideColor(
-                        topColor[high],
-                        topMaterial[high],
-                        highY - lowY,
-                        0.72F
-                );
-
-                mesh.addQuad(
-                        x0, lowY, z,
-                        x1, lowY, z,
-                        x1, highY, z,
-                        x0, highY, z,
-                        color,
-                        wallMaterial(topMaterial[high])
-                );
-            }
-        }
-
-        // Tile-edge skirts hide cracks where neighboring plateau averages differ.
-        int skirtDepth = spacing * 2;
-
-        for (int gz = 0; gz < cells; gz++) {
-            int z0 = job.originZ + gz * spacing;
-            int z1 = z0 + spacing;
-
-            int west = gz * cells;
-            addSkirt(mesh, job.originX, z0, job.originX, z1,
-                    topY[west], skirtDepth, topColor[west], topMaterial[west], true);
-
-            int east = gz * cells + cells - 1;
-            int eastX = job.originX + cells * spacing;
-            addSkirt(mesh, eastX, z1, eastX, z0,
-                    topY[east], skirtDepth, topColor[east], topMaterial[east], true);
-        }
-
-        for (int gx = 0; gx < cells; gx++) {
-            int x0 = job.originX + gx * spacing;
-            int x1 = x0 + spacing;
-
-            int north = gx;
-            addSkirt(mesh, x1, job.originZ, x0, job.originZ,
-                    topY[north], skirtDepth, topColor[north], topMaterial[north], false);
-
-            int south = (cells - 1) * cells + gx;
-            int southZ = job.originZ + cells * spacing;
-            addSkirt(mesh, x0, southZ, x1, southZ,
-                    topY[south], skirtDepth, topColor[south], topMaterial[south], false);
-        }
-
-        return mesh.finish();
-    }
-
-    private static byte dominantMaterial(
-            GenerationJob job,
-            int i00,
-            int i10,
-            int i01,
-            int i11
-    ) {
-        int[] counts = new int[MinecraftSurfacePalette.MATERIAL_COUNT];
-        int[] indices = {i00, i10, i01, i11};
-
-        for (int index : indices) {
-            int material = Byte.toUnsignedInt(job.sampleMaterials[index]);
-            if (material >= 0 && material < counts.length) {
-                counts[material]++;
-            }
-        }
-
-        // Two or more water corners make this a water cell. This keeps lakes and
-        // oceans flat instead of interpolating blue ramps up their shorelines.
-        if (counts[MinecraftSurfacePalette.MATERIAL_WATER] >= 2) {
-            return MinecraftSurfacePalette.MATERIAL_WATER;
-        }
-
-        int bestMaterial = MinecraftSurfacePalette.MATERIAL_GRASS;
-        int bestCount = -1;
-
-        for (int material = 0; material < counts.length; material++) {
-            if (material == MinecraftSurfacePalette.MATERIAL_WATER) {
-                continue;
-            }
-
-            if (counts[material] > bestCount) {
-                bestCount = counts[material];
-                bestMaterial = material;
-            }
-        }
-
-        return (byte) bestMaterial;
-    }
-
-    private static int representativeHeight(
-            GenerationJob job,
-            byte material,
-            int seaLevel,
-            int... indices
-    ) {
-        if (material == MinecraftSurfacePalette.MATERIAL_WATER) {
-            return seaLevel;
-        }
-
-        int sum = 0;
-        int count = 0;
-
-        for (int index : indices) {
-            if (job.sampleMaterials[index] == MinecraftSurfacePalette.MATERIAL_WATER) {
-                continue;
-            }
-
-            sum += job.heights[index];
-            count++;
-        }
-
-        if (count == 0) {
-            return seaLevel;
-        }
-
-        int average = Math.round(sum / (float) count);
-
-        // At near-ring sampling (8 blocks or finer), keep full one-block
-        // vertical steps. Exact 1-block L1 now preserves the horizontal surface
-        // footprint without smoothing away Minecraft's stepped silhouette.
-        return job.sampleSpacing <= 8
-                ? average
-                : Math.round(average / 2.0F) * 2;
-    }
-
-    private static int representativeColor(
-            GenerationJob job,
-            byte material,
-            int... indices
-    ) {
-        long red = 0;
-        long green = 0;
-        long blue = 0;
-        int count = 0;
-
-        for (int index : indices) {
-            if (job.sampleMaterials[index] != material) {
-                continue;
-            }
-
-            int rgb = job.sampleColors[index];
-            red += (rgb >> 16) & 0xFF;
-            green += (rgb >> 8) & 0xFF;
-            blue += rgb & 0xFF;
-            count++;
-        }
-
-        if (count == 0) {
-            for (int index : indices) {
-                int rgb = job.sampleColors[index];
-                red += (rgb >> 16) & 0xFF;
-                green += (rgb >> 8) & 0xFF;
-                blue += rgb & 0xFF;
-                count++;
-            }
-        }
-
-        return ((int) (red / count) << 16)
-                | ((int) (green / count) << 8)
-                | (int) (blue / count);
-    }
-
-    private static int sideColor(
-            int topColor,
-            byte topMaterial,
-            int heightDelta,
-            float directionalShade
-    ) {
-        int target = switch (topMaterial) {
-            case MinecraftSurfacePalette.MATERIAL_GRASS -> 0x65503A;
-            case MinecraftSurfacePalette.MATERIAL_SAND -> 0xB7A66F;
-            case MinecraftSurfacePalette.MATERIAL_TERRACOTTA -> 0x8F4F38;
-            case MinecraftSurfacePalette.MATERIAL_SNOW -> 0x83888A;
-            case MinecraftSurfacePalette.MATERIAL_GRAVEL -> 0x726F69;
-            case MinecraftSurfacePalette.MATERIAL_PODZOL -> 0x5A3E25;
-            case MinecraftSurfacePalette.MATERIAL_MUD -> 0x3E3834;
-            case MinecraftSurfacePalette.MATERIAL_ICE -> 0x8FB9D8;
-            default -> MinecraftSurfacePalette.stoneColor();
-        };
-
-        float blend = Math.min(0.72F, 0.28F + heightDelta / 48.0F);
-        int side = MinecraftSurfacePalette.blend(topColor, target, blend);
-        return MinecraftSurfacePalette.applyLighting(side, directionalShade);
-    }
-
-    private static byte wallMaterial(byte topMaterial) {
-        if (topMaterial == MinecraftSurfacePalette.MATERIAL_SAND
-                || topMaterial == MinecraftSurfacePalette.MATERIAL_TERRACOTTA) {
-            return topMaterial;
-        }
-
-        return MinecraftSurfacePalette.MATERIAL_STONE;
-    }
-
-    private static void addSkirt(
-            MeshBuilder mesh,
-            int x0,
-            int z0,
-            int x1,
-            int z1,
-            int topY,
-            int depth,
-            int topColor,
-            byte material,
-            boolean eastWest
-    ) {
-        int bottomY = topY - depth;
-        int color = sideColor(
-                topColor,
-                material,
-                depth,
-                eastWest ? 0.72F : 0.66F
-        );
-
-        mesh.addQuad(
-                x0, bottomY, z0,
-                x1, bottomY, z1,
-                x1, topY, z1,
-                x0, topY, z0,
-                color,
-                wallMaterial(material)
-        );
-    }
-
-    private static byte displayMaterial(
-            GenerationJob job,
-            int sampleIndex,
-            float steepness
-    ) {
-        byte material = job.sampleMaterials[sampleIndex];
-
-        // Once a grass slope becomes visually cliff-like, treat it as stone for
-        // the renderer's material breakup rather than keeping grass texture noise.
-        if (material == MinecraftSurfacePalette.MATERIAL_GRASS && steepness > 0.72F) {
-            return MinecraftSurfacePalette.MATERIAL_STONE;
-        }
-
-        return material;
-    }
-
-    private static int shadeSample(
-            GenerationJob job,
-            int sampleIndex,
-            float shade,
-            float steepness
-    ) {
-        int color = job.sampleColors[sampleIndex];
-        byte material = job.sampleMaterials[sampleIndex];
-
-        if (material == MinecraftSurfacePalette.MATERIAL_GRASS && steepness > 0.42F) {
-            float stoneBlend = Math.min(0.78F, (steepness - 0.42F) * 1.15F);
-            color = MinecraftSurfacePalette.blend(
-                    color,
-                    MinecraftSurfacePalette.stoneColor(),
-                    stoneBlend
-            );
-        }
-
-        if (material == MinecraftSurfacePalette.MATERIAL_WATER) {
-            shade = 0.92F + (shade - 0.72F) * 0.25F;
-        }
-
-        return MinecraftSurfacePalette.applyLighting(color, shade);
     }
 
     private static void putCacheTile(
@@ -5386,6 +4734,7 @@ public final class WorldgenSurfaceSampler {
         private final int totalSamples;
         private final int cellCount;
         private final int[] heights;
+        private final boolean[] water;
         private final int[] sampleColors;
         private final byte[] sampleMaterials;
         private final boolean refinement;
@@ -5438,6 +4787,7 @@ public final class WorldgenSurfaceSampler {
             this.totalSamples = samplesAcross * samplesAcross;
             this.cellCount = cellsAcross * cellsAcross;
             this.heights = new int[totalSamples];
+            this.water = new boolean[totalSamples];
             this.sampleColors = new int[totalSamples];
             this.sampleMaterials = new byte[totalSamples];
         }
@@ -5467,6 +4817,7 @@ public final class WorldgenSurfaceSampler {
     private static final class L1SampleGrid {
         private final int samplesAcross;
         private final int[] heights;
+        private final boolean[] water;
         private final int[] colors;
         private final byte[] materials;
         private final boolean[] heightSampled;
@@ -5483,6 +4834,7 @@ public final class WorldgenSurfaceSampler {
             this.samplesAcross = tileSize + 1;
             int total = samplesAcross * samplesAcross;
             this.heights = new int[total];
+            this.water = new boolean[total];
             this.colors = new int[total];
             this.materials = new byte[total];
             this.heightSampled = new boolean[total];

@@ -50,6 +50,9 @@ public final class EverviewGpuRegionCache {
     private static StitchBuffer stitches;
     public record StitchBuffer(GpuBuffer vertices, int originX, int originZ, int indices, long bytes) {}
     public static StitchBuffer stitches() { return stitches; }
+    public static void clearIfInactive() {
+        if (lastLevel != null || !REGIONS.isEmpty() || !PENDING.isEmpty()) clear();
+    }
     private static int regionRebuildsThisFrame, tileUploadsThisFrame, staleRegionsThisFrame;
     private static int residencySelectionRebuildsThisFrame, degradedFineTilesThisFrame, wantedTiles;
     private static long uploadNanosThisFrame, prepareNanosThisFrame;
@@ -95,7 +98,11 @@ public final class EverviewGpuRegionCache {
                 if (stitches != null) stitches.vertices().close();
                 stitches = nextStitches;
                 renderState = replacement;
-                for (GpuRegion old : RETIRED) { residentBytes -= old.bytes(); old.close(); }
+                for (GpuRegion old : RETIRED) {
+                    residentBytes -= old.bytes();
+                    EverviewTerrainBackend.active().regionRetired(old);
+                    old.close();
+                }
                 RETIRED.clear();
                 residencyRevision++;
                 nextOwnershipRetry = 0;
@@ -302,6 +309,7 @@ public final class EverviewGpuRegionCache {
                 prepared.originX(), prepared.originZ(), prepared.desired().tiles(), new ArrayList<>());
         for (PreparedTile tile : prepared.tiles()) region.tileViews().add(new GpuTile(tile.source(), region,
                 tile.first(), tile.count(), tile.batches(), tile.surfaceData(), tile.edges()));
+        EverviewTerrainBackend.active().regionUploaded(region);
         return region;
     }
 
@@ -335,8 +343,14 @@ public final class EverviewGpuRegionCache {
     public static void clear() {
         renderState = EverviewRenderState.EMPTY;
         if (stitches != null) { stitches.vertices().close(); stitches = null; }
-        for (GpuRegion region : REGIONS.values()) region.close();
-        for (GpuRegion region : RETIRED) region.close();
+        for (GpuRegion region : REGIONS.values()) {
+            EverviewTerrainBackend.active().regionRetired(region);
+            region.close();
+        }
+        for (GpuRegion region : RETIRED) {
+            EverviewTerrainBackend.active().regionRetired(region);
+            region.close();
+        }
         for (PendingRegion pending : PENDING.values()) pending.future().cancel(false);
         if (selectionFuture != null) selectionFuture.cancel(false);
         if (ownershipFuture != null) ownershipFuture.cancel(false);

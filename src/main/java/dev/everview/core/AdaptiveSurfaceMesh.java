@@ -13,19 +13,26 @@ public final class AdaptiveSurfaceMesh {
     private final int cells, stride, spacing, sea, maxSpan;
     private final int[] heights, colors;
     private final byte[] materials;
+    private final boolean[] wet;
     private final double error;
     private final Sink sink;
     private int emitted;
 
     public AdaptiveSurfaceMesh(int cells, int spacing, int sea, int[] heights, byte[] materials,
                                int[] colors, double error, Sink sink) {
+        this(cells, spacing, sea, heights, materials, colors, null, error, sink);
+    }
+
+    public AdaptiveSurfaceMesh(int cells, int spacing, int sea, int[] heights, byte[] materials,
+                               int[] colors, boolean[] wet, double error, Sink sink) {
         if (cells < 1 || Integer.bitCount(cells) != 1 || spacing < 1
                 || heights.length != (cells + 1) * (cells + 1)
-                || materials.length != heights.length || colors.length != heights.length) {
+                || materials.length != heights.length || colors.length != heights.length
+                || (wet != null && wet.length != heights.length)) {
             throw new IllegalArgumentException("power-of-two cell grid and matching samples required");
         }
         this.cells = cells; this.stride = cells + 1; this.spacing = spacing; this.sea = sea;
-        this.heights = heights; this.materials = materials; this.colors = colors;
+        this.heights = heights; this.materials = materials; this.colors = colors; this.wet = wet;
         this.error = error; this.sink = sink; this.maxSpan = Math.max(1, DrawableCoverage.CELL_SIZE / spacing);
     }
 
@@ -93,7 +100,7 @@ public final class AdaptiveSurfaceMesh {
     private int edge(int a, int b) {
         return wet(a) != wet(b) ? sea : Math.round((height(a) + height(b)) * .5f);
     }
-    private boolean wet(int i) { return heights[i] < sea; }
-    private int height(int i) { return Math.max(sea, heights[i]); }
+    private boolean wet(int i) { return wet == null ? heights[i] < sea : wet[i]; }
+    private int height(int i) { return wet(i) ? sea : heights[i]; }
     private int at(int x, int z) { return z * stride + x; }
 }

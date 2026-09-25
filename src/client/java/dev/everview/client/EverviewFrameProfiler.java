@@ -6,6 +6,7 @@ public final class EverviewFrameProfiler {
     public static long prepareTotal, drawTotal, hud;
     public static volatile long selectionWorker, ownershipWorker, packingWorker, generationIntegration;
     public static int ownershipBuilds, deferredUploads;
+    public static volatile int reusedRegions, rebuiltRegions, seamIndices;
     private static final double[] totalHistory = new double[240];
     private static int cursor, samples;
 

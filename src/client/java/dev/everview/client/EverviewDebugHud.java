@@ -414,6 +414,8 @@ public final class EverviewDebugHud {
                 gpu.uploadMs(),
                 gpu.prepareMs()
         ));
+        lines.add(String.format("Commands: reused %d regions | rebuilt %d | seam indices %d",
+                EverviewFrameProfiler.reusedRegions, EverviewFrameProfiler.rebuiltRegions, EverviewFrameProfiler.seamIndices));
         lines.add(String.format("CPU metadata %.1f MiB | seam GPU %.1f MiB | GPU includes in-flight retired buffers",
                 gpu.cpuMetadataMiB(), gpu.seamGpuMiB()));
         lines.add(String.format(

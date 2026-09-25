@@ -6,6 +6,7 @@ import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.renderpearl.api.commands.RenderPass;
 import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -102,6 +103,9 @@ public final class EverviewRenderer {
      * that receives Minecraft's already-open opaque RenderPass.
      */
     public static void register() {
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            if (client.level == null) EverviewGpuRegionCache.clearIfInactive();
+        });
         LevelRenderEvents.COLLECT_SUBMITS.register(context -> {
             Minecraft client = Minecraft.getInstance();
 
@@ -153,7 +157,8 @@ public final class EverviewRenderer {
         double x = camera.position().x(), y = camera.position().y(), z = camera.position().z();
         double vanillaRadius = client.options.getEffectiveRenderDistance() * 16.0;
         var frustum = camera.getCullFrustum();
-        renderPass.setPipeline(RenderSystem.getCompiledPipeline(EverviewGpuPipeline.TERRAIN));
+        EverviewTerrainBackend backend = EverviewTerrainBackend.active();
+        renderPass.setPipeline(RenderSystem.getCompiledPipeline(backend.pipeline()));
         RenderSystem.bindDefaultUniforms(renderPass);
         RenderSystem.AutoStorageIndexBuffer quadIndices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
 
@@ -185,6 +190,7 @@ public final class EverviewRenderer {
             renderPass.setVertexBuffer(0, region.vertexBuffer().slice());
             renderPass.setIndexBuffer(indexBuffer, quadIndices.type());
             renderPass.setUniform("DynamicTransforms", transform);
+            backend.bindRegion(renderPass, plan);
             if (commands.ranges().size() == 1) {
                 var range = commands.ranges().getFirst();
                 renderPass.drawIndexed(range.count(), 1, range.first(), 0, 0);
@@ -212,6 +218,7 @@ public final class EverviewRenderer {
             renderPass.setVertexBuffer(0, stitches.vertices().slice());
             renderPass.setIndexBuffer(indices, quadIndices.type());
             renderPass.setUniform("DynamicTransforms", RenderSystem.getDynamicUniforms().writeTransform(modelView,COLOR_MODULATOR,MODEL_OFFSET,TEXTURE_MATRIX));
+            backend.bindStitches(renderPass, stitches);
             renderPass.drawIndexed(stitches.indices(),1,0,0,0);
             EverviewMetrics.recordDrawCall(false);
             EverviewFrameProfiler.submission += System.nanoTime() - started;

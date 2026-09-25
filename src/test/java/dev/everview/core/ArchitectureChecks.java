@@ -80,6 +80,22 @@ public final class ArchitectureChecks {
         verifyClassification(quads, channel, 16, 8);
     }
 
+    public static void shallowShore() {
+        int[] equalHeight = field(2, 63);
+        boolean[] wet = new boolean[equalHeight.length];
+        wet[1 * 3 + 1] = true;
+        byte[] materials = new byte[equalHeight.length];
+        materials[1 * 3 + 1] = 1;
+        int[] colors = new int[equalHeight.length];
+        List<Quad> quads = new ArrayList<>();
+        new AdaptiveSurfaceMesh(2, 16, 63, equalHeight, materials, colors, wet, 4,
+                (x0,z0,x1,z1,a,b,c,d,m,rgb) -> quads.add(new Quad(x0,z0,x1,z1,a,b,c,d,m))).build();
+        require(quads.stream().filter(q -> q.material == 1).mapToDouble(Quad::area).sum() == 256,
+                "one-block shallow water disappeared against same-height land");
+        require(quads.stream().filter(q -> q.material == 0).mapToDouble(Quad::area).sum() == 768,
+                "same-height dry shore became water");
+    }
+
     public static void coverageTransitions() {
         DrawableCoverage parentOnly = new DrawableCoverage(); parentOnly.add(6, -2048, -2048, 2048);
         require(parentOnly.covers(-2048, -2048, 2048), "coarse floor incomplete");
@@ -142,9 +158,9 @@ public final class ArchitectureChecks {
     }
 
     public static void main(String[] args) {
-        flatTerrain(); peaksAndValleys(); saddleAndRidge(); islandAndInlet(); narrowChannel();
+        flatTerrain(); peaksAndValleys(); saddleAndRidge(); islandAndInlet(); narrowChannel(); shallowShore();
         coverageTransitions(); retirementAndBudget(); coverageDiagnostic();
-        System.out.println("8 architecture checks passed: adaptive error/extrema, sampled shoreline topology, coverage, admission.");
+        System.out.println("9 architecture checks passed: adaptive error/extrema, sampled shoreline topology, coverage, admission.");
         int[] heights = field(128, 80); byte[] materials = new byte[heights.length]; int[] colors = new int[heights.length];
         AdaptiveSurfaceMesh.Sink discard = (x0,z0,x1,z1,a,b,c,d,m,rgb) -> {};
         int emitted = 0;
