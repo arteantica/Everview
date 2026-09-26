@@ -366,7 +366,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSampler.SharedHeightCacheStatus shared =
                     WorldgenSurfaceSampler.sharedHeightCacheStatus();
             lines.add(String.format(
-                    "Shared heights: %,d entries | %,d hits / %,d misses | %.1f%% reuse",
+                    "Shared source: %,d columns generated | %,d hits / %,d misses | %.1f%% reuse",
                     shared.entries(),
                     shared.hits(),
                     shared.misses(),

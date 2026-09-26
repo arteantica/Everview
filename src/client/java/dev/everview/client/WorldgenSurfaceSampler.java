@@ -3435,8 +3435,8 @@ public final class WorldgenSurfaceSampler {
 
         // M6.4: all L2-L6 height coverage uses the dedicated worker pool, not
         // just emergency high-speed coverage. getBaseHeight was the dominant
-        // reason a settled world could take 10+ minutes. Appearance and mesh
-        // assembly stay on the server lane for now.
+        // reason a settled world could take 10+ minutes. M9.7 also assembles
+        // appearance and geometry on these workers after height completion.
         if ((job.ring.lodLevel() >= 2
                         && job.sampleGrid == null)
                 || job.asyncCoverageStarted) {
@@ -3766,9 +3766,7 @@ public final class WorldgenSurfaceSampler {
             job.generatedSamples++;
         }
 
-        // Appearance stays on the server lane. With cached biome classification
-        // this is much cheaper than height generation and keeps thread-sensitive
-        // biome color/material work out of the worker pool.
+        // Only immutable generator/biome inputs are queried here, never loaded chunks.
         for (int sampleIndex = 0;
                 sampleIndex < job.totalSamples;
                 sampleIndex++) {
@@ -4169,10 +4167,12 @@ public final class WorldgenSurfaceSampler {
         }
 
         long biomeStart=System.nanoTime();
-        var chunks=level.getChunkSource();
-        Holder<Biome> biome = chunks.getGenerator().getBiomeSource().createResolver(
-                chunks.randomState().createClimateSampler(net.minecraft.world.level.levelgen.densityfunction.SamplerContext.EMPTY_UNCACHED))
-                .getNoiseBiome(quartX,quartY,quartZ);
+        if(job.biomeResolver==null){
+            var chunks=level.getChunkSource();
+            job.biomeResolver=chunks.getGenerator().getBiomeSource().createResolver(
+                    chunks.randomState().createClimateSampler(net.minecraft.world.level.levelgen.densityfunction.SamplerContext.EMPTY_UNCACHED));
+        }
+        Holder<Biome> biome = job.biomeResolver.getNoiseBiome(quartX,quartY,quartZ);
         GenerationProfile.biomeNanos.add(System.nanoTime()-biomeStart);GenerationProfile.biomeCalls.increment();
         SHARED_BIOME_MISSES.incrementAndGet();
 
@@ -4759,6 +4759,7 @@ public final class WorldgenSurfaceSampler {
     private static final class GenerationJob {
         private final TerrainSourceStore source = terrainSource;
         private final java.util.concurrent.ConcurrentMap<Long, Holder<Biome>> biomeCache = SHARED_BIOME_CACHE;
+        private net.minecraft.world.level.biome.BiomeResolver biomeResolver;
         private volatile boolean assemblyPending;
         private final LodTileKey key;
         private final WorldgenLodRing ring;
