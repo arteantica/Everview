@@ -24,6 +24,30 @@ jobs:
       - name: Build
         run: ./gradlew build --no-daemon
 
+      - name: Benchmark actual Minecraft terrain sampling
+        run: ./gradlew terrainBenchmark --no-daemon > build/terrain-benchmark.txt
+
+      - name: Benchmark persistent command scaling
+        run: ./gradlew rendererScalingBenchmark --no-daemon > build/renderer-scaling-benchmark.txt
+
+      - name: Check production ownership shader
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libegl1 libgl1-mesa-dri
+          curl -fsSL https://piston-data.mojang.com/v1/objects/e877b6a07acd633fb3bb475002175cec036e7b87/client.jar -o build/shader-validation-client.jar
+          python3 tools/check_ownership_shader.py build/shader-validation-client.jar > build/ownership-shader-check.txt
+
+      - name: Upload test reports and benchmark
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: everview-validation
+          path: |
+            build/terrain-benchmark.txt
+            build/renderer-scaling-benchmark.txt
+            build/ownership-shader-check.txt
+            build/reports/tests/test
+
       - name: Upload mod jar
         uses: actions/upload-artifact@v4
         with:

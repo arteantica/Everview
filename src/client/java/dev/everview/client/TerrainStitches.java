@@ -28,9 +28,11 @@ public final class TerrainStitches {
                 if (otherLevel == 0) continue; // A missing neighbor is a coverage gap, never filled by a fake surface.
                 int size = otherLevel <= 2 ? 128 : 128 << (otherLevel - 2);
                 var other = tiles.get(new LodTileKey(otherLevel,Math.floorDiv(otherEdge.cellX()*128,size),Math.floorDiv(otherEdge.cellZ()*128,size)));
-                if (other == null || other == tile) continue;
+                if (other == null) continue;
                 // Equal lattices share their sampled boundaries; exact columns already have real side faces.
-                if (level == otherLevel && tile.source().sampleSpacing() == other.source().sampleSpacing()) continue;
+                if (level == otherLevel && tile.source().sampleSpacing() == other.source().sampleSpacing()
+                        && tile.source().stage() == WorldgenTileStage.COVERAGE
+                        && other.source().stage() == WorldgenTileStage.COVERAGE) continue;
                 List<TerrainEdges.Segment> opposite = other.edges().profiles().get(otherEdge);
                 if (opposite == null) continue;
                 join(edge, entry.getValue(), opposite, quads);

@@ -25,8 +25,10 @@ public final class EverviewGpuPipeline {
                     EverviewClient.MOD_ID,
                     "pipeline/persistent_lod_terrain"
             ))
-            .withVertexShader("core/position_color")
-            .withFragmentShader("core/position_color")
+            .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
+                    .withUniform("EverviewOwnership", com.mojang.renderpearl.api.pipeline.UniformType.UNIFORM_BUFFER).build())
+            .withVertexShader("everview:core/terrain")
+            .withFragmentShader("everview:core/terrain")
             .withColorTargetState(ColorTargetState.DEFAULT)
             .withVertexBinding(0, DefaultVertexFormat.POSITION_COLOR)
             .withPrimitiveTopology(PrimitiveTopology.QUADS)

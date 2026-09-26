@@ -8,6 +8,22 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 final class TerrainSeamTest {
+    @Test void adaptivePatchesWithinOneTileHaveExactlyOneSeam() {
+        var source=new WorldgenSurfaceTile(3,0,0,256,1,WorldgenTileStage.ADAPTIVE_DETAIL,
+                new int[12],new int[4],new byte[4],1,60,80,63,1);
+        var region=new EverviewGpuRegionCache.GpuRegion(new EverviewGpuRegionCache.RegionKey(3,0,0),
+                null,6,64,0,0,List.of(source),new ArrayList<>());
+        var edge=new TerrainEdges.Edge(0,0,1);
+        var profiles=java.util.Map.of(edge,List.of(new TerrainEdges.Segment(0,128,64,64,0x00ff00,(byte)0)),
+                edge.opposite(),List.of(new TerrainEdges.Segment(0,128,70,70,0x00aa00,(byte)0)));
+        region.tileViews().add(new EverviewGpuRegionCache.GpuTile(source,region,0,6,List.of(),
+                new TerrainSurfaceData(new byte[0],new int[0]),new TerrainEdges(profiles,0)));
+        var coverage=new dev.everview.core.DrawableCoverage();coverage.add(3,0,0,256);
+        var seam=TerrainStitches.build(List.of(region),coverage,0,0);
+        assertEquals(6,seam.indexCount());assertEquals(64,seam.vertices().remaining());
+        for(int vertex=0;vertex<4;vertex++)assertEquals(128f,seam.vertices().getFloat(vertex*16));
+    }
+
     @Test void profilesUseTheActualGeneratedSurfaceHeights() {
         int[] v = {0, 72, 0, 0, 80, 128, 128, 64, 128, 128, 60, 0};
         int[] c = {0x008800, 0x008800, 0x008800, 0x008800};

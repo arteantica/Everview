@@ -11,3 +11,6 @@ run/
 .settings/
 .DS_Store
 Thumbs.db
+
+# Headless Minecraft benchmark logs
+logs/

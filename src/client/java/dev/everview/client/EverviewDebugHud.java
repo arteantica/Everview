@@ -28,6 +28,8 @@ public final class EverviewDebugHud {
             KeyMapping.Category.MISC
     );
 
+    private static final KeyMapping GENERATION_TOGGLE=new KeyMapping("key.everview.generation_hud",InputConstants.Type.KEYBOARD,InputConstants.KEY_F7,KeyMapping.Category.MISC);
+    private static boolean generationView;
     private static boolean expanded;
     private static long refreshedAt;
     private static List<String> cachedLines = List.of();
@@ -40,9 +42,12 @@ public final class EverviewDebugHud {
 
     public static void register() {
         KeyMappingHelper.registerKeyMapping(TOGGLE_KEY);
+        KeyMappingHelper.registerKeyMapping(GENERATION_TOGGLE);
         KeyMappingHelper.registerKeyMapping(RENDER_TOGGLE);
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            while(GENERATION_TOGGLE.consumeClick()){generationView=!generationView;refreshedAt=0;}
             while (TOGGLE_KEY.consumeClick()) {
+                generationView=false;
                 expanded = !expanded; refreshedAt = 0;
             }
             while (RENDER_TOGGLE.consumeClick()) {
@@ -68,7 +73,7 @@ public final class EverviewDebugHud {
         if (started - refreshedAt >= 250_000_000L) {
             EverviewMetrics.Snapshot metrics = EverviewMetrics.snapshot();
             WorldgenSurfaceSnapshot far = WorldgenSurfaceSampler.snapshot();
-            cachedLines = expanded ? expandedLines(metrics, far) : compactLines(metrics, far);
+            cachedLines = generationView ? GenerationDiagnostics.lines(far) : expanded ? expandedLines(metrics, far) : compactLines(metrics, far);
             cachedWidth = 0;
             for (String line : cachedLines) cachedWidth = Math.max(cachedWidth, client.font.width(line));
             refreshedAt = started;
@@ -82,7 +87,7 @@ public final class EverviewDebugHud {
             WorldgenSurfaceSnapshot far
     ) {
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M9.6 | F8 details | F9 LOD " + (EverviewRenderer.renderEnabled ? "ON" : "OFF (A/B)"));
+        lines.add("Everview M9.7 | F8 details | F9 LOD " + (EverviewRenderer.renderEnabled ? "ON" : "OFF (A/B)"));
 
         if (!far.available()) {
             lines.add("LOD worldgen unavailable");
@@ -127,12 +132,12 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M9.6 DEV | PERSISTENT COVERAGE + ADAPTIVE TERRAIN");
+        lines.add("Everview M9.7 DEV | SHARED SOURCE + ADAPTIVE BLOCK DETAIL");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Renderer: persistent region commands | transactional ownership | 360 spatial residency");
-        lines.add("Handoff: 64b overlap | 350ms visible-stability gate | chunk fade forced OFF");
-        lines.add("LOD targets: L1 1b | L2 2b | L3 2b | L4 4b | L5 8b | L6 16b");
+        lines.add("Handoff: final vanilla mask for all terrain/water/seams | resident fallback retained");
+        lines.add("F7 generation metrics | adaptive 1b/2b feature detail beyond L1");
         lines.add("First-visible: L1 4b -> 1b | L2 4b | L3 4b | L4 8b | L5 8b | L6 16b");
         lines.add("Adaptive error: L3 0.5b | L4 1b | L5 2b | L6 4b | GPU target/hard 1024/1152 MiB");
         lines.add(String.format(

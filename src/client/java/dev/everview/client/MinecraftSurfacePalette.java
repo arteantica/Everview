@@ -58,11 +58,27 @@ public final class MinecraftSurfacePalette {
             int worldZ,
             int seaLevel
     ) {
+        long start=System.nanoTime();
+        try { return sampleInternal(biomeHolder,worldX,worldY,worldZ,seaLevel,true); }
+        finally {dev.everview.terrain.GenerationProfile.materialNanos.add(System.nanoTime()-start);}
+    }
+    /** Approximate solid substrate, kept separate from the fluid surface class.
+     * Actual surface-rule block IDs can replace this producer without losing seabed heights. */
+    public static SampleAppearance sampleSolid(Holder<Biome> biome,int x,int y,int z,int sea) {
+        long start=System.nanoTime();
+        try{return sampleInternal(biome,x,y,z,sea,false);}
+        finally{dev.everview.terrain.GenerationProfile.materialNanos.add(System.nanoTime()-start);}
+    }
+    private static SampleAppearance sampleInternal(Holder<Biome> biomeHolder,int worldX,int worldY,int worldZ,int seaLevel,boolean fluid) {
         BiomeProfile profile = BIOME_PROFILES.computeIfAbsent(
                 biomeHolder,
                 MinecraftSurfacePalette::classifyBiome
         );
 
+        if (worldY < seaLevel && !fluid) {
+            return profile.sandy() ? new SampleAppearance(SAND,MATERIAL_SAND)
+                    : new SampleAppearance(GRAVEL,MATERIAL_GRAVEL);
+        }
         if (worldY < seaLevel) {
             if (profile.frozen() && profile.waterBiome()) {
                 return new SampleAppearance(ICE, MATERIAL_ICE);

@@ -30,6 +30,10 @@ dependencies {
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
     testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    def nativeOs = System.getProperty('os.name').toLowerCase().contains('win') ? 'windows' :
+            (System.getProperty('os.name').toLowerCase().contains('mac') ? 'macos' : 'linux')
+    def nativeArch = System.getProperty('os.arch') in ['aarch64', 'arm64'] ? '-arm64' : ''
+    testRuntimeOnly "org.lwjgl:lwjgl:3.4.3:natives-${nativeOs}${nativeArch}"
 }
 
 tasks.named('test', Test) {
@@ -61,4 +65,18 @@ publishing {
             from components.java
         }
     }
+}
+
+tasks.register('terrainBenchmark', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.everview.terrain.NoiseBatchBenchmark'
+    maxHeapSize = '2G'
+}
+
+tasks.register('rendererScalingBenchmark', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.everview.client.RendererScalingBenchmark'
+    maxHeapSize = '2G'
 }

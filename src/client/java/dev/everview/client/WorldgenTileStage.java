@@ -13,7 +13,8 @@ package dev.everview.client;
 public enum WorldgenTileStage {
     COVERAGE,
     EXACT_GEOMETRY,
-    EXACT_APPEARANCE;
+    EXACT_APPEARANCE,
+    ADAPTIVE_DETAIL;
 
     public boolean exactGeometry() {
         return this == EXACT_GEOMETRY || this == EXACT_APPEARANCE;

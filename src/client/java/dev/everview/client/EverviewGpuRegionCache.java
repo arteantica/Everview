@@ -686,7 +686,7 @@ public final class EverviewGpuRegionCache {
         private final List<WorldgenSurfaceTile> sources;
         private final List<GpuTile> tileViews;
 
-        private GpuRegion(
+        GpuRegion(
                 RegionKey key,
                 GpuBuffer vertexBuffer,
                 int indexCount,

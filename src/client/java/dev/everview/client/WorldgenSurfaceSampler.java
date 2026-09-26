@@ -1,5 +1,7 @@
 package dev.everview.client;
 
+import dev.everview.terrain.*;
+
 import dev.everview.core.LodTileKey;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -159,7 +161,7 @@ public final class WorldgenSurfaceSampler {
             SHARED_HEIGHT_CACHE = new ConcurrentHashMap<>(262_144);
     private static final AtomicLong SHARED_HEIGHT_HITS = new AtomicLong();
     private static final AtomicLong SHARED_HEIGHT_MISSES = new AtomicLong();
-    private static final ConcurrentHashMap<Long, Holder<Biome>>
+    private static volatile ConcurrentHashMap<Long, Holder<Biome>>
             SHARED_BIOME_CACHE = new ConcurrentHashMap<>(65_536);
     private static final AtomicLong SHARED_BIOME_HITS = new AtomicLong();
     private static final AtomicLong SHARED_BIOME_MISSES = new AtomicLong();
@@ -183,6 +185,7 @@ public final class WorldgenSurfaceSampler {
                                 "Everview-ExactHeight"
                         );
                         thread.setDaemon(true);
+                        thread.setPriority(Thread.MIN_PRIORITY);
                         return thread;
                     }
             );
@@ -195,6 +198,7 @@ public final class WorldgenSurfaceSampler {
                                 "Everview-CoverageHeight"
                         );
                         thread.setDaemon(true);
+                        thread.setPriority(Thread.MIN_PRIORITY);
                         return thread;
                     }
             );
@@ -207,6 +211,7 @@ public final class WorldgenSurfaceSampler {
                                 "Everview-Appearance"
                         );
                         thread.setDaemon(true);
+                        thread.setPriority(Thread.MIN_PRIORITY);
                         return thread;
                     }
             );
@@ -223,6 +228,7 @@ public final class WorldgenSurfaceSampler {
     private static CompletableFuture<WorldgenDiskCache.LoadResult> diskLoadFuture;
     private static CompletableFuture<WorldgenDiskCache.SaveResult> diskSaveFuture;
     private static Path diskCachePath;
+    private static volatile TerrainSourceStore terrainSource;
     private static long diskCacheSeed;
     private static String diskCacheDimension = "";
     private static boolean diskLoadReady;
@@ -380,16 +386,25 @@ public final class WorldgenSurfaceSampler {
         return MAX_DETACHED_APPEARANCE_JOBS;
     }
 
+    public static String generationQueues() {
+        var a=(java.util.concurrent.ThreadPoolExecutor)EXACT_HEIGHT_EXECUTOR;
+        var b=(java.util.concurrent.ThreadPoolExecutor)COVERAGE_HEIGHT_EXECUTOR;
+        return "Workers active " + (a.getActiveCount()+b.getActiveCount()) + "/" + (EXACT_HEIGHT_WORKERS+COVERAGE_HEIGHT_WORKERS)
+                + " | queued " + (a.getQueue().size()+b.getQueue().size()) + " | complete " + COMPLETED.size();
+    }
+    public static TerrainSourceStore terrainSource() { return terrainSource; }
+
     public static SharedHeightCacheStatus sharedHeightCacheStatus() {
-        long hits = SHARED_HEIGHT_HITS.get();
-        long misses = SHARED_HEIGHT_MISSES.get();
+        TerrainSourceStore source=terrainSource;
+        long hits = source==null?0:source.hits.sum();
+        long misses = source==null?0:source.misses.sum();
         long total = hits + misses;
         double hitPercent = total == 0L
                 ? 0.0
                 : hits * 100.0 / total;
 
         return new SharedHeightCacheStatus(
-                SHARED_HEIGHT_CACHE.size(),
+                terrainSource==null?0:(int)terrainSource.batchColumns.sum(),
                 hits,
                 misses,
                 hitPercent
@@ -811,8 +826,137 @@ public final class WorldgenSurfaceSampler {
         }
 
         rebuildSnapshot();
+        scheduleDetail(server, clientLevel.dimension());
         maybeScheduleDiskSave();
     }
+
+    private static final ExecutorService DETAIL_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
+        Thread t=new Thread(r,"Everview-AdaptiveDetail");t.setDaemon(true);t.setPriority(Thread.MIN_PRIORITY);return t;
+    });
+    private static CompletableFuture<Void> detailFuture;
+    private static LodTileKey detailKey;
+    private static long nextDetailPoll;
+    private static volatile long detailCompleted, detailRejected;
+    private static final Map<LodTileKey,Long> DETAIL_RETRY = new HashMap<>();
+    private static volatile ConcurrentHashMap<LodTileKey,Integer> DETAIL_TARGET = new ConcurrentHashMap<>();
+    public static String detailStatus() {return "detail " + detailCompleted + " ready / " + detailRejected + " budget-limited patches | " + (detailFuture==null?"idle":"working");}
+
+    private static void scheduleDetail(MinecraftServer server,ResourceKey<Level> dimension) {
+        long now=System.nanoTime();
+        if(now<nextDetailPoll)return;nextDetailPoll=now+250_000_000L;
+        if(detailFuture!=null){
+            if(!detailFuture.isDone())return;
+            try{detailFuture.join();}catch(RuntimeException ex){if(!(ex.getCause() instanceof java.util.concurrent.CancellationException))EverviewClient.LOGGER.warn("Everview detail task failed",ex);}
+            detailFuture=null;detailKey=null;
+        }
+        if(highSpeedCoverageMode || terrainSource==null || !diskLoadReady)return;
+        // First establish the far floor. Fine jobs share its source pages once it exists.
+        if(snapshot.completionPercent()<65)return;
+        Minecraft client=Minecraft.getInstance();if(client.player==null)return;
+        double cx=client.player.getX(),cz=client.player.getZ();
+        double focal=client.getWindow().getHeight()/(2.0*Math.tan(Math.toRadians(client.options.fov().get())*.5));
+        WantedTile chosen=null;WorldgenSurfaceTile base=null;
+        for(WantedTile wanted:wantedTiles){
+            if(wanted.ring().lodLevel()<2||wanted.prefetch()||DETACHED_COVERAGE_JOBS.containsKey(wanted.key())
+                    ||(currentJob!=null&&currentJob.key.equals(wanted.key()))||DETAIL_RETRY.getOrDefault(wanted.key(),0L)>now)continue;
+            var tile=CACHE.get(wanted.key());if(tile==null||tile.sampleSpacing()>wanted.targetSpacing())continue;
+            int target=DetailPolicy.spacing(wanted.frontierDistanceBlocks(),focal,false,0);
+            if(tile.stage()==WorldgenTileStage.ADAPTIVE_DETAIL
+                    && (tile.sampleSpacing()<=target || DETAIL_TARGET.getOrDefault(wanted.key(),Integer.MAX_VALUE)<=target))continue;
+            // Don't refine a completely hidden fallback. Revisit it if it becomes exposed.
+            var coverage=EverviewGpuRegionCache.renderState().coverage();boolean exposed=false;
+            for(int z=tile.minZ();z<tile.maxZ()&&!exposed;z+=128)for(int x=tile.minX();x<tile.maxX();x+=128)
+                if(!coverage.finerOwns(tile.lodLevel(),Math.floorDiv(x,128),Math.floorDiv(z,128))){exposed=true;break;}
+            if(!exposed)continue;
+            chosen=wanted;base=tile;break;
+        }
+        if(chosen==null)return;
+        WantedTile wanted=chosen;WorldgenSurfaceTile previous=base;TerrainSourceStore source=terrainSource;long taskEpoch=epoch;
+        detailKey=wanted.key();DETAIL_RETRY.put(detailKey,now+30_000_000_000L);
+        var targets=DETAIL_TARGET;int requestedTarget=DetailPolicy.spacing(wanted.frontierDistanceBlocks(),focal,false,0);
+        var launch=new CompletableFuture<Void>();detailFuture=launch;
+        server.execute(()->{
+            ServerLevel level=server.getLevel(dimension);
+            if(level==null||taskEpoch!=epoch){launch.complete(null);return;}
+            var generator=level.getChunkSource().getGenerator();var random=level.getChunkSource().randomState();
+            var loader=heightLoader(level,generator,random);
+            DETAIL_EXECUTOR.execute(()->{
+                long start=System.nanoTime();
+                try{
+                    var resolver=generator.getBiomeSource().createResolver(random.createClimateSampler(
+                            net.minecraft.world.level.levelgen.densityfunction.SamplerContext.EMPTY_UNCACHED));
+                    MeshBuilder mesh=new MeshBuilder(4096);int min=Integer.MAX_VALUE,max=Integer.MIN_VALUE,worst=1;
+                    int patchBudget=260_000/((previous.tileSize()/128)*(previous.tileSize()/128));
+                    for(int pz=previous.minZ();pz<previous.maxZ();pz+=128)for(int px=previous.minX();px<previous.maxX();px+=128){
+                        if(taskEpoch!=epoch)throw new java.util.concurrent.CancellationException();
+                        int lo=Integer.MAX_VALUE,hi=Integer.MIN_VALUE;boolean anyWet=false,anyDry=false;
+                        // Coarse probes choose a refinement target; they are not called an error certificate.
+                        for(int z=0;z<=128;z+=32)for(int x=0;x<=128;x+=32){int p=source.sample(px+x,pz+z,false,loader);int h=TerrainNoiseBatch.floor(p);lo=Math.min(lo,h);hi=Math.max(hi,h);anyWet|=TerrainNoiseBatch.wet(p);anyDry|=!TerrainNoiseBatch.wet(p);}
+                        double distance=Math.hypot(px+64-cx,pz+64-cz);boolean shore=anyWet&&anyDry;
+                        int spacing=DetailPolicy.spacing(distance,focal,shore,hi-lo);
+                        int cells=128/spacing,stride=cells+1,total=stride*stride;
+                        int[] h=new int[total],colors=new int[total];byte[] materials=new byte[total];boolean[] wet=new boolean[total];
+                        for(int z=0;z<=cells;z++)for(int x=0;x<=cells;x++){
+                            int wx=px+x*spacing,wz=pz+z*spacing,i=z*stride+x;
+                            int packed=source.sample(wx,wz,true,loader);h[i]=TerrainNoiseBatch.surface(packed);wet[i]=TerrainNoiseBatch.wet(packed);
+                            min=Math.min(min,h[i]);max=Math.max(max,h[i]);
+                            int floor=TerrainNoiseBatch.floor(packed);
+                            var appearance=source.appearance(wx,wz,()->{
+                                long begin=System.nanoTime();var biome=resolver.getNoiseBiome(wx>>2,floor>>2,wz>>2);GenerationProfile.biomeNanos.add(System.nanoTime()-begin);GenerationProfile.biomeCalls.increment();
+                                var value=MinecraftSurfacePalette.sampleSolid(biome,wx,floor,wz,level.getSeaLevel());
+                                return new TerrainSourceStore.Appearance(value.rgb(),value.material());
+                            });
+                            colors[i]=appearance.color();materials[i]=appearance.material();
+                            if(wet[i]&&materials[i]!=MinecraftSurfacePalette.MATERIAL_ICE){materials[i]=MinecraftSurfacePalette.MATERIAL_WATER;colors[i]=0x3B6E98;}
+                            else if(!wet[i]&&(materials[i]==MinecraftSurfacePalette.MATERIAL_WATER||materials[i]==MinecraftSurfacePalette.MATERIAL_ICE)){materials[i]=MinecraftSurfacePalette.MATERIAL_GRASS;colors[i]=0x6F9D50;}
+                        }
+                        int ox=px,oz=pz;int quantum=DetailPolicy.quantum(distance,focal,shore);
+                        long meshStart=System.nanoTime();
+                        int actual=emitBudgetedDetailPatch(mesh,ox,oz,spacing,h,colors,materials,wet,quantum,patchBudget);
+                        GenerationProfile.meshNanos.add(System.nanoTime()-meshStart);
+                        worst=Math.max(worst,actual);if(actual>spacing)detailRejected++;
+                        (actual==1?GenerationProfile.detailCells1:actual==2?GenerationProfile.detailCells2:
+                                actual==4?GenerationProfile.detailCells4:GenerationProfile.detailCellsCoarse).increment();
+                    }
+                    MeshData result=mesh.finish();long elapsed=System.nanoTime()-start;
+                    GenerationProfile.meshQuads.add(result.quadCount());GenerationProfile.meshes.increment();
+                    var tile=new WorldgenSurfaceTile(previous.lodLevel(),previous.tileX(),previous.tileZ(),previous.tileSize(),worst,
+                            WorldgenTileStage.ADAPTIVE_DETAIL,result.vertices(),result.colors(),result.materials(),result.quadCount(),min-1,max+1,level.getSeaLevel(),elapsed);
+                    if(taskEpoch!=epoch)throw new java.util.concurrent.CancellationException();
+                    COMPLETED.add(new CompletedTile(taskEpoch,wanted.key(),tile,0,0,0,0));targets.put(wanted.key(),requestedTarget);detailCompleted++;
+                    launch.complete(null);
+                }catch(Throwable ex){launch.completeExceptionally(ex);}
+                finally{GenerationProfile.workerNanos.add(System.nanoTime()-start);GenerationProfile.workerTasks.increment();}
+            });
+        });
+    }
+    private static int emitBudgetedDetailPatch(MeshBuilder mesh,int ox,int oz,int sourceSpacing,
+            int[] heights,int[] colors,byte[] materials,boolean[] wet,int quantum,int budget) {
+        int savedQuads=mesh.quadCount,savedInts=mesh.vertexInts,savedVertices=mesh.vertexCount;
+        int sourceStride=128/sourceSpacing+1;
+        for(int spacing=sourceSpacing;spacing<=16;spacing*=2){
+            int cells=128/spacing,stride=cells+1,factor=spacing/sourceSpacing;
+            int[] h=heights,c=colors;byte[] m=materials;boolean[] w=wet;
+            if(factor>1){
+                int count=stride*stride;h=new int[count];c=new int[count];m=new byte[count];w=new boolean[count];
+                for(int z=0;z<=cells;z++)for(int x=0;x<=cells;x++){
+                    int from=z*factor*sourceStride+x*factor,to=z*stride+x;
+                    h[to]=heights[from];c[to]=colors[from];m[to]=materials[from];w[to]=wet[from];
+                }
+            }
+            try {
+                new BlockSurfaceMesh(cells,spacing,h,c,m,w,quantum,(x0,y0,z0,x1,y1,z1,x2,y2,z2,x3,y3,z3,color,material)->{
+                    if(mesh.quadCount-savedQuads>=budget)throw new DetailBudgetException();
+                    mesh.addQuad(ox+x0,y0,oz+z0,ox+x1,y1,oz+z1,ox+x2,y2,oz+z2,ox+x3,y3,oz+z3,color,material);
+                }).boundaryWalls(false).build();
+                return spacing;
+            } catch(DetailBudgetException limited){
+                mesh.quadCount=savedQuads;mesh.vertexInts=savedInts;mesh.vertexCount=savedVertices;
+            }
+        }
+        throw new IllegalStateException("16b patch exceeded reserved geometry budget");
+    }
+    private static final class DetailBudgetException extends RuntimeException {}
 
     private static MotionPrediction updateMotionPrediction(
             Minecraft client,
@@ -908,6 +1052,8 @@ public final class WorldgenSurfaceSampler {
         diskCachePath = WorldgenDiskCache.pathFor(server, dimension);
         diskCacheSeed = WorldgenDiskCache.seedFor(server, dimension);
         diskCacheDimension = WorldgenDiskCache.dimensionId(dimension);
+        terrainSource = new TerrainSourceStore(diskCachePath.resolve("source-v1-" + diskCacheSeed), 32_768);
+        GenerationProfile.reset();
         diskCacheStatus = "LOADING";
         diskLoadReady = false;
 
@@ -1192,6 +1338,8 @@ public final class WorldgenSurfaceSampler {
     private static void reset() {
         scheduleDetachedSaveIfDirty();
         epoch++;
+        detailFuture = null; detailKey = null; DETAIL_RETRY.clear(); DETAIL_TARGET=new ConcurrentHashMap<>(); detailCompleted=detailRejected=0;
+        if (terrainSource != null) { terrainSource.close(); terrainSource = null; }
         meshContentRevision++;
         CACHE.clear();
         ACCOUNTED_MESH_BYTES.clear();
@@ -1200,7 +1348,7 @@ public final class WorldgenSurfaceSampler {
         SHARED_HEIGHT_CACHE.clear();
         SHARED_HEIGHT_HITS.set(0L);
         SHARED_HEIGHT_MISSES.set(0L);
-        SHARED_BIOME_CACHE.clear();
+        SHARED_BIOME_CACHE = new ConcurrentHashMap<>(65_536);
         SHARED_BIOME_HITS.set(0L);
         SHARED_BIOME_MISSES.set(0L);
         COMPLETED.clear();
@@ -1277,7 +1425,14 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
+            var existing=CACHE.get(completed.key());
+            if(existing!=null && existing.stage()==WorldgenTileStage.ADAPTIVE_DETAIL
+                    && completed.tile().stage()!=WorldgenTileStage.ADAPTIVE_DETAIL){
+                if(currentJob!=null&&currentJob.key.equals(completed.key()))currentJob=null;
+                continue;
+            }
             putCacheTile(completed.key(), completed.tile());
+            GenerationProfile.integrated.increment();
             lastGenerationMs = completed.tile().generationMs();
             generatedTileCount++;
             if (completed.tile().stage().diskSafe()) {
@@ -2802,14 +2957,16 @@ public final class WorldgenSurfaceSampler {
                     int y = grid.heights[fineIndex];
                     job.heights[sampleIndex] = y;
                     job.water[sampleIndex] = job.sampleGrid.water[fineIndex];
+                    job.fluidHeights[sampleIndex] = job.sampleGrid.fluidHeights[fineIndex];
                     job.minY = Math.min(job.minY, y);
-                    job.maxY = Math.max(job.maxY, y);
+                    job.maxY = Math.max(job.maxY, Math.max(y,job.fluidHeights[sampleIndex]));
                     job.reusedSamples++;
 
                     if (!grid.appearanceSampled[fineIndex]) {
                         int worldX = job.originX + gx;
                         int worldZ = job.originZ + gz;
                         biomes[sampleIndex] = sampleBiomeCached(
+                                job,
                                 level,
                                 worldX,
                                 y,
@@ -2881,7 +3038,7 @@ public final class WorldgenSurfaceSampler {
                 );
             }
 
-            var appearance = MinecraftSurfacePalette.sample(
+            var appearance = sampleSourceAppearance(job,
                     biome,
                     worldX,
                     y,
@@ -3075,8 +3232,9 @@ public final class WorldgenSurfaceSampler {
                 int y = job.sampleGrid.heights[fineIndex];
                 job.heights[sampleIndex] = y;
                 job.water[sampleIndex] = job.sampleGrid.water[fineIndex];
+                    job.fluidHeights[sampleIndex] = job.sampleGrid.fluidHeights[fineIndex];
                 job.minY = Math.min(job.minY, y);
-                job.maxY = Math.max(job.maxY, y);
+                job.maxY = Math.max(job.maxY, Math.max(y,job.fluidHeights[sampleIndex]));
                 job.reusedSamples++;
             } else {
                 missingScratch[missingCount++] = sampleIndex;
@@ -3134,8 +3292,9 @@ public final class WorldgenSurfaceSampler {
         for (int i = 0; i < result.sampleIndices().length; i++) {
             int sampleIndex = result.sampleIndices()[i];
             int packed = result.heights()[i];
-            int y = packed >> 1;
-            job.water[sampleIndex] = (packed & 1) != 0;
+            int y = TerrainNoiseBatch.floor(packed);
+            job.water[sampleIndex] = TerrainNoiseBatch.wet(packed);
+            job.fluidHeights[sampleIndex] = TerrainNoiseBatch.surface(packed);
             int gx = sampleIndex % job.samplesAcross;
             int gz = sampleIndex / job.samplesAcross;
             int fineIndex = job.fineGridIndex(gx, gz);
@@ -3144,10 +3303,11 @@ public final class WorldgenSurfaceSampler {
             if (fineIndex >= 0) {
                 job.sampleGrid.heights[fineIndex] = y;
                 job.sampleGrid.water[fineIndex] = job.water[sampleIndex];
+                job.sampleGrid.fluidHeights[fineIndex] = job.fluidHeights[sampleIndex];
                 job.sampleGrid.heightSampled[fineIndex] = true;
             }
             job.minY = Math.min(job.minY, y);
-            job.maxY = Math.max(job.maxY, y);
+            job.maxY = Math.max(job.maxY, Math.max(y,job.fluidHeights[sampleIndex]));
             job.generatedSamples++;
         }
 
@@ -3267,6 +3427,7 @@ public final class WorldgenSurfaceSampler {
             long taskEpoch
     ) {
         long sliceStart = System.nanoTime();
+        if(job.assemblyPending)return;
 
         ServerChunkCache chunks = level.getChunkSource();
         var generator = chunks.getGenerator();
@@ -3324,18 +3485,20 @@ public final class WorldgenSurfaceSampler {
                         randomState,
                         worldX,
                         worldZ,
-                        job.sampleSpacing
+                        job.sampleSpacing, job
                 );
 
-                int y = packed >> 1;
-                job.water[sampleIndex] = (packed & 1) != 0;
+                int y = TerrainNoiseBatch.floor(packed);
+                job.water[sampleIndex] = TerrainNoiseBatch.wet(packed);
+            job.fluidHeights[sampleIndex] = TerrainNoiseBatch.surface(packed);
                 var biome = sampleBiomeCached(
+                                job,
                                 level,
                                 worldX,
                                 y,
                                 worldZ
                         );
-                var appearance = MinecraftSurfacePalette.sample(
+                var appearance = sampleSourceAppearance(job,
                         biome,
                         worldX,
                         y,
@@ -3358,6 +3521,7 @@ public final class WorldgenSurfaceSampler {
                 if (grid.heightSampled[fineIndex]) {
                     y = grid.heights[fineIndex];
                     job.water[sampleIndex] = grid.water[fineIndex];
+                    job.fluidHeights[sampleIndex] = grid.fluidHeights[fineIndex];
                     job.reusedSamples++;
                 } else {
                     int packed = sampleHeightCached(
@@ -3366,12 +3530,14 @@ public final class WorldgenSurfaceSampler {
                         randomState,
                         worldX,
                         worldZ,
-                        job.sampleSpacing
+                        job.sampleSpacing, job
                 );
-                    y = packed >> 1;
-                    job.water[sampleIndex] = (packed & 1) != 0;
+                    y = TerrainNoiseBatch.floor(packed);
+                    job.water[sampleIndex] = TerrainNoiseBatch.wet(packed);
+            job.fluidHeights[sampleIndex] = TerrainNoiseBatch.surface(packed);
                     grid.heights[fineIndex] = y;
                     grid.water[fineIndex] = job.water[sampleIndex];
+                    grid.fluidHeights[fineIndex] = job.fluidHeights[sampleIndex];
                     grid.heightSampled[fineIndex] = true;
                     job.generatedSamples++;
                     processed++;
@@ -3390,12 +3556,13 @@ public final class WorldgenSurfaceSampler {
                         job.provisionalAppearanceSamples++;
                     } else {
                         var biome = sampleBiomeCached(
+                                job,
                                 level,
                                 worldX,
                                 y,
                                 worldZ
                         );
-                        var appearance = MinecraftSurfacePalette.sample(
+                        var appearance = sampleSourceAppearance(job,
                                 biome,
                                 worldX,
                                 y,
@@ -3412,12 +3579,13 @@ public final class WorldgenSurfaceSampler {
                     }
                 } else {
                     var biome = sampleBiomeCached(
+                                job,
                                 level,
                                 worldX,
                                 y,
                                 worldZ
                         );
-                    var appearance = MinecraftSurfacePalette.sample(
+                    var appearance = sampleSourceAppearance(job,
                             biome,
                             worldX,
                             y,
@@ -3436,7 +3604,7 @@ public final class WorldgenSurfaceSampler {
 
             int y = job.heights[sampleIndex];
             job.minY = Math.min(job.minY, y);
-            job.maxY = Math.max(job.maxY, y);
+            job.maxY = Math.max(job.maxY, Math.max(y,job.fluidHeights[sampleIndex]));
             job.nextSample = sampleIndex + 1;
 
             if (System.nanoTime() - sliceStart >= sliceBudgetNanos) {
@@ -3569,11 +3737,16 @@ public final class WorldgenSurfaceSampler {
             return;
         }
 
+        if(job.assemblyPending)return;
+        job.assemblyPending=true;
+        COVERAGE_HEIGHT_EXECUTOR.execute(()->{try{
+            if(taskEpoch!=epoch)return;
         for (int i = 0; i < result.sampleIndices().length; i++) {
             int sampleIndex = result.sampleIndices()[i];
             int packed = result.heights()[i];
-            int y = packed >> 1;
-            job.water[sampleIndex] = (packed & 1) != 0;
+            int y = TerrainNoiseBatch.floor(packed);
+            job.water[sampleIndex] = TerrainNoiseBatch.wet(packed);
+            job.fluidHeights[sampleIndex] = TerrainNoiseBatch.surface(packed);
             job.heights[sampleIndex] = y;
 
             if (job.sampleGrid != null) {
@@ -3583,12 +3756,13 @@ public final class WorldgenSurfaceSampler {
                 if (fineIndex >= 0) {
                     job.sampleGrid.heights[fineIndex] = y;
                     job.sampleGrid.water[fineIndex] = job.water[sampleIndex];
+                job.sampleGrid.fluidHeights[fineIndex] = job.fluidHeights[sampleIndex];
                     job.sampleGrid.heightSampled[fineIndex] = true;
                 }
             }
 
             job.minY = Math.min(job.minY, y);
-            job.maxY = Math.max(job.maxY, y);
+            job.maxY = Math.max(job.maxY, Math.max(y,job.fluidHeights[sampleIndex]));
             job.generatedSamples++;
         }
 
@@ -3605,12 +3779,13 @@ public final class WorldgenSurfaceSampler {
             int y = job.heights[sampleIndex];
 
             var biome = sampleBiomeCached(
+                                job,
                                 level,
                                 worldX,
                                 y,
                                 worldZ
                         );
-            var appearance = MinecraftSurfacePalette.sample(
+            var appearance = sampleSourceAppearance(job,
                     biome,
                     worldX,
                     y,
@@ -3670,6 +3845,8 @@ public final class WorldgenSurfaceSampler {
 
         lastSliceSamples = result.sampleIndices().length;
         lastSliceMs = (System.nanoTime() - sliceStart) / 1_000_000.0;
+        }catch(Throwable error){job.failed=true;EverviewClient.LOGGER.warn("Everview coverage assembly failed",error);}
+        });
     }
 
     private static void runAsyncExactGeometry(
@@ -3696,8 +3873,9 @@ public final class WorldgenSurfaceSampler {
                     int y = job.sampleGrid.heights[fineIndex];
                     job.heights[sampleIndex] = y;
                     job.water[sampleIndex] = job.sampleGrid.water[fineIndex];
+                    job.fluidHeights[sampleIndex] = job.sampleGrid.fluidHeights[fineIndex];
                     job.minY = Math.min(job.minY, y);
-                    job.maxY = Math.max(job.maxY, y);
+                    job.maxY = Math.max(job.maxY, Math.max(y,job.fluidHeights[sampleIndex]));
                     job.reusedSamples++;
                 } else {
                     missingScratch[missingCount++] = sampleIndex;
@@ -3770,8 +3948,9 @@ public final class WorldgenSurfaceSampler {
         for (int i = 0; i < result.sampleIndices().length; i++) {
             int sampleIndex = result.sampleIndices()[i];
             int packed = result.heights()[i];
-            int y = packed >> 1;
-            job.water[sampleIndex] = (packed & 1) != 0;
+            int y = TerrainNoiseBatch.floor(packed);
+            job.water[sampleIndex] = TerrainNoiseBatch.wet(packed);
+            job.fluidHeights[sampleIndex] = TerrainNoiseBatch.surface(packed);
             int gx = sampleIndex % job.samplesAcross;
             int gz = sampleIndex / job.samplesAcross;
             int fineIndex = job.fineGridIndex(gx, gz);
@@ -3780,10 +3959,11 @@ public final class WorldgenSurfaceSampler {
             if (fineIndex >= 0) {
                 job.sampleGrid.heights[fineIndex] = y;
                 job.sampleGrid.water[fineIndex] = job.water[sampleIndex];
+                job.sampleGrid.fluidHeights[fineIndex] = job.fluidHeights[sampleIndex];
                 job.sampleGrid.heightSampled[fineIndex] = true;
             }
             job.minY = Math.min(job.minY, y);
-            job.maxY = Math.max(job.maxY, y);
+            job.maxY = Math.max(job.maxY, Math.max(y,job.fluidHeights[sampleIndex]));
             job.generatedSamples++;
         }
 
@@ -3820,12 +4000,13 @@ public final class WorldgenSurfaceSampler {
 
             int y = job.heights[sampleIndex];
             var biome = sampleBiomeCached(
+                                job,
                                 level,
                                 worldX,
                                 y,
                                 worldZ
                         );
-            var appearance = MinecraftSurfacePalette.sample(
+            var appearance = sampleSourceAppearance(job,
                     biome,
                     worldX,
                     y,
@@ -3906,8 +4087,10 @@ public final class WorldgenSurfaceSampler {
             int start = sampleIndices.length * worker / workers;
             int end = sampleIndices.length * (worker + 1) / workers;
 
+            long enqueued = System.nanoTime();
             futures.add(CompletableFuture.supplyAsync(
-                    () -> computeHeightPart(
+                    () -> { long began=System.nanoTime(); GenerationProfile.queueNanos.add(began-enqueued);
+                        try { return computeHeightPart(
                             level,
                             generator,
                             randomState,
@@ -3915,7 +4098,7 @@ public final class WorldgenSurfaceSampler {
                             sampleIndices,
                             start,
                             end
-                    ),
+                    ); } finally {GenerationProfile.workerNanos.add(System.nanoTime()-began);GenerationProfile.workerTasks.increment();} },
                     executor
             ));
         }
@@ -3956,7 +4139,19 @@ public final class WorldgenSurfaceSampler {
         });
     }
 
+    private static MinecraftSurfacePalette.SampleAppearance sampleSourceAppearance(GenerationJob job,Holder<Biome> biome,int x,int y,int z,int sea) {
+        var a=job.source.appearance(x,z,()->{
+            var solid=MinecraftSurfacePalette.sampleSolid(biome,x,y,z,sea);
+            return new TerrainSourceStore.Appearance(solid.rgb(),solid.material());
+        });
+        int index=((z-job.originZ)/job.sampleSpacing)*job.samplesAcross+(x-job.originX)/job.sampleSpacing;
+        if(index>=0&&index<job.water.length&&job.water[index])
+            return MinecraftSurfacePalette.sample(biome,x,y,z,sea);
+        return new MinecraftSurfacePalette.SampleAppearance(a.color(),a.material());
+    }
+
     private static Holder<Biome> sampleBiomeCached(
+            GenerationJob job,
             ServerLevel level,
             int worldX,
             int worldY,
@@ -3967,22 +4162,23 @@ public final class WorldgenSurfaceSampler {
         int quartZ = worldZ >> 2;
         long key = packQuartBiome(quartX, quartY, quartZ);
 
-        Holder<Biome> cached = SHARED_BIOME_CACHE.get(key);
+        Holder<Biome> cached = job.biomeCache.get(key);
         if (cached != null) {
             SHARED_BIOME_HITS.incrementAndGet();
             return cached;
         }
 
-        Holder<Biome> biome = level.getNoiseBiome(
-                quartX,
-                quartY,
-                quartZ
-        );
+        long biomeStart=System.nanoTime();
+        var chunks=level.getChunkSource();
+        Holder<Biome> biome = chunks.getGenerator().getBiomeSource().createResolver(
+                chunks.randomState().createClimateSampler(net.minecraft.world.level.levelgen.densityfunction.SamplerContext.EMPTY_UNCACHED))
+                .getNoiseBiome(quartX,quartY,quartZ);
+        GenerationProfile.biomeNanos.add(System.nanoTime()-biomeStart);GenerationProfile.biomeCalls.increment();
         SHARED_BIOME_MISSES.incrementAndGet();
 
-        if (SHARED_BIOME_CACHE.size() < SHARED_BIOME_CACHE_LIMIT) {
+        if (job.biomeCache.size() < SHARED_BIOME_CACHE_LIMIT) {
             Holder<Biome> raced =
-                    SHARED_BIOME_CACHE.putIfAbsent(key, biome);
+                    job.biomeCache.putIfAbsent(key, biome);
             if (raced != null) {
                 return raced;
             }
@@ -4003,54 +4199,38 @@ public final class WorldgenSurfaceSampler {
             net.minecraft.world.level.levelgen.RandomState randomState,
             int worldX,
             int worldZ,
-            int sampleSpacing
+            int sampleSpacing, GenerationJob job
     ) {
-        boolean reusableColumn = sampleSpacing > 1
-                || (((worldX & 1) == 0) && ((worldZ & 1) == 0));
-        long key = packWorldColumn(worldX, worldZ);
+        TerrainSourceStore source = job.source;
+        TerrainSourceStore.Loader loader = heightLoader(level, generator, randomState);
+        return source.sample(worldX, worldZ, sampleSpacing <= 4, loader);
+    }
 
-        if (reusableColumn) {
-            Integer cached = SHARED_HEIGHT_CACHE.get(key);
-            if (cached != null) {
-                SHARED_HEIGHT_HITS.incrementAndGet();
-                return cached;
+    private static TerrainSourceStore.Loader heightLoader(ServerLevel level,
+            net.minecraft.world.level.chunk.ChunkGenerator generator,
+            net.minecraft.world.level.levelgen.RandomState randomState) {
+        return new TerrainSourceStore.Loader() {
+            public int[] batch(int x, int z) {
+                long start=System.nanoTime();
+                try {
+                    if(generator instanceof net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator noise)
+                        return TerrainNoiseBatch.sample(noise,randomState,level,x,z,16);
+                    int[] result=new int[256];
+                    for(int dz=0;dz<16;dz++)for(int dx=0;dx<16;dx++)result[dz*16+dx]=column(x+dx,z+dz);
+                    return result;
+                } finally {GenerationProfile.noiseNanos.add(System.nanoTime()-start);GenerationProfile.noiseColumns.add(256);}
             }
-        }
-
-        int y = generator.getBaseHeight(
-                worldX,
-                worldZ,
-                Heightmap.Types.OCEAN_FLOOR_WG,
-                level,
-                randomState
-        );
-        y = Math.max(level.getMinY(), Math.min(level.getMaxY(), y));
-        int sea = level.getSeaLevel();
-        boolean wet;
-        if (y < sea - 2) {
-            wet = true;
-        } else if (y <= sea + 2) {
-            // At a shallow shore the ocean-floor height alone cannot tell a
-            // one-block fluid layer from dry land at the same elevation.
-            int visible = generator.getBaseHeight(worldX, worldZ,
-                    Heightmap.Types.WORLD_SURFACE_WG, level, randomState);
-            wet = visible > y;
-        } else {
-            wet = false;
-        }
-        int packed = (y << 1) | (wet ? 1 : 0);
-        if (reusableColumn) {
-            SHARED_HEIGHT_MISSES.incrementAndGet();
-
-            if (SHARED_HEIGHT_CACHE.size() < SHARED_HEIGHT_CACHE_LIMIT) {
-                Integer raced = SHARED_HEIGHT_CACHE.putIfAbsent(key, packed);
-                if (raced != null) {
-                    return raced;
-                }
+            public int column(int x,int z) {
+                long start=System.nanoTime();
+                try {
+                    if(generator instanceof net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator noise)
+                        return TerrainNoiseBatch.sample(noise,randomState,level,x,z,1)[0];
+                    int floor=generator.getBaseHeight(x,z,Heightmap.Types.OCEAN_FLOOR_WG,level,randomState);
+                    int surface=generator.getBaseHeight(x,z,Heightmap.Types.WORLD_SURFACE_WG,level,randomState);
+                    return TerrainNoiseBatch.pack(floor,surface);
+                } finally {GenerationProfile.noiseNanos.add(System.nanoTime()-start);GenerationProfile.noiseColumns.increment();}
             }
-        }
-
-        return packed;
+        };
     }
 
     private static long packWorldColumn(int worldX, int worldZ) {
@@ -4069,6 +4249,7 @@ public final class WorldgenSurfaceSampler {
     ) {
         int count = Math.max(0, end - start);
         int[] heights = new int[count];
+        TerrainSourceStore.Loader loader=heightLoader(level,generator,randomState);
 
         for (int i = 0; i < count; i++) {
             if (Thread.currentThread().isInterrupted()) {
@@ -4089,20 +4270,19 @@ public final class WorldgenSurfaceSampler {
             int worldX = job.originX + gx * job.sampleSpacing;
             int worldZ = job.originZ + gz * job.sampleSpacing;
 
-            heights[i] = sampleHeightCached(
-                    level,
-                    generator,
-                    randomState,
-                    worldX,
-                    worldZ,
-                    job.sampleSpacing
-            );
+            heights[i] = job.source.sample(worldX, worldZ, job.sampleSpacing <= 4, loader);
         }
 
         return new HeightPart(start, heights);
     }
 
     private static MeshData buildMesh(GenerationJob job, int seaLevel) {
+        long start=System.nanoTime();
+        try { MeshData mesh=buildMeshInternal(job,seaLevel); GenerationProfile.meshQuads.add(mesh.quadCount()); return mesh; }
+        finally {GenerationProfile.meshNanos.add(System.nanoTime()-start);GenerationProfile.meshes.increment();}
+    }
+
+    private static MeshData buildMeshInternal(GenerationJob job, int seaLevel) {
         // Heights are solid-surface samples. Fluid coverage never comes from a nearby
         // borrowed biome/material, and never from a coarse-cell majority vote.
         for (int i = 0; i < job.totalSamples; i++) {
@@ -4133,7 +4313,7 @@ public final class WorldgenSurfaceSampler {
             default -> 4.0;
         };
         new dev.everview.core.AdaptiveSurfaceMesh(job.cellsAcross, job.sampleSpacing, seaLevel,
-                job.heights, job.sampleMaterials, job.sampleColors, job.water, error,
+                job.heights, job.sampleMaterials, job.sampleColors, job.water, job.fluidHeights, error,
                 (x0, z0, x1, z1, y00, y01, y11, y10, material, color) -> {
                     // No height quantization or averaged plateaus. The simplified
                     // triangles retain all sampled features within their error bound.
@@ -4159,160 +4339,13 @@ public final class WorldgenSurfaceSampler {
      * exact tiles meet deterministically without deep crack-hiding skirts.
      */
     private static MeshData buildBlockColumnMesh(GenerationJob job, int seaLevel) {
-        int cells = job.cellsAcross;
-        int[] topY = new int[job.cellCount];
-        int[] topColor = new int[job.cellCount];
-        byte[] topMaterial = new byte[job.cellCount];
-
-        for (int gz = 0; gz < cells; gz++) {
-            for (int gx = 0; gx < cells; gx++) {
-                int cell = gz * cells + gx;
-                int sample = gz * job.samplesAcross + gx;
-                int x = job.originX + gx;
-                int z = job.originZ + gz;
-
-                byte material = job.sampleMaterials[sample];
-                int y = exactColumnHeight(job, sample, material, seaLevel);
-                int color = MaterialTerrainShading.apply(
-                        MinecraftSurfacePalette.applyLighting(
-                                job.sampleColors[sample],
-                                material == MinecraftSurfacePalette.MATERIAL_WATER
-                                        ? 0.97F
-                                        : 1.00F
-                        ),
-                        material,
-                        x,
-                        y,
-                        z,
-                        L1_EXACT_SPACING
-                );
-
-                topY[cell] = y;
-                topColor[cell] = color;
-                topMaterial[cell] = material;
-            }
-        }
-
-        MeshBuilder mesh = new MeshBuilder(job.cellCount * 4);
-
-        // One top quad per sampled Minecraft column.
-        for (int gz = 0; gz < cells; gz++) {
-            int z0 = job.originZ + gz;
-            int z1 = z0 + 1;
-
-            for (int gx = 0; gx < cells; gx++) {
-                int x0 = job.originX + gx;
-                int x1 = x0 + 1;
-                int cell = gz * cells + gx;
-
-                mesh.addQuad(
-                        x0, topY[cell], z0,
-                        x0, topY[cell], z1,
-                        x1, topY[cell], z1,
-                        x1, topY[cell], z0,
-                        topColor[cell],
-                        topMaterial[cell]
-                );
-            }
-        }
-
-        // Shared east/west faces inside the tile.
-        for (int gz = 0; gz < cells; gz++) {
-            int z0 = job.originZ + gz;
-            int z1 = z0 + 1;
-
-            for (int gx = 0; gx < cells - 1; gx++) {
-                int left = gz * cells + gx;
-                int right = left + 1;
-                addBlockBoundaryWall(
-                        mesh,
-                        job.originX + gx + 1, z0,
-                        job.originX + gx + 1, z1,
-                        topY[left], topMaterial[left], topColor[left],
-                        topY[right], topMaterial[right], topColor[right],
-                        0.82F
-                );
-            }
-
-            // The extra x=max sample is the first column sample of the tile
-            // immediately to the east. This makes exact-tile seams deterministic.
-            int inside = gz * cells + cells - 1;
-            int outsideSample = gz * job.samplesAcross + cells;
-            byte outsideMaterial = job.sampleMaterials[outsideSample];
-            int outsideY = exactColumnHeight(
-                    job,
-                    outsideSample,
-                    outsideMaterial,
-                    seaLevel
-            );
-            int outsideColor = exactSampleColor(
-                    job,
-                    outsideSample,
-                    outsideMaterial,
-                    job.originX + cells,
-                    outsideY,
-                    z0
-            );
-            int eastX = job.originX + cells;
-
-            addBlockBoundaryWall(
-                    mesh,
-                    eastX, z0,
-                    eastX, z1,
-                    topY[inside], topMaterial[inside], topColor[inside],
-                    outsideY, outsideMaterial, outsideColor,
-                    0.82F
-            );
-        }
-
-        // Shared north/south faces inside the tile.
-        for (int gx = 0; gx < cells; gx++) {
-            int x0 = job.originX + gx;
-            int x1 = x0 + 1;
-
-            for (int gz = 0; gz < cells - 1; gz++) {
-                int north = gz * cells + gx;
-                int south = north + cells;
-                addBlockBoundaryWall(
-                        mesh,
-                        x0, job.originZ + gz + 1,
-                        x1, job.originZ + gz + 1,
-                        topY[north], topMaterial[north], topColor[north],
-                        topY[south], topMaterial[south], topColor[south],
-                        0.72F
-                );
-            }
-
-            // Same ownership rule for the south tile edge.
-            int inside = (cells - 1) * cells + gx;
-            int outsideSample = cells * job.samplesAcross + gx;
-            byte outsideMaterial = job.sampleMaterials[outsideSample];
-            int outsideY = exactColumnHeight(
-                    job,
-                    outsideSample,
-                    outsideMaterial,
-                    seaLevel
-            );
-            int outsideColor = exactSampleColor(
-                    job,
-                    outsideSample,
-                    outsideMaterial,
-                    x0,
-                    outsideY,
-                    job.originZ + cells
-            );
-            int southZ = job.originZ + cells;
-
-            addBlockBoundaryWall(
-                    mesh,
-                    x0, southZ,
-                    x1, southZ,
-                    topY[inside], topMaterial[inside], topColor[inside],
-                    outsideY, outsideMaterial, outsideColor,
-                    0.72F
-            );
-        }
-
+        int[] displayed=job.heights.clone();
+        for(int i=0;i<displayed.length;i++)if(job.water[i])displayed[i]=job.fluidHeights[i];
+        MeshBuilder mesh=new MeshBuilder(Math.max(16,job.cellCount/4));
+        new BlockSurfaceMesh(job.cellsAcross,job.sampleSpacing,displayed,job.sampleColors,job.sampleMaterials,job.water,1,
+            (x0,y0,z0,x1,y1,z1,x2,y2,z2,x3,y3,z3,color,material)->mesh.addQuad(
+                x0+job.originX,y0,z0+job.originZ,x1+job.originX,y1,z1+job.originZ,
+                x2+job.originX,y2,z2+job.originZ,x3+job.originX,y3,z3+job.originZ,color,material)).boundaryWalls(false).build();
         return mesh.finish();
     }
 
@@ -4324,7 +4357,7 @@ public final class WorldgenSurfaceSampler {
     ) {
         return material == MinecraftSurfacePalette.MATERIAL_WATER
                 || material == MinecraftSurfacePalette.MATERIAL_ICE
-                ? seaLevel
+                ? job.fluidHeights[sample]
                 : job.heights[sample];
     }
 
@@ -4724,6 +4757,9 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static final class GenerationJob {
+        private final TerrainSourceStore source = terrainSource;
+        private final java.util.concurrent.ConcurrentMap<Long, Holder<Biome>> biomeCache = SHARED_BIOME_CACHE;
+        private volatile boolean assemblyPending;
         private final LodTileKey key;
         private final WorldgenLodRing ring;
         private final int originX;
@@ -4735,6 +4771,7 @@ public final class WorldgenSurfaceSampler {
         private final int cellCount;
         private final int[] heights;
         private final boolean[] water;
+        private final int[] fluidHeights;
         private final int[] sampleColors;
         private final byte[] sampleMaterials;
         private final boolean refinement;
@@ -4788,6 +4825,7 @@ public final class WorldgenSurfaceSampler {
             this.cellCount = cellsAcross * cellsAcross;
             this.heights = new int[totalSamples];
             this.water = new boolean[totalSamples];
+            this.fluidHeights = new int[totalSamples];
             this.sampleColors = new int[totalSamples];
             this.sampleMaterials = new byte[totalSamples];
         }
@@ -4818,6 +4856,7 @@ public final class WorldgenSurfaceSampler {
         private final int samplesAcross;
         private final int[] heights;
         private final boolean[] water;
+        private final int[] fluidHeights;
         private final int[] colors;
         private final byte[] materials;
         private final boolean[] heightSampled;
@@ -4835,6 +4874,7 @@ public final class WorldgenSurfaceSampler {
             int total = samplesAcross * samplesAcross;
             this.heights = new int[total];
             this.water = new boolean[total];
+            this.fluidHeights = new int[total];
             this.colors = new int[total];
             this.materials = new byte[total];
             this.heightSampled = new boolean[total];
