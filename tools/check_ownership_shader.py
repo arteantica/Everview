@@ -10,6 +10,9 @@ import zipfile
 
 root=pathlib.Path(__file__).resolve().parents[1]
 client=pathlib.Path(sys.argv[1])
+mod_paths=[pathlib.Path(p) for p in sys.argv[2:] if not p.endswith('-sources.jar')]
+assert not sys.argv[2:] or len(mod_paths)==1, 'Supply exactly one production mod JAR (sources JAR is ignored).'
+mod=zipfile.ZipFile(mod_paths[0]) if mod_paths else None
 egl=C.CDLL(ctypes.util.find_library('EGL'))
 gl=C.CDLL(ctypes.util.find_library('GL'))
 def bind(lib,name,restype,*args):
@@ -35,7 +38,8 @@ create=bind(gl,'glCreateShader',U,U);source=bind(gl,'glShaderSource',None,U,I,C.
 compile_shader=bind(gl,'glCompileShader',None,U);query=bind(gl,'glGetShaderiv',None,U,U,C.POINTER(I))
 shaders=[]
 for name,kind in [('terrain.vsh',0x8B31),('terrain.fsh',0x8B30)]:
-    shader=create(kind);s=C.c_char_p(expand((root/'src/main/resources/assets/everview/shaders/core'/name).read_text()).encode())
+    text=mod.read('assets/everview/shaders/core/'+name).decode() if mod else (root/'src/main/resources/assets/everview/shaders/core'/name).read_text()
+    shader=create(kind);s=C.c_char_p(expand(text).encode())
     source(shader,1,C.byref(s),None);compile_shader(shader);ok=I();query(shader,0x8B81,C.byref(ok))
     log=C.create_string_buffer(8192);bind(gl,'glGetShaderInfoLog',None,U,I,C.POINTER(I),P)(shader,8192,None,log)
     assert ok.value,(name,log.value.decode());shaders.append(shader)

@@ -17,6 +17,9 @@ import net.minecraft.resources.Identifier;
  * like ordinary opaque world geometry.
  */
 public final class EverviewGpuPipeline {
+    private static final Identifier TERRAIN_SHADER =
+            Identifier.fromNamespaceAndPath(EverviewClient.MOD_ID, "core/terrain");
+
     public static final RenderPipeline TERRAIN = RenderPipeline.builder()
             .withBindGroupLayout(BindGroupLayouts.GLOBALS)
             .withBindGroupLayout(BindGroupLayouts.PROJECTION)
@@ -27,8 +30,8 @@ public final class EverviewGpuPipeline {
             ))
             .withBindGroupLayout(com.mojang.renderpearl.api.pipeline.BindGroupLayout.builder()
                     .withUniform("EverviewOwnership", com.mojang.renderpearl.api.pipeline.UniformType.UNIFORM_BUFFER).build())
-            .withVertexShader("everview:core/terrain")
-            .withFragmentShader("everview:core/terrain")
+            .withVertexShader(TERRAIN_SHADER)
+            .withFragmentShader(TERRAIN_SHADER)
             .withColorTargetState(ColorTargetState.DEFAULT)
             .withVertexBinding(0, DefaultVertexFormat.POSITION_COLOR)
             .withPrimitiveTopology(PrimitiveTopology.QUADS)

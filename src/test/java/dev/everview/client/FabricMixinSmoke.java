@@ -57,8 +57,56 @@ public final class FabricMixinSmoke {
         if (!Class.forName("dev.everview.client.VanillaTerrainReadiness", false, loader)
                 .isAssignableFrom(Class.forName("net.minecraft.client.renderer.LevelRenderer", false, loader)))
             throw new AssertionError("Drawable-readiness interface was not applied");
+        verifyTerrainPipeline(loader, mod);
         System.out.println("PASS: " + mixins.size() + " packaged client mixins / " + checked
                 + " required handlers transformed and JVM-verified by Fabric Loader");
+    }
+
+    private static void verifyTerrainPipeline(ClassLoader loader, Path mod) throws Exception {
+        // Unlike class-only Mixin checks, this executes the production initializer
+        // that the first terrain draw uses, including Minecraft's actual builder.
+        Class<?> pipelineClass = Class.forName("dev.everview.client.EverviewGpuPipeline", true, loader);
+        if (pipelineClass.getClassLoader() != loader) throw new AssertionError("Pipeline bypassed Knot");
+        Object pipeline = pipelineClass.getField("TERRAIN").get(null);
+        Class<?> type = pipeline.getClass();
+        if (!type.getMethod("getLocation").invoke(pipeline).toString()
+                .equals("everview:pipeline/persistent_lod_terrain"))
+            throw new AssertionError("Unexpected terrain pipeline location");
+        Map<?, ?> shaders = (Map<?, ?>) type.getMethod("getShaders").invoke(pipeline);
+        if (shaders.size() != 2) throw new AssertionError("Both shader stages must exist");
+        Set<String> stages = new HashSet<>();
+        try (var jar = new JarFile(mod.toFile())) {
+            for (var entry : shaders.entrySet()) {
+                String stage = entry.getKey().toString();
+                stages.add(stage);
+                String id = entry.getValue().toString();
+                if (!id.equals("everview:core/terrain"))
+                    throw new AssertionError("Shader namespace/path is wrong: " + id);
+                String extension = switch (stage) {
+                    case "VERTEX" -> ".vsh";
+                    case "FRAGMENT" -> ".fsh";
+                    default -> throw new AssertionError("Unexpected shader stage " + stage);
+                };
+                String asset = "assets/everview/shaders/core/terrain" + extension;
+                if (jar.getJarEntry(asset) == null)
+                    throw new AssertionError("Pipeline shader is absent from the packaged JAR: " + asset);
+            }
+        }
+        if (!stages.equals(Set.of("VERTEX", "FRAGMENT"))) throw new AssertionError("Missing shader stage");
+        Object depth = type.getMethod("getDepthStencilState").invoke(pipeline);
+        if (!Boolean.TRUE.equals(depth.getClass().getMethod("writeDepth").invoke(depth)))
+            throw new AssertionError("Terrain must write depth");
+        Set<String> uniforms = new HashSet<>();
+        for (Object layout : (List<?>) type.getMethod("getBindGroupLayouts").invoke(pipeline)) {
+            for (Object uniform : (List<?>) layout.getClass().getMethod("uniforms").invoke(layout)) {
+                String name = uniform.getClass().getMethod("name").invoke(uniform).toString();
+                if (!uniforms.add(name)) throw new AssertionError("Duplicate pipeline uniform " + name);
+            }
+        }
+        if (!uniforms.equals(Set.of("Globals", "Projection", "DynamicTransforms", "EverviewOwnership")))
+            throw new AssertionError("Incomplete terrain/ownership bindings: " + uniforms);
+        System.out.println("PASS: production terrain pipeline initialized; both namespaced shader assets,"
+                + " depth writes and terrain/ownership uniform bindings verified");
     }
 
     private static MixinTarget inspect(ClassReader reader) {
