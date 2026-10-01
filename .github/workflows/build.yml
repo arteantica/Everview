@@ -38,6 +38,9 @@ jobs:
       - name: Benchmark persistent command scaling
         run: ./gradlew rendererScalingBenchmark --no-daemon > build/renderer-scaling-benchmark.txt
 
+      - name: Benchmark sparse Minecraft sampling and source reuse
+        run: ./gradlew sparseSamplingBenchmark --no-daemon > build/sparse-sampling-benchmark.txt
+
       - name: Check production ownership shader
         run: |
           sudo apt-get update -qq
@@ -53,6 +56,7 @@ jobs:
           path: |
             build/terrain-benchmark.txt
             build/renderer-scaling-benchmark.txt
+            build/sparse-sampling-benchmark.txt
             build/ownership-shader-check.txt
             build/mixin-smoke.txt
             build/mixin-smoke-sodium.txt

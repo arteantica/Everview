@@ -37,6 +37,30 @@ final class TerrainArchitectureTest {
             assertEquals(1,store.diskHits.sum());
         }
     }
+    @Test void backgroundWritebackDrainsSparseProductionAndPreservesLatestAppearance() throws Exception {
+        var l=loader(new AtomicInteger());
+        try(var store=new TerrainSourceStore(directory,1024)) {
+            for(int i=0;i<600;i++) {
+                int x=i*16;store.sample(x,-16,false,l);
+                store.appearance(x,-16,()->new TerrainSourceStore.Appearance(0x123456,(byte)3));
+            }
+            long deadline=System.nanoTime()+5_000_000_000L;
+            while(store.pendingWrites()>0 && System.nanoTime()<deadline)Thread.sleep(20);
+            assertEquals(0,store.pendingWrites(),"background drain remained limited to the old 64 pages/sec");
+            assertTrue(store.writtenPages.sum()>=600);
+            assertEquals(0,store.errors.sum());
+        }
+        try(var reopened=new TerrainSourceStore(directory,16)) {
+            var never=new TerrainSourceStore.Loader(){
+                public int[] batch(int x,int z){throw new AssertionError("source regenerated after background save");}
+                public int column(int x,int z){throw new AssertionError("source regenerated after background save");}
+            };
+            for(int i:new int[]{0,255,599}) {
+                assertEquals(l.column(i*16,-16),reopened.sample(i*16,-16,false,never));
+                assertEquals(new TerrainSourceStore.Appearance(0x123456,(byte)3),reopened.appearance(i*16,-16,()->{throw new AssertionError("appearance was lost");}));
+            }
+        }
+    }
     @Test void movementEvictsPagesWithinBoundAndReusesDisk() {
         var l=loader(new AtomicInteger());
         try(var store=new TerrainSourceStore(directory,16)){

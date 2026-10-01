@@ -40,6 +40,11 @@ tasks.named('test', Test) {
     useJUnitPlatform()
 }
 
+// Coverage lifecycle checks execute the actual client sampler without a game
+// instance. Fabric smoke below still loads all mod classes from the packaged JAR.
+sourceSets.test.compileClasspath += sourceSets.client.output
+sourceSets.test.runtimeClasspath += sourceSets.client.output
+
 processResources {
     def version = project.version
     inputs.property "version", version
@@ -78,6 +83,13 @@ tasks.register('rendererScalingBenchmark', JavaExec) {
     dependsOn testClasses
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'dev.everview.client.RendererScalingBenchmark'
+    maxHeapSize = '2G'
+}
+
+tasks.register('sparseSamplingBenchmark', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.everview.terrain.SparseSamplingBenchmark'
     maxHeapSize = '2G'
 }
 

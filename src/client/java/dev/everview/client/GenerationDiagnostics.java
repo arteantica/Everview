@@ -5,11 +5,12 @@ import java.util.*;
 
 /** Only evaluated at the existing 250 ms HUD refresh, never part of terrain traversal. */
 public final class GenerationDiagnostics {
-    private static long lastTime,lastColumns,lastTiles;private static double columnsPerSecond,tilesPerSecond;
+    private static long lastTime,lastColumns,lastTiles,lastStarted;private static double columnsPerSecond,tilesPerSecond;
     private GenerationDiagnostics(){}
     public static List<String> lines(WorldgenSurfaceSnapshot snapshot){
         var source=WorldgenSurfaceSampler.terrainSource();var out=new ArrayList<String>();long now=System.nanoTime();
         long columns=GenerationProfile.noiseColumns.sum(),tiles=GenerationProfile.integrated.sum();
+        if(lastStarted!=GenerationProfile.started){lastStarted=GenerationProfile.started;lastTime=0;columnsPerSecond=tilesPerSecond=0;}
         if(lastTime==0||now-lastTime>=1_000_000_000L){double seconds=(now-lastTime)/1e9;
             if(lastTime!=0&&columns>=lastColumns){columnsPerSecond=(columns-lastColumns)/seconds;tilesPerSecond=(tiles-lastTiles)/seconds;}
             lastTime=now;lastColumns=columns;lastTiles=tiles;
@@ -21,14 +22,18 @@ public final class GenerationDiagnostics {
         out.add(String.format(Locale.ROOT,"Source %.0f new columns/s | %.2f integrated tiles/s | %,d total columns",columnsPerSecond,tilesPerSecond,columns));
         out.add(String.format(Locale.ROOT,"Sampling %.1f ms | biome %.1f ms (%,d queries) | material %.1f ms (cumulative worker time)",
                 GenerationProfile.noiseNanos.sum()/1e6,GenerationProfile.biomeNanos.sum()/1e6,GenerationProfile.biomeCalls.sum(),GenerationProfile.materialNanos.sum()/1e6));
-        out.add(String.format(Locale.ROOT,"Mesh %.1f ms / %,d meshes | height/detail busy %.2f workers avg | queue wait %.1f ms",
+        out.add(String.format(Locale.ROOT,"Noise contexts %,d | shared-context columns %,d | integrated %,d tiles total",
+                GenerationProfile.noiseBatches.sum(),GenerationProfile.sharedContextColumns.sum(),tiles));
+        out.add(String.format(Locale.ROOT,"Mesh %.1f ms / %,d meshes | generation busy %.2f workers avg | queue wait %.1f ms",
                 GenerationProfile.meshNanos.sum()/1e6,GenerationProfile.meshes.sum(),GenerationProfile.workerNanos.sum()/1e9/seconds,GenerationProfile.queueNanos.sum()/1e6));
         out.add(WorldgenSurfaceSampler.generationQueues()+" | "+WorldgenSurfaceSampler.detailStatus());
+        out.add(WorldgenSurfaceSampler.coverageStages());
         if(source!=null){long requests=source.hits.sum()+source.misses.sum();
             out.add(String.format(Locale.ROOT,"Source RAM ~%.1f MiB | %.1f%% point reuse | %,d disk pages reused | %d pending writes",
                     source.residentBytes()/1048576.0,requests==0?0:100.0*source.hits.sum()/requests,source.diskHits.sum(),source.pendingWrites()));
             out.add(String.format(Locale.ROOT,"Source I/O read %.1f ms / %.2f MiB | write %.1f ms / %.2f MiB | errors %,d | budget waits %,d",
                     source.readNanos.sum()/1e6,source.readBytes.sum()/1048576.0,source.writeNanos.sum()/1e6,source.writeBytes.sum()/1048576.0,source.errors.sum(),source.budgetWaits.sum()));
+            out.add(String.format(Locale.ROOT,"Source writeback %,d pages saved | %.1f pages/s average",source.writtenPages.sum(),source.writtenPages.sum()/seconds));
             out.add(String.format(Locale.ROOT,"Source lookup %.1f ms | page lock wait %.1f ms | dual solid/fluid heights | optional volume layers: inactive",
                     source.lookupNanos.sum()/1e6,source.waitNanos.sum()/1e6));
         }

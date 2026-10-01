@@ -14,12 +14,15 @@ import java.util.zip.*;
  * 16x16 pages share one in-flight fill. Persistent 256x256 regions have an indexed
  * compressed page log; only dirty pages are written. Disk work never runs on rendering. */
 public final class TerrainSourceStore implements AutoCloseable {
-    public interface Loader { int[] batch(int x, int z); int column(int x, int z); }
+    public interface Loader extends AutoCloseable {
+        int[] batch(int x, int z); int column(int x, int z);
+        @Override default void close() {}
+    }
     public record Appearance(int color, byte material) {}
     public interface AppearanceLoader { Appearance sample(); }
     public final LongAdder hits=new LongAdder(), misses=new LongAdder(), batchColumns=new LongAdder(),
             readNanos=new LongAdder(), writeNanos=new LongAdder(), readBytes=new LongAdder(), writeBytes=new LongAdder(),
-            diskHits=new LongAdder(), waitNanos=new LongAdder(), lookupNanos=new LongAdder(), errors=new LongAdder(), budgetWaits=new LongAdder();
+            diskHits=new LongAdder(), writtenPages=new LongAdder(), waitNanos=new LongAdder(), lookupNanos=new LongAdder(), errors=new LongAdder(), budgetWaits=new LongAdder();
     private static final int HEADER=4096, MAGIC=0x45565331;
     private final LinkedHashMap<Long,Page> pages=new LinkedHashMap<>(256,.75f,true);
     private final ConcurrentLinkedQueue<Page> dirty=new ConcurrentLinkedQueue<>();
@@ -38,7 +41,10 @@ public final class TerrainSourceStore implements AutoCloseable {
     public TerrainSourceStore(Path directory,int maxPages) {
         this.directory=directory; this.maxPages=Math.max(16,maxPages);
         writer=Executors.newSingleThreadScheduledExecutor(r->{Thread t=new Thread(r,"Everview-SourceIO");t.setDaemon(true);t.setPriority(Thread.MIN_PRIORITY);return t;});
-        writer.scheduleWithFixedDelay(()->flush(128),2,2,TimeUnit.SECONDS);
+        // The former 128 pages / 2 seconds capped writeback at 64 pages/s,
+        // far below sparse LOD production. Drain bounded background slices;
+        // retain the existing hard RAM bound and worker-side backpressure.
+        writer.scheduleWithFixedDelay(()->flushUntil(1024,System.nanoTime()+50_000_000L),100,100,TimeUnit.MILLISECONDS);
     }
     public synchronized long residentBytes() { synchronized(pages) {return pages.size()*2560L;} }
     public int pendingWrites() { return dirty.size(); }
@@ -122,7 +128,11 @@ public final class TerrainSourceStore implements AutoCloseable {
         }}finally{release(p);}
     }
     public void flush(int limit) {
+        flushUntil(limit,Long.MAX_VALUE);
+    }
+    private void flushUntil(int limit,long deadline) {
         for(int n=0;n<limit;n++){
+            if(System.nanoTime()>=deadline)return;
             Page p=dirty.poll();if(p==null)return;
             synchronized(p){
                 try {if(p.changed){write(p);p.changed=false;}p.queued=false;}
@@ -168,7 +178,7 @@ public final class TerrainSourceStore implements AutoCloseable {
             }
             if(Files.size(path)>2*1024*1024)compact(path);
         }
-        writeNanos.add(System.nanoTime()-start);
+        writeNanos.add(System.nanoTime()-start);writtenPages.increment();
     }
     private static void writeBits(DataOutputStream out,BitSet bits)throws IOException{long[] a=bits.toLongArray();for(int i=0;i<4;i++)out.writeLong(i<a.length?a[i]:0);}
     private static void compact(Path path)throws IOException {

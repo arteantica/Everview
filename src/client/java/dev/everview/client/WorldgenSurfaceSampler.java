@@ -82,10 +82,8 @@ public final class WorldgenSurfaceSampler {
             1,
             EXACT_HEIGHT_WORKERS / 2
     );
-    private static final int MAX_DETACHED_COVERAGE_JOBS = Math.max(
-            1,
-            COVERAGE_HEIGHT_WORKERS
-    );
+    private static final int MAX_DETACHED_COVERAGE_JOBS =
+            COVERAGE_HEIGHT_WORKERS + EXACT_HEIGHT_WORKERS;
     private static final int APPEARANCE_WORKERS = 1;
     private static final int MAX_DETACHED_APPEARANCE_JOBS =
             APPEARANCE_WORKERS;
@@ -283,7 +281,7 @@ public final class WorldgenSurfaceSampler {
     private static List<WorldgenLodRing> activeRings = List.of();
     private static List<WantedTile> wantedTiles = List.of();
     private static Set<LodTileKey> wantedKeys = Set.of();
-    private static GenerationJob currentJob;
+    private static volatile GenerationJob currentJob;
     private static final Map<LodTileKey, CompletableFuture<Void>>
             DETACHED_EXACT_JOBS = new ConcurrentHashMap<>();
     private static final Map<LodTileKey, GenerationJob>
@@ -379,7 +377,17 @@ public final class WorldgenSurfaceSampler {
         if (clientFrameMs >= 12.0) {
             return 1;
         }
-        return MAX_DETACHED_COVERAGE_JOBS;
+        // Reserve each exact tile's maximum three workers before borrowing.
+        // Never add threads or let a backlog of coverage take over the exact lane.
+        int reserved = DETACHED_EXACT_JOBS.size() * 3;
+        if (currentJob != null && currentJob.exactGeometryOnly) reserved += 3;
+        return COVERAGE_HEIGHT_WORKERS + Math.max(0, activeExactWorkerBudget() - reserved);
+    }
+
+    private static ExecutorService coverageExecutor() {
+        long primary = DETACHED_COVERAGE_JOBS.values().stream()
+                .filter(job -> job.coverageExecutor == COVERAGE_HEIGHT_EXECUTOR).count();
+        return primary < COVERAGE_HEIGHT_WORKERS ? COVERAGE_HEIGHT_EXECUTOR : EXACT_HEIGHT_EXECUTOR;
     }
 
     private static int activeAppearanceJobBudget() {
@@ -391,6 +399,17 @@ public final class WorldgenSurfaceSampler {
         var b=(java.util.concurrent.ThreadPoolExecutor)COVERAGE_HEIGHT_EXECUTOR;
         return "Workers active " + (a.getActiveCount()+b.getActiveCount()) + "/" + (EXACT_HEIGHT_WORKERS+COVERAGE_HEIGHT_WORKERS)
                 + " | queued " + (a.getQueue().size()+b.getQueue().size()) + " | complete " + COMPLETED.size();
+    }
+    public static String coverageStages() {
+        int capture=0, heights=0, assembly=0, ready=0;
+        for (GenerationJob job : DETACHED_COVERAGE_JOBS.values()) {
+            if (job.asyncHeightFuture == null) capture++;
+            else if (!job.asyncHeightFuture.isDone()) heights++;
+            else if (job.asyncCoverageFuture == null || !job.asyncCoverageFuture.isDone()) assembly++;
+            else ready++;
+        }
+        return "Coverage stages capture/height/assembly/ready " + capture + "/" + heights + "/" + assembly + "/" + ready
+                + " | producer slots " + DETACHED_COVERAGE_JOBS.size() + "/" + activeCoverageJobBudget();
     }
     public static TerrainSourceStore terrainSource() { return terrainSource; }
 
@@ -733,10 +752,9 @@ public final class WorldgenSurfaceSampler {
             }
         }
 
-        // M6.6: L2-L6 no longer wait behind one coverage tile lifecycle.
-        // Each detached job owns one complete tile height request and uses one
-        // worker from the shared coverage pool, allowing several tiles to make
-        // progress at the same time while the server lane keeps producing L1.
+        // Complete sampling, appearance and mesh assembly on bounded worker
+        // lanes. Producer slots remain occupied until client integration, not
+        // merely until heights finish. Spare exact capacity may serve coverage.
         if (diskLoadReady) {
             pollDetachedCoverage();
 
@@ -776,15 +794,8 @@ public final class WorldgenSurfaceSampler {
         }
 
         if (currentJob == null && activeSliceId == 0L) {
-            GenerationJob readyCoverage =
-                    takeReadyDetachedCoverage();
-            WantedTile next = readyCoverage == null
-                    ? findNextMissing()
-                    : null;
-
-            if (readyCoverage != null) {
-                currentJob = readyCoverage;
-            } else if (next != null) {
+            WantedTile next = findNextMissing();
+            if (next != null) {
                 WorldgenSurfaceTile existing = CACHE.get(next.key());
 
                 int sampleSpacing = nextGenerationSpacing(next, existing);
@@ -820,6 +831,7 @@ public final class WorldgenSurfaceSampler {
 
         if (currentJob != null
                 && activeSliceId == 0L
+                && !currentJob.assemblyPending
                 && (currentJob.asyncHeightFuture == null
                         || currentJob.asyncHeightFuture.isDone())) {
             scheduleSlice(server, clientLevel.dimension(), currentJob);
@@ -1329,9 +1341,7 @@ public final class WorldgenSurfaceSampler {
     }
 
     private static void cancelCurrentJob() {
-        if (currentJob != null && currentJob.asyncHeightFuture != null) {
-            currentJob.asyncHeightFuture.cancel(true);
-        }
+        if (currentJob != null) cancelCoverageJob(currentJob);
         currentJob = null;
     }
 
@@ -1425,6 +1435,11 @@ public final class WorldgenSurfaceSampler {
                 continue;
             }
 
+            GenerationJob owner = completed.coverageOwner();
+            if (owner != null) {
+                if (!coverageJobLive(owner, completed.epoch())) continue;
+                if (owner.detachedCoverage) DETACHED_COVERAGE_JOBS.remove(completed.key(), owner);
+            }
             var existing=CACHE.get(completed.key());
             if(existing!=null && existing.stage()==WorldgenTileStage.ADAPTIVE_DETAIL
                     && completed.tile().stage()!=WorldgenTileStage.ADAPTIVE_DETAIL){
@@ -2702,9 +2717,7 @@ public final class WorldgenSurfaceSampler {
             GenerationJob job = entry.getValue();
 
             if (!containsWantedKey(entry.getKey())) {
-                if (job.asyncHeightFuture != null) {
-                    job.asyncHeightFuture.cancel(true);
-                }
+                cancelCoverageJob(job);
                 DETACHED_COVERAGE_JOBS.remove(entry.getKey(), job);
                 staleJobsCancelled++;
                 continue;
@@ -2758,6 +2771,8 @@ public final class WorldgenSurfaceSampler {
                 false
         );
         job.asyncCoverageStarted = true;
+        job.detachedCoverage = true;
+        job.coverageExecutor = coverageExecutor();
 
         if (DETACHED_COVERAGE_JOBS.putIfAbsent(key, job) != null) {
             return false;
@@ -2777,6 +2792,8 @@ public final class WorldgenSurfaceSampler {
                 ServerChunkCache chunks = level.getChunkSource();
                 var generator = chunks.getGenerator();
                 var randomState = chunks.randomState();
+                job.biomeResolver = generator.getBiomeSource().createResolver(randomState.createClimateSampler(
+                        net.minecraft.world.level.levelgen.densityfunction.SamplerContext.EMPTY_UNCACHED));
 
                 int[] sampleIndices = new int[job.totalSamples];
                 for (int i = 0; i < sampleIndices.length; i++) {
@@ -2791,9 +2808,10 @@ public final class WorldgenSurfaceSampler {
                         randomState,
                         job,
                         sampleIndices,
-                        COVERAGE_HEIGHT_EXECUTOR,
+                        job.coverageExecutor,
                         1
                 );
+                chainCoverageAssembly(job, level.getSeaLevel(), taskEpoch, job.coverageExecutor);
             } catch (Throwable throwable) {
                 job.failed = true;
                 EverviewClient.LOGGER.warn(
@@ -2809,54 +2827,20 @@ public final class WorldgenSurfaceSampler {
         return true;
     }
 
-    private static GenerationJob takeReadyDetachedCoverage() {
-        // Feed exact L1 first whenever a bootstrap tile's heights are ready.
-        for (Map.Entry<LodTileKey, GenerationJob> entry
-                : DETACHED_COVERAGE_JOBS.entrySet()) {
-            GenerationJob job = entry.getValue();
-            CompletableFuture<HeightBatchResult> future =
-                    job.asyncHeightFuture;
+    private static boolean coverageJobLive(GenerationJob job, long taskEpoch) {
+        return taskEpoch == epoch && !job.cancelled && (job.detachedCoverage
+                ? DETACHED_COVERAGE_JOBS.get(job.key) == job : currentJob == job);
+    }
 
-            if (job.ring.lodLevel() != 1
-                    || future == null
-                    || !future.isDone()) {
-                continue;
-            }
-
-            if (DETACHED_COVERAGE_JOBS.remove(entry.getKey(), job)) {
-                return job;
-            }
-        }
-
-        for (Map.Entry<LodTileKey, GenerationJob> entry
-                : DETACHED_COVERAGE_JOBS.entrySet()) {
-            GenerationJob job = entry.getValue();
-            CompletableFuture<HeightBatchResult> future =
-                    job.asyncHeightFuture;
-
-            if (future == null || !future.isDone()) {
-                continue;
-            }
-
-            if (DETACHED_COVERAGE_JOBS.remove(entry.getKey(), job)) {
-                return job;
-            }
-        }
-
-        return null;
+    private static void cancelCoverageJob(GenerationJob job) {
+        job.cancelled = true;
+        if (job.asyncHeightFuture != null) job.asyncHeightFuture.cancel(true);
+        if (job.asyncCoverageFuture != null) job.asyncCoverageFuture.cancel(true);
     }
 
     private static int cancelDetachedCoverageJobs() {
-        int cancelled = 0;
-
-        for (GenerationJob job : DETACHED_COVERAGE_JOBS.values()) {
-            if (job.asyncHeightFuture != null
-                    && !job.asyncHeightFuture.isDone()
-                    && job.asyncHeightFuture.cancel(true)) {
-                cancelled++;
-            }
-        }
-
+        int cancelled = DETACHED_COVERAGE_JOBS.size();
+        for (GenerationJob job : DETACHED_COVERAGE_JOBS.values()) cancelCoverageJob(job);
         DETACHED_COVERAGE_JOBS.clear();
         return cancelled;
     }
@@ -3433,13 +3417,9 @@ public final class WorldgenSurfaceSampler {
         var generator = chunks.getGenerator();
         var randomState = chunks.randomState();
 
-        // M6.4: all L2-L6 height coverage uses the dedicated worker pool, not
-        // just emergency high-speed coverage. getBaseHeight was the dominant
-        // reason a settled world could take 10+ minutes. M9.7 also assembles
-        // appearance and geometry on these workers after height completion.
-        if ((job.ring.lodLevel() >= 2
-                        && job.sampleGrid == null)
-                || job.asyncCoverageStarted) {
+        // Bootstrap/coarse heights, appearance and meshing stay off server
+        // ticks. Exact and appearance refinement retain their existing lanes.
+        if ((!job.exactGeometryOnly && !job.appearanceOnly) || job.asyncCoverageStarted) {
             runAsyncCoverageGeometry(
                     level,
                     generator,
@@ -3673,74 +3653,50 @@ public final class WorldgenSurfaceSampler {
             ServerLevel level,
             net.minecraft.world.level.chunk.ChunkGenerator generator,
             net.minecraft.world.level.levelgen.RandomState randomState,
-            GenerationJob job,
-            long taskEpoch,
-            long sliceStart
+            GenerationJob job, long taskEpoch, long sliceStart
     ) {
-        if (job.asyncHeightFuture == null) {
-            int[] sampleIndices = new int[job.totalSamples];
-            for (int i = 0; i < sampleIndices.length; i++) {
-                sampleIndices[i] = i;
+        if (job.assemblyPending) return;
+        int[] sampleIndices = new int[job.totalSamples];
+        for (int i = 0; i < sampleIndices.length; i++) sampleIndices[i] = i;
+        job.asyncCoverageStarted = true;
+        job.asyncStartedNanos = System.nanoTime();
+        job.biomeResolver = generator.getBiomeSource().createResolver(randomState.createClimateSampler(
+                net.minecraft.world.level.levelgen.densityfunction.SamplerContext.EMPTY_UNCACHED));
+        job.asyncHeightFuture = submitHeightBatch(level, generator, randomState, job,
+                sampleIndices, COVERAGE_HEIGHT_EXECUTOR, 1);
+        chainCoverageAssembly(job, level.getSeaLevel(), taskEpoch, COVERAGE_HEIGHT_EXECUTOR);
+        lastSliceSamples = 0;
+        lastSliceMs = (System.nanoTime() - sliceStart) / 1_000_000.0;
+    }
+
+    private static void chainCoverageAssembly(GenerationJob job, int seaLevel, long taskEpoch,
+                                               ExecutorService executor) {
+        job.assemblyPending = true;
+        job.asyncCoverageFuture = job.asyncHeightFuture.thenApply(result -> {
+            job.heightsReadyNanos = System.nanoTime();
+            return result;
+        }).thenAcceptAsync(result -> {
+            if (!coverageJobLive(job, taskEpoch)) return;
+            long began = System.nanoTime();
+            GenerationProfile.queueNanos.add(began - job.heightsReadyNanos);
+            try {
+                if (result.sampleIndices().length != job.totalSamples || result.heights().length != job.totalSamples)
+                    throw new IllegalStateException("incomplete coverage height batch");
+                assembleCoverageGeometry(job, result, seaLevel, taskEpoch);
+            } finally {
+                GenerationProfile.workerNanos.add(System.nanoTime() - began);
+                GenerationProfile.workerTasks.increment();
             }
+        }, executor).whenComplete((ignored, error) -> {
+            if (error != null && coverageJobLive(job, taskEpoch)) {
+                job.failed = true;
+                EverviewClient.LOGGER.warn("Everview coverage generation failed at {}", job.key, error);
+            }
+        });
+    }
 
-            job.asyncCoverageStarted = true;
-            job.asyncMissingSampleIndices = sampleIndices;
-            job.asyncStartedNanos = System.nanoTime();
-
-            job.asyncHeightFuture = submitHeightBatch(
-                    level,
-                    generator,
-                    randomState,
-                    job,
-                    sampleIndices,
-                    COVERAGE_HEIGHT_EXECUTOR,
-                    COVERAGE_HEIGHT_WORKERS
-            );
-
-            lastSliceSamples = 0;
-            lastSliceMs = (System.nanoTime() - sliceStart) / 1_000_000.0;
-            return;
-        }
-
-        if (!job.asyncHeightFuture.isDone()) {
-            lastSliceSamples = 0;
-            lastSliceMs = 0.0;
-            return;
-        }
-
-        HeightBatchResult result;
-        try {
-            result = job.asyncHeightFuture.join();
-        } catch (RuntimeException exception) {
-            // Fall back to the proven server-thread path if a world generator
-            // rejects asynchronous height access.
-            job.asyncCoverageStarted = false;
-            job.asyncHeightFuture = null;
-            job.asyncMissingSampleIndices = new int[0];
-            job.nextSample = 0;
-            EverviewClient.LOGGER.warn(
-                    "Everview async coverage heights failed at L{} {}, {}; "
-                            + "falling back to server-thread coverage",
-                    job.ring.lodLevel(),
-                    job.key.tileX(),
-                    job.key.tileZ(),
-                    exception
-            );
-            return;
-        }
-
-        if (result.sampleIndices().length != job.totalSamples) {
-            job.asyncCoverageStarted = false;
-            job.asyncHeightFuture = null;
-            job.asyncMissingSampleIndices = new int[0];
-            job.nextSample = 0;
-            return;
-        }
-
-        if(job.assemblyPending)return;
-        job.assemblyPending=true;
-        COVERAGE_HEIGHT_EXECUTOR.execute(()->{try{
-            if(taskEpoch!=epoch)return;
+    private static void assembleCoverageGeometry(GenerationJob job, HeightBatchResult result,
+                                                  int seaLevel, long taskEpoch) {
         for (int i = 0; i < result.sampleIndices().length; i++) {
             int sampleIndex = result.sampleIndices()[i];
             int packed = result.heights()[i];
@@ -3756,7 +3712,7 @@ public final class WorldgenSurfaceSampler {
                 if (fineIndex >= 0) {
                     job.sampleGrid.heights[fineIndex] = y;
                     job.sampleGrid.water[fineIndex] = job.water[sampleIndex];
-                job.sampleGrid.fluidHeights[fineIndex] = job.fluidHeights[sampleIndex];
+                    job.sampleGrid.fluidHeights[fineIndex] = job.fluidHeights[sampleIndex];
                     job.sampleGrid.heightSampled[fineIndex] = true;
                 }
             }
@@ -3776,19 +3732,14 @@ public final class WorldgenSurfaceSampler {
             int worldZ = job.originZ + gz * job.sampleSpacing;
             int y = job.heights[sampleIndex];
 
-            var biome = sampleBiomeCached(
-                                job,
-                                level,
-                                worldX,
-                                y,
-                                worldZ
-                        );
+            if (job.cancelled) return;
+            var biome = sampleBiomeCached(job, worldX, y, worldZ);
             var appearance = sampleSourceAppearance(job,
                     biome,
                     worldX,
                     y,
                     worldZ,
-                    level.getSeaLevel()
+                    seaLevel
             );
 
             job.sampleColors[sampleIndex] = appearance.rgb();
@@ -3808,11 +3759,8 @@ public final class WorldgenSurfaceSampler {
         }
 
         job.nextSample = job.totalSamples;
-        job.accumulatedNanos += System.nanoTime() - job.asyncStartedNanos;
-
-        long meshStart = System.nanoTime();
-        MeshData mesh = buildMesh(job, level.getSeaLevel());
-        job.accumulatedNanos += System.nanoTime() - meshStart;
+        MeshData mesh = buildMesh(job, seaLevel);
+        job.accumulatedNanos = System.nanoTime() - job.asyncStartedNanos;
 
         WorldgenSurfaceTile tile = new WorldgenSurfaceTile(
                 job.ring.lodLevel(),
@@ -3827,10 +3775,11 @@ public final class WorldgenSurfaceSampler {
                 mesh.quadCount(),
                 job.minY,
                 job.maxY,
-                level.getSeaLevel(),
+                seaLevel,
                 job.accumulatedNanos
         );
 
+        if (!coverageJobLive(job, taskEpoch)) return;
         COMPLETED.add(new CompletedTile(
                 taskEpoch,
                 job.key,
@@ -3838,13 +3787,10 @@ public final class WorldgenSurfaceSampler {
                 job.reusedSamples,
                 job.generatedSamples,
                 job.appearanceGeneratedSamples,
-                job.provisionalAppearanceSamples
+                job.provisionalAppearanceSamples,
+                job
         ));
 
-        lastSliceSamples = result.sampleIndices().length;
-        lastSliceMs = (System.nanoTime() - sliceStart) / 1_000_000.0;
-        }catch(Throwable error){job.failed=true;EverviewClient.LOGGER.warn("Everview coverage assembly failed",error);}
-        });
     }
 
     private static void runAsyncExactGeometry(
@@ -4155,6 +4101,15 @@ public final class WorldgenSurfaceSampler {
             int worldY,
             int worldZ
     ) {
+        if (job.biomeResolver == null) {
+            var chunks=level.getChunkSource();
+            job.biomeResolver=chunks.getGenerator().getBiomeSource().createResolver(
+                    chunks.randomState().createClimateSampler(net.minecraft.world.level.levelgen.densityfunction.SamplerContext.EMPTY_UNCACHED));
+        }
+        return sampleBiomeCached(job, worldX, worldY, worldZ);
+    }
+
+    private static Holder<Biome> sampleBiomeCached(GenerationJob job, int worldX, int worldY, int worldZ) {
         int quartX = worldX >> 2;
         int quartY = worldY >> 2;
         int quartZ = worldZ >> 2;
@@ -4167,11 +4122,6 @@ public final class WorldgenSurfaceSampler {
         }
 
         long biomeStart=System.nanoTime();
-        if(job.biomeResolver==null){
-            var chunks=level.getChunkSource();
-            job.biomeResolver=chunks.getGenerator().getBiomeSource().createResolver(
-                    chunks.randomState().createClimateSampler(net.minecraft.world.level.levelgen.densityfunction.SamplerContext.EMPTY_UNCACHED));
-        }
         Holder<Biome> biome = job.biomeResolver.getNoiseBiome(quartX,quartY,quartZ);
         GenerationProfile.biomeNanos.add(System.nanoTime()-biomeStart);GenerationProfile.biomeCalls.increment();
         SHARED_BIOME_MISSES.incrementAndGet();
@@ -4209,22 +4159,23 @@ public final class WorldgenSurfaceSampler {
     private static TerrainSourceStore.Loader heightLoader(ServerLevel level,
             net.minecraft.world.level.chunk.ChunkGenerator generator,
             net.minecraft.world.level.levelgen.RandomState randomState) {
+        return heightLoader(level, generator, randomState, 1);
+    }
+
+    private static TerrainSourceStore.Loader heightLoader(ServerLevel level,
+            net.minecraft.world.level.chunk.ChunkGenerator generator,
+            net.minecraft.world.level.levelgen.RandomState randomState, int spacing) {
+        if (generator instanceof net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator noise)
+            return TerrainNoiseBatch.loader(noise, randomState, level, spacing);
         return new TerrainSourceStore.Loader() {
             public int[] batch(int x, int z) {
-                long start=System.nanoTime();
-                try {
-                    if(generator instanceof net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator noise)
-                        return TerrainNoiseBatch.sample(noise,randomState,level,x,z,16);
-                    int[] result=new int[256];
-                    for(int dz=0;dz<16;dz++)for(int dx=0;dx<16;dx++)result[dz*16+dx]=column(x+dx,z+dz);
-                    return result;
-                } finally {GenerationProfile.noiseNanos.add(System.nanoTime()-start);GenerationProfile.noiseColumns.add(256);}
+                int[] result=new int[256];
+                for(int dz=0;dz<16;dz++)for(int dx=0;dx<16;dx++)result[dz*16+dx]=column(x+dx,z+dz);
+                return result;
             }
             public int column(int x,int z) {
                 long start=System.nanoTime();
                 try {
-                    if(generator instanceof net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator noise)
-                        return TerrainNoiseBatch.sample(noise,randomState,level,x,z,1)[0];
                     int floor=generator.getBaseHeight(x,z,Heightmap.Types.OCEAN_FLOOR_WG,level,randomState);
                     int surface=generator.getBaseHeight(x,z,Heightmap.Types.WORLD_SURFACE_WG,level,randomState);
                     return TerrainNoiseBatch.pack(floor,surface);
@@ -4249,31 +4200,27 @@ public final class WorldgenSurfaceSampler {
     ) {
         int count = Math.max(0, end - start);
         int[] heights = new int[count];
-        TerrainSourceStore.Loader loader=heightLoader(level,generator,randomState);
+        try (TerrainSourceStore.Loader loader=heightLoader(level,generator,randomState,job.sampleSpacing)) {
+            for (int i = 0; i < count; i++) {
+                if (job.cancelled || Thread.currentThread().isInterrupted())
+                    throw new java.util.concurrent.CancellationException("coverage job retired");
 
-        for (int i = 0; i < count; i++) {
-            if (Thread.currentThread().isInterrupted()) {
-                return new HeightPart(
-                        start,
-                        Arrays.copyOf(heights, i)
-                );
+                int sampleIndex = sampleIndices[start + i];
+                int gx = sampleIndex % job.samplesAcross;
+                int gz = sampleIndex / job.samplesAcross;
+                // M6.0: coarse async coverage must sample the real world-space
+                // lattice. The old worker forgot sampleSpacing here, so a 2048b L6
+                // tile could read heights from only its first ~8 blocks and then
+                // stretch that tiny patch across the whole tile. That is the main
+                // source of the repeated blobs/squares seen beyond L1/L2.
+                int worldX = job.originX + gx * job.sampleSpacing;
+                int worldZ = job.originZ + gz * job.sampleSpacing;
+
+                heights[i] = job.source.sample(worldX, worldZ, job.sampleSpacing <= 4, loader);
             }
 
-            int sampleIndex = sampleIndices[start + i];
-            int gx = sampleIndex % job.samplesAcross;
-            int gz = sampleIndex / job.samplesAcross;
-            // M6.0: coarse async coverage must sample the real world-space
-            // lattice. The old worker forgot sampleSpacing here, so a 2048b L6
-            // tile could read heights from only its first ~8 blocks and then
-            // stretch that tiny patch across the whole tile. That is the main
-            // source of the repeated blobs/squares seen beyond L1/L2.
-            int worldX = job.originX + gx * job.sampleSpacing;
-            int worldZ = job.originZ + gz * job.sampleSpacing;
-
-            heights[i] = job.source.sample(worldX, worldZ, job.sampleSpacing <= 4, loader);
+            return new HeightPart(start, heights);
         }
-
-        return new HeightPart(start, heights);
     }
 
     private static MeshData buildMesh(GenerationJob job, int seaLevel) {
@@ -4761,6 +4708,10 @@ public final class WorldgenSurfaceSampler {
         private final java.util.concurrent.ConcurrentMap<Long, Holder<Biome>> biomeCache = SHARED_BIOME_CACHE;
         private net.minecraft.world.level.biome.BiomeResolver biomeResolver;
         private volatile boolean assemblyPending;
+        private volatile boolean cancelled;
+        private boolean detachedCoverage;
+        private ExecutorService coverageExecutor;
+        private volatile CompletableFuture<Void> asyncCoverageFuture;
         private final LodTileKey key;
         private final WorldgenLodRing ring;
         private final int originX;
@@ -4788,6 +4739,7 @@ public final class WorldgenSurfaceSampler {
         private volatile CompletableFuture<HeightBatchResult> asyncHeightFuture;
         private int[] asyncMissingSampleIndices = new int[0];
         private long asyncStartedNanos;
+        private long heightsReadyNanos;
         private boolean asyncExactDisabled;
         private boolean asyncCoverageStarted;
         private volatile boolean failed;
@@ -5106,8 +5058,13 @@ public final class WorldgenSurfaceSampler {
             int reusedSamples,
             int generatedSamples,
             int appearanceGeneratedSamples,
-            int provisionalAppearanceSamples
+            int provisionalAppearanceSamples,
+            GenerationJob coverageOwner
     ) {
+        private CompletedTile(long epoch, LodTileKey key, WorldgenSurfaceTile tile,
+                              int reused, int generated, int appearance, int provisional) {
+            this(epoch, key, tile, reused, generated, appearance, provisional, null);
+        }
     }
 
     private record CompactedTile(
