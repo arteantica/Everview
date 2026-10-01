@@ -80,3 +80,25 @@ tasks.register('rendererScalingBenchmark', JavaExec) {
     mainClass = 'dev.everview.client.RendererScalingBenchmark'
     maxHeapSize = '2G'
 }
+
+// Transform the packaged mod through the real Fabric/Mixin client loader.
+// No Minecraft initialization, window, account, or graphics device is required.
+tasks.register('mixinSmoke', JavaExec) {
+    dependsOn jar, testClasses
+    classpath = (sourceSets.client.runtimeClasspath + sourceSets.test.runtimeClasspath) -
+            sourceSets.main.output - sourceSets.client.output
+    mainClass = 'dev.everview.client.FabricMixinSmoke'
+    maxHeapSize = '2G'
+    workingDir layout.buildDirectory.dir('mixin-smoke')
+    doFirst {
+        workingDir.mkdirs()
+        def modJar = tasks.jar.archiveFile.get().asFile
+        args modJar.absolutePath
+        def apiJars = classpath.files.findAll {
+            it.name.startsWith('fabric-') && !it.name.startsWith('fabric-loader-') && it.name.endsWith('.jar')
+        }
+        def extraMods = project.findProperty('smokeMods')?.toString()?.split(File.pathSeparator)
+                ?.collect { project.file(it) } ?: []
+        systemProperty 'fabric.addMods', ([modJar] + apiJars + extraMods).join(File.pathSeparator)
+    }
+}

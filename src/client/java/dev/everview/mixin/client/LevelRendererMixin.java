@@ -50,7 +50,7 @@ public abstract class LevelRendererMixin implements VanillaTerrainReadiness {
 
     // Both vanilla and Sodium have finalized their uploads/draw preparation here.
     // COLLECT_SUBMITS is earlier and can otherwise leave a one-frame stale mask.
-    @Inject(method = "renderLevel", at = @At(value = "INVOKE",
+    @Inject(method = "render(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;ZLnet/minecraft/client/renderer/state/level/CameraRenderState;Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;Lorg/joml/Vector4f;ZZ)V", at = @At(value = "INVOKE",
             target = "Lnet/minecraft/client/renderer/LevelRenderer;addMainPass(Lcom/mojang/blaze3d/framegraph/FrameGraphBuilder;Lnet/minecraft/client/renderer/feature/FeatureRenderDispatcher$PreparedFrame;Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;Z)V"))
     private void everview$finalizeOwnership(CallbackInfo ci) {
         EverviewRenderer.prepareVanillaOwnership();
