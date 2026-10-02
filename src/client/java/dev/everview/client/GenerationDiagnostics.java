@@ -33,7 +33,9 @@ public final class GenerationDiagnostics {
                     source.residentBytes()/1048576.0,requests==0?0:100.0*source.hits.sum()/requests,source.diskHits.sum(),source.pendingWrites()));
             out.add(String.format(Locale.ROOT,"Source I/O read %.1f ms / %.2f MiB | write %.1f ms / %.2f MiB | errors %,d | budget waits %,d",
                     source.readNanos.sum()/1e6,source.readBytes.sum()/1048576.0,source.writeNanos.sum()/1e6,source.writeBytes.sum()/1048576.0,source.errors.sum(),source.budgetWaits.sum()));
-            out.add(String.format(Locale.ROOT,"Source writeback %,d pages saved | %.1f pages/s average",source.writtenPages.sum(),source.writtenPages.sum()/seconds));
+            out.add(String.format(Locale.ROOT,"Source writeback %,d pages saved | %.1f pages/s avg | %,d region batches / %,d opens / %d cached",source.writtenPages.sum(),source.writtenPages.sum()/seconds,source.regionBatches.sum(),source.regionOpens.sum(),source.cachedRegions()));
+            out.add(String.format(Locale.ROOT,"Source pressure %.1f ms / %,d waits | %,d clean evictions | queued + in-flight pages included",
+                    source.pressureNanos.sum()/1e6,source.pressureWaits.sum(),source.evictionVisits.sum()));
             out.add(String.format(Locale.ROOT,"Source lookup %.1f ms | page lock wait %.1f ms | dual solid/fluid heights | optional volume layers: inactive",
                     source.lookupNanos.sum()/1e6,source.waitNanos.sum()/1e6));
         }

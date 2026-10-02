@@ -41,6 +41,9 @@ jobs:
       - name: Benchmark sparse Minecraft sampling and source reuse
         run: ./gradlew sparseSamplingBenchmark --no-daemon > build/sparse-sampling-benchmark.txt
 
+      - name: Benchmark source cache pressure and region I/O
+        run: ./gradlew sourcePressureBenchmark --no-daemon > build/source-pressure-benchmark.txt
+
       - name: Check production ownership shader
         run: |
           sudo apt-get update -qq
@@ -57,6 +60,7 @@ jobs:
             build/terrain-benchmark.txt
             build/renderer-scaling-benchmark.txt
             build/sparse-sampling-benchmark.txt
+            build/source-pressure-benchmark.txt
             build/ownership-shader-check.txt
             build/mixin-smoke.txt
             build/mixin-smoke-sodium.txt

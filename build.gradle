@@ -114,3 +114,10 @@ tasks.register('mixinSmoke', JavaExec) {
         systemProperty 'fabric.addMods', ([modJar] + apiJars + extraMods).join(File.pathSeparator)
     }
 }
+
+tasks.register('sourcePressureBenchmark', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.everview.terrain.SourcePressureBenchmark'
+    maxHeapSize = '2G'
+}
