@@ -34,7 +34,22 @@ public record TerrainEdges(Map<Edge, List<Segment>> profiles, long estimatedByte
                     new Segment(x0,x1,v[q+4],v[q+7],color,material));
         }
         profiles.replaceAll((key, segments) -> {
-            segments.sort(Comparator.comparingInt(Segment::start)); return List.copyOf(segments);
+            segments.sort(Comparator.comparingInt(Segment::start));
+            // Ownership splitting can divide one terrace edge into many 16b pieces.
+            // Coalesce identical flat profiles; final vanilla masking still runs per fragment.
+            var joined=new ArrayList<Segment>(segments.size());
+            for(var next:segments){
+                if(!joined.isEmpty()){
+                    var previous=joined.getLast();
+                    if(previous.end()==next.start() && previous.y0()==previous.y1()
+                            && next.y0()==next.y1() && previous.y1()==next.y0()
+                            && previous.color()==next.color() && previous.material()==next.material()){
+                        joined.set(joined.size()-1,new Segment(previous.start(),next.end(),previous.y0(),next.y1(),next.color(),next.material()));continue;
+                    }
+                }
+                joined.add(next);
+            }
+            return List.copyOf(joined);
         });
         long bytes = profiles.size() * 80L;
         for (var segments : profiles.values()) bytes += segments.size() * 40L;

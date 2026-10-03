@@ -44,6 +44,9 @@ jobs:
       - name: Benchmark source cache pressure and region I/O
         run: ./gradlew sourcePressureBenchmark --no-daemon > build/source-pressure-benchmark.txt
 
+      - name: Benchmark stepped coverage geometry and ownership packing
+        run: ./gradlew steppedCoverageBenchmark --no-daemon > build/stepped-coverage-benchmark.txt
+
       - name: Check production ownership shader
         run: |
           sudo apt-get update -qq
@@ -61,6 +64,7 @@ jobs:
             build/renderer-scaling-benchmark.txt
             build/sparse-sampling-benchmark.txt
             build/source-pressure-benchmark.txt
+            build/stepped-coverage-benchmark.txt
             build/ownership-shader-check.txt
             build/mixin-smoke.txt
             build/mixin-smoke-sodium.txt

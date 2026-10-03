@@ -29,10 +29,8 @@ public final class TerrainStitches {
                 int size = otherLevel <= 2 ? 128 : 128 << (otherLevel - 2);
                 var other = tiles.get(new LodTileKey(otherLevel,Math.floorDiv(otherEdge.cellX()*128,size),Math.floorDiv(otherEdge.cellZ()*128,size)));
                 if (other == null) continue;
-                // Equal lattices share their sampled boundaries; exact columns already have real side faces.
-                if (level == otherLevel && tile.source().sampleSpacing() == other.source().sampleSpacing()
-                        && tile.source().stage() == WorldgenTileStage.COVERAGE
-                        && other.source().stage() == WorldgenTileStage.COVERAGE) continue;
+                // Equal sampling grids can still have different sample-owned terrace
+                // heights on opposite sides. Join actual profiles even within one tile.
                 List<TerrainEdges.Segment> opposite = other.edges().profiles().get(otherEdge);
                 if (opposite == null) continue;
                 join(edge, entry.getValue(), opposite, quads);
@@ -58,7 +56,8 @@ public final class TerrainStitches {
                 if (Math.abs(d0)>0.001f || Math.abs(d1)>0.001f) {
                     boolean xEdge = edge.side() == 1;
                     float constant = (xEdge ? edge.cellX()+1 : edge.cellZ()+1)*128;
-                    int color = a0+a1 >= b0+b1 ? sa.color() : sb.color();
+                    int color = MinecraftSurfacePalette.applyLighting(
+                            a0+a1 >= b0+b1 ? sa.color() : sb.color(),xEdge?.82f:.72f);
                     if (d0*d1 < 0) {
                         float split = start + (end-start)*d0/(d0-d1);
                         float y = sa.height(split);

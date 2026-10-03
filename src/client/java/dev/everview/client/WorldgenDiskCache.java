@@ -35,7 +35,7 @@ import java.util.zip.GZIPOutputStream;
  */
 public final class WorldgenDiskCache {
     private static final int MAGIC = 0x45564C31; // EVL1
-    private static final int VERSION = 35;
+    private static final int VERSION = 36; // Stepped coverage; old triangle meshes cannot be restored.
     private static final int SHARD_BLOCKS = 512;
     private static final int MAX_TILES_PER_SHARD = 4_096;
     private static final int MAX_VERTEX_INTS = 4_000_000;
@@ -51,6 +51,7 @@ public final class WorldgenDiskCache {
 
         return server.getWorldPath(LevelResource.ROOT)
                 .resolve("everview")
+                // Stable container retains source-v1 pages while mesh header versions change.
                 .resolve("lod-cache-v35")
                 .resolve(dimensionId);
     }
@@ -216,7 +217,7 @@ public final class WorldgenDiskCache {
             String dimension = input.readUTF();
 
             if (magic != MAGIC
-                    || version != VERSION
+                    || (version != VERSION && version != 35)
                     || seed != expectedSeed
                     || !dimension.equals(expectedDimension)) {
                 return new ShardLoadResult(List.of(), false);
@@ -233,7 +234,10 @@ public final class WorldgenDiskCache {
                 if (tile == null) {
                     return new ShardLoadResult(List.of(), false);
                 }
-                tiles.add(tile);
+                // v35 exact L1 already uses this column topology. Retain it for a
+                // warm near handoff, but never restore old coverage triangles or
+                // far detail whose heights were rounded to two-block terraces.
+                if(version==VERSION || (tile.lodLevel()==1 && tile.sampleSpacing()==1 && tile.stage().exactGeometry()))tiles.add(tile);
             }
 
             return new ShardLoadResult(List.copyOf(tiles), true);

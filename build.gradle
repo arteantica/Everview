@@ -121,3 +121,10 @@ tasks.register('sourcePressureBenchmark', JavaExec) {
     mainClass = 'dev.everview.terrain.SourcePressureBenchmark'
     maxHeapSize = '2G'
 }
+
+tasks.register('steppedCoverageBenchmark', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.everview.client.SteppedCoverageBenchmark'
+    maxHeapSize = '2G'
+}

@@ -132,14 +132,14 @@ public final class EverviewDebugHud {
         boolean iris = FabricLoader.getInstance().isModLoaded("iris");
 
         List<String> lines = new ArrayList<>();
-        lines.add("Everview M9.7 DEV | SHARED SOURCE + ADAPTIVE BLOCK DETAIL");
+        lines.add("Everview M9.7.5 | STEPPED COVERAGE AT EVERY DISTANCE");
         lines.add("F8 compact | 26.3 Fabric | Sodium "
                 + yesNo(sodium) + " | Iris " + yesNo(iris));
         lines.add("Renderer: persistent region commands | transactional ownership | 360 spatial residency");
         lines.add("Handoff: final vanilla mask for all terrain/water/seams | resident fallback retained");
         lines.add("F7 generation metrics | adaptive 1b/2b feature detail beyond L1");
         lines.add("First-visible: L1 4b -> 1b | L2 4b | L3 4b | L4 8b | L5 8b | L6 16b");
-        lines.add("Adaptive error: L3 0.5b | L4 1b | L5 2b | L6 4b | GPU target/hard 1024/1152 MiB");
+        lines.add("All LODs: level tops + vertical faces | integer heights | GPU target/hard 1024/1152 MiB");
         lines.add(String.format(
                 "Camera far: vanilla %.0f -> Everview %.0f | ring target %d",
                 EverviewFarPlane.vanillaDepthFar(),

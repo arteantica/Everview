@@ -8,17 +8,31 @@ public final class BlockSurfaceMesh {
         void quad(int x0,int y0,int z0,int x1,int y1,int z1,int x2,int y2,int z2,int x3,int y3,int z3,int color,byte material);
     }
     private final int cells,stride,spacing,quantum;private final int[] heights,colors;private final byte[] materials;
-    private final boolean[] wet;private final Sink sink;private boolean boundaryWalls=true;private int quads;
+    private final boolean[] wet;private final Sink sink;private boolean boundaryWalls=true,ownershipBoundaryWalls=true;private int quads;
     public BlockSurfaceMesh(int cells,int spacing,int[] heights,int[] colors,byte[] materials,boolean[] wet,int quantum,Sink sink){
         if(cells<1||spacing<1||heights.length!=(cells+1)*(cells+1)||colors.length!=heights.length||materials.length!=heights.length||wet.length!=heights.length)
             throw new IllegalArgumentException("matching column lattice required");
         this.cells=cells;this.stride=cells+1;this.spacing=spacing;this.heights=heights;this.colors=colors;this.materials=materials;this.wet=wet;this.quantum=quantum;this.sink=sink;
     }
     public BlockSurfaceMesh boundaryWalls(boolean enabled){boundaryWalls=enabled;return this;}
+    /** Leave ownership-cell boundaries to the atomically published seam buffer. */
+    public BlockSurfaceMesh ownershipBoundaryWalls(boolean enabled){ownershipBoundaryWalls=enabled;return this;}
     private int height(int i){return wet[i]||quantum==1?heights[i]:Math.floorDiv(heights[i]+quantum/2,quantum)*quantum;}
     private boolean same(int a,int b){return height(a)==height(b)&&materials[a]==materials[b]&&colors[a]==colors[b]&&wet[a]==wet[b];}
     public int build(){
-        boolean[] used=new boolean[cells*cells];int maxSpan=Math.max(1,128/spacing);
+        int maxSpan=Math.max(1,128/spacing);
+        boolean uniform=true;
+        for(int i=1;i<heights.length;i++)if(!same(0,i)){uniform=false;break;}
+        if(uniform){
+            // Flat sea/plains need no occupancy array or discontinuity pass. Retain
+            // ownership alignment, exact tint/material and the same sample footprint.
+            for(int z=0;z<cells;z+=maxSpan)for(int x=0;x<cells;x+=maxSpan){
+                int a=x*spacing,b=z*spacing,c=Math.min(cells,x+maxSpan)*spacing,d=Math.min(cells,z+maxSpan)*spacing,y=height(0);
+                emit(a,y,b,a,y,d,c,y,d,c,y,b,colors[0],materials[0]);
+            }
+            return quads;
+        }
+        boolean[] used=new boolean[cells*cells];
         for(int z=0;z<cells;z++)for(int x=0;x<cells;x++){
             int index=z*stride+x;if(used[z*cells+x])continue;
             int width=1,depth=1,limX=Math.min(cells,((x/maxSpan)+1)*maxSpan),limZ=Math.min(cells,((z/maxSpan)+1)*maxSpan);
@@ -30,6 +44,7 @@ public final class BlockSurfaceMesh {
         }
         // Each discontinuity has exactly one owner: west/north columns.
         for(int axis=0;axis<2;axis++)for(int cross=1;cross<=(boundaryWalls?cells:cells-1);cross++){
+            if(!ownershipBoundaryWalls && cross*spacing%128==0)continue;
             int along=0;
             while(along<cells){
                 int a=axis==0?along*stride+cross-1:(cross-1)*stride+along;

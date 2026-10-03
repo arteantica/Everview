@@ -11,6 +11,7 @@ public final class DetailPolicy {
         return base;
     }
     public static int quantum(double distance,double focalPixels,boolean shore) {
-        return shore || focalPixels/Math.max(1,distance)>=.115?1:2;
+        // Sampling may be coarse, but every sampled surface retains its integer block height.
+        return 1;
     }
 }
